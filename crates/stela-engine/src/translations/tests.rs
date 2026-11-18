@@ -762,6 +762,11 @@ fn the_translator_id_covers_every_engine_item_its_inputs_name() {
                 "super::known_keys::DEFAULT_SLOTS",
                 "super::known_keys::Known",
                 "super::known_keys::MAX_SLOTS",
+                // Consumers: the jobs a store takes to translate ahead of
+                // execution, which compile through `Preparation::prepare` as
+                // a PE does, so they add nothing a compile reads.
+                "super::ahead",
+                "super::ahead::AheadJob",
                 "crate::translations",
                 "crate::translations::Digest",
                 "crate::translations::PAGE_BYTES",

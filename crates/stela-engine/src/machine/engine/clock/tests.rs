@@ -643,8 +643,15 @@ fn a_long_freeze_s_lag_is_repaid_ten_times_faster_until_a_second_is_left() {
             clocks[2].look(|| host);
             let count = clocks[2].read(|| host);
             if count >= deadline {
+                // On its count but for the step's own leap: a fast step
+                // repays `step / FAST_SLEW_PARTS` counts at once (0.31 ms of
+                // a 24 MHz count at the 50 ms stall limit), which a timer's
+                // count may fall inside.
                 if armed > resumed {
-                    assert!(count - deadline <= 2, "at {host}: {count} for {deadline}");
+                    assert!(
+                        count - deadline <= step / FAST_SLEW_PARTS + 2,
+                        "at {host}: {count} for {deadline}"
+                    );
                 }
                 deadline = count + 1000;
                 armed = host;
@@ -662,11 +669,13 @@ fn a_long_freeze_s_lag_is_repaid_ten_times_faster_until_a_second_is_left() {
             assert_eq!(shared.lag(), lag);
         }
         if host > resumed && host + 2 * step < fast_until {
-            // About one count in ten while more than the bound is owed.
+            // About one count in ten while more than the bound is owed. The
+            // slew repays a step's worth at once, a step after the last and
+            // at a look, so the lag trails the line by up to two steps.
             let expected = lag - (host - resumed) / FAST_SLEW_PARTS;
             let owed = shared.lag();
             assert!(
-                owed.abs_diff(expected) <= step / FAST_SLEW_PARTS + 2,
+                owed.abs_diff(expected) <= 2 * step / FAST_SLEW_PARTS + 2,
                 "at {host}: {owed} for {expected}"
             );
         }

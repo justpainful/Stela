@@ -90,8 +90,10 @@ fn a_successor_translated_ahead_is_the_pes_block_and_saves_its_compile() {
     let jobs = first.host.store.as_mut().unwrap().ahead.take().unwrap();
     let mut pcs: Vec<u64> = jobs.iter().map(AheadJob::pc).collect();
     pcs.sort_unstable();
-    assert_eq!(pcs, [BASE + 4, BASE + 8]);
-    let job = jobs.iter().find(|job| job.pc() == BASE + 4).unwrap();
+    // The ADD runs inside the CBZ's block, which runs past a forward
+    // conditional branch: this PE's table holds it, so only the SVC goes.
+    assert_eq!(pcs, [BASE + 8]);
+    let job = jobs.iter().find(|job| job.pc() == BASE + 8).unwrap();
     let ahead = job.translate().unwrap();
     assert!(ahead.ahead());
 
@@ -99,7 +101,7 @@ fn a_successor_translated_ahead_is_the_pes_block_and_saves_its_compile() {
     let mut compiler = machine(&WORDS);
     compiler.host.store = Some(MemoryStore::default());
     assert!(matches!(
-        compiler.fetch_block(BASE + 4, false),
+        compiler.fetch_block(BASE + 8, false),
         Ok(Fetched::Block(_))
     ));
     let compiled = compiler.host.store.as_mut().unwrap().offers.pop().unwrap();
@@ -123,7 +125,7 @@ fn a_successor_translated_ahead_is_the_pes_block_and_saves_its_compile() {
         let mut receiver = machine(&WORDS);
         receiver.host.store = Some(store);
         assert!(matches!(
-            receiver.fetch_block(BASE + 4, false),
+            receiver.fetch_block(BASE + 8, false),
             Ok(Fetched::Block(_))
         ));
         assert_eq!(
@@ -150,7 +152,7 @@ fn a_block_translated_ahead_from_a_page_written_since_is_refused() {
         Ok(Fetched::Block(_))
     ));
     let jobs = first.host.store.as_mut().unwrap().ahead.take().unwrap();
-    let job = jobs.iter().find(|job| job.pc() == BASE + 4).unwrap();
+    let job = jobs.iter().find(|job| job.pc() == BASE + 8).unwrap();
     let ahead = job.translate().unwrap().shared();
 
     // The ADD became a SUB: the page has another key, whose lookup the
@@ -159,7 +161,7 @@ fn a_block_translated_ahead_from_a_page_written_since_is_refused() {
     let mut probe = machine(&written);
     probe.host.store = Some(MemoryStore::default());
     assert!(matches!(
-        probe.fetch_block(BASE + 4, false),
+        probe.fetch_block(BASE + 8, false),
         Ok(Fetched::Block(_))
     ));
     let now = probe.host.store.as_mut().unwrap().offers.pop().unwrap();
@@ -171,7 +173,7 @@ fn a_block_translated_ahead_from_a_page_written_since_is_refused() {
     let mut receiver = machine(&written);
     receiver.host.store = Some(store);
     assert!(matches!(
-        receiver.fetch_block(BASE + 4, false),
+        receiver.fetch_block(BASE + 8, false),
         Ok(Fetched::Block(_))
     ));
     assert_eq!(
