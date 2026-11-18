@@ -41,6 +41,10 @@ const TRANSLATE_AHEAD: bool = true;
 /// takes the job back as that slice ends rather than at the next doorbell.
 #[cfg(feature = "nvk")]
 const SPINS_WHILE_HELD: u32 = 1 << 16;
+/// Spin rounds of [`SPINS_WHILE_HELD`] a worker makes in a row before it
+/// sleeps until a doorbell: a few dozen slices.
+#[cfg(feature = "nvk")]
+const HELD_ROUNDS: u32 = 64;
 
 /// Whether any compile worker runs.
 #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
@@ -128,6 +132,11 @@ pub(in crate::engine) fn nudge() {
 /// with none, it sleeps.
 fn run(_: &mut host::HostOwner, index: usize) {
     let bit = 1u32 << index;
+    // Spin rounds left while work another processor holds keeps waiting: a
+    // worker whose wait outlasts them sleeps until a doorbell, as a PE that
+    // waits for a GPU job or its Linux work rings the workers.
+    #[cfg(feature = "nvk")]
+    let mut spins_left = HELD_ROUNDS;
     loop {
         crate::native_mmio::shootdown::service();
         #[cfg(feature = "nvk")]
@@ -137,20 +146,32 @@ fn run(_: &mut host::HostOwner, index: usize) {
             // of a core.
             super::gpu::pump_waiting_pe(&|| false);
             if super::gpu::gate::run_job(super::gpu::gate::Taker::Worker) {
+                spins_left = HELD_ROUNDS;
                 continue;
             }
         }
         if super::translations::translate_ahead() {
+            #[cfg(feature = "nvk")]
+            {
+                spins_left = HELD_ROUNDS;
+            }
             continue;
         }
         // Work another processor holds (the pump's turn, a job's slice):
-        // take it back as that ends, answering shootdowns meanwhile.
+        // take it back as that ends, answering shootdowns meanwhile, for a
+        // bounded time. Linux's ready work that no PE waits for is the boot
+        // CPU's, and spinning on it for good kept every worker's core busy.
         #[cfg(feature = "nvk")]
-        if super::gpu::linux_ready() || super::gpu::gate::jobs_pending() {
+        if spins_left != 0 && (super::gpu::linux_ready() || super::gpu::gate::jobs_pending()) {
+            spins_left -= 1;
             for _ in 0..SPINS_WHILE_HELD {
                 core::hint::spin_loop();
             }
             continue;
+        }
+        #[cfg(feature = "nvk")]
+        {
+            spins_left = HELD_ROUNDS;
         }
         SLEEPING.fetch_or(bit, Ordering::SeqCst);
         if super::translations::ahead_pending() {

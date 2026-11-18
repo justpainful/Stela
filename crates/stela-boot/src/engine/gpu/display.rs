@@ -136,6 +136,9 @@ struct KmsScanout {
     gpu: Option<GpuInFlight>,
     /// A frame the GPU composed was given up: the CPU composes every frame.
     gpu_failed: bool,
+    /// Frames the GPU did not finish in [`GPU_PATIENCE_SECONDS`], each given
+    /// up: [`GPU_TIMEOUTS`] of them end GPU compose for the boot.
+    gpu_timeouts: u32,
 }
 
 impl Scanout for KmsScanout {
@@ -259,16 +262,28 @@ impl Scanout for KmsScanout {
             }
             Some(false) if host::rdtsc().wrapping_sub(inflight.began) < patience => false,
             _ => {
+                // Given up: nothing of it shows, and the DCP shows the frame
+                // on screen again whole. A device lost or reopened imports
+                // its buffers anew, so GPU compose goes on; frames not done
+                // in time end it after [`GPU_TIMEOUTS`].
                 self.gpu = None;
                 display.abandon_gpu_frame();
                 self.blank = true;
-                self.gpu_failed = true;
+                if shown.is_some() {
+                    self.gpu_timeouts += 1;
+                    self.gpu_failed = self.gpu_timeouts >= GPU_TIMEOUTS;
+                }
                 output::arguments(format_args!(
-                    "GPU {name}: a display frame composed on the GPU was {}; the CPU composes \
-                     every frame from now on\n",
+                    "GPU {name}: a display frame composed on the GPU was {} ({} of {GPU_TIMEOUTS} \
+                     timeouts){}\n",
                     match shown {
                         None => "lost with its Metal device",
                         _ => "not done in time",
+                    },
+                    self.gpu_timeouts,
+                    match self.gpu_failed {
+                        true => "; the CPU composes every frame from now on",
+                        false => "",
                     }
                 ));
                 true
@@ -375,6 +390,7 @@ impl KmsScanout {
             gpu_index: None,
             gpu: None,
             gpu_failed: false,
+            gpu_timeouts: 0,
         }
     }
 
@@ -610,6 +626,11 @@ const GPU_COMPOSE: bool = true;
 /// ([`Scanout::gpu_pending_done`]): it waits behind the Metal work already
 /// on the queue, which a busy guest can make long.
 const GPU_PATIENCE_SECONDS: u64 = 2;
+
+/// Frames given up for [`GPU_PATIENCE_SECONDS`] before GPU compose ends for
+/// the boot: a guest's long submission on the shared queue delays a frame
+/// without any fault, and each frame given up costs one frame's picture.
+const GPU_TIMEOUTS: u32 = 3;
 
 /// How long a compose waits for the Metal service's turn, which a guest's
 /// call may hold, before the CPU composes the frame instead: a fraction of

@@ -1237,8 +1237,7 @@ fn report(counters: &pack::Counters) {
     ));
     let ahead = AHEAD.counts();
     output::arguments(format_args!(
-        "TRANSLATIONS ahead on={} queued={} repeated={} dropped={} present={} compiled={}          refused={} published={} unpublished={} hits={} stale={} ns/block={}
-",
+        "TRANSLATIONS ahead on={} queued={} repeated={} dropped={} present={} compiled={} refused={} published={} unpublished={} hits={} stale={} ns/block={}\n",
         AHEAD_ON.load(Ordering::Relaxed),
         ahead.queued,
         ahead.repeated,
