@@ -26,7 +26,7 @@
 //! [`take`] splits the GPU's outputs between them ([`Display::take_split`]):
 //! the main display keeps the output it would take alone, in its own size,
 //! and the guest's second display runs the next connected output in that
-//! monitor's own mode, each its own scanout ([`scanouts`]) with its own
+//! monitor's own mode, each its own scanout ([`scanout`], [`second_scanout`]) with its own
 //! buffers, refresh, vertical blanks, flips and hot-plug. Both share the
 //! node and the GPU's Metal device, whose compose marker and timeline run
 //! one frame at a time across both: the tickets are the device's
@@ -1152,12 +1152,6 @@ pub(in crate::engine) fn taken_size() -> Option<(usize, usize)> {
     taken_size_of(MAIN)
 }
 
-/// The mode of the guest's second display [`take`] took, before the
-/// board's DCP takes it: its monitor's own ([`want_second_display`]).
-pub(in crate::engine) fn second_taken_size() -> Option<(usize, usize)> {
-    taken_size_of(SECOND)
-}
-
 fn taken_size_of(slot: usize) -> Option<(usize, usize)> {
     // SAFETY: the one boot CPU, after `take` and before `scanout`.
     let taken = unsafe { &(*TAKEN.0.get()).0[slot] };
@@ -1207,16 +1201,6 @@ pub(in crate::engine) fn scanout() -> Option<Box<dyn Scanout>> {
 /// GPU.
 pub(in crate::engine) fn second_scanout() -> Option<Box<dyn Scanout>> {
     scanout_of(SECOND)
-}
-
-/// The scanouts of the displays [`take`] took, the main display's first,
-/// then the second's where there is one: index 0 and 1 of the board's
-/// scanouts. Empty when no display was taken.
-pub(in crate::engine) fn scanouts() -> Vec<Box<dyn Scanout>> {
-    [scanout(), second_scanout()]
-        .into_iter()
-        .flatten()
-        .collect()
 }
 
 fn scanout_of(slot: usize) -> Option<Box<dyn Scanout>> {
