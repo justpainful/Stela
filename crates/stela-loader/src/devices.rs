@@ -91,7 +91,7 @@
 //! explicitly refuses their overlapping ownership rather than choosing one.
 use crate::apple_device_tree::{DeviceTree, Node};
 use alloc::{format, string::String, vec::Vec};
-use stela_soc_data::board;
+use stela_soc_data::board::{self, Admission};
 
 const COMPATIBLE: &str = "compatible";
 const ROLE: &str = "role";
@@ -186,7 +186,7 @@ fn is_dart(node: &Node) -> bool {
     compatibles(node).any(|name| name.starts_with("dart,"))
 }
 
-fn modeled_dart(node: &Node) -> bool {
+fn modeled_dart(node: &Node, admission: Admission) -> bool {
     use stela_soc_data::dart::Profile;
     let Some(profile) = node
         .property(COMPATIBLE)
@@ -194,9 +194,13 @@ fn modeled_dart(node: &Node) -> bool {
     else {
         return false;
     };
-    if !compatibles(node)
-        .any(|name| board::models(name, |key| node.property(key).map(|p| p.value.as_slice())))
-    {
+    if !compatibles(node).any(|name| {
+        board::models_under(
+            name,
+            |key| node.property(key).map(|p| p.value.as_slice()),
+            admission,
+        )
+    }) {
         return false;
     }
     if profile == Profile::T8110 {
@@ -250,7 +254,7 @@ fn modeled_dart(node: &Node) -> bool {
 }
 
 /// A modeled device that is not part of an IOMMU.
-fn modeled_client(node: &Node) -> bool {
+fn modeled_client(node: &Node, admission: Admission) -> bool {
     // Only NOR-backed controllers have a modeled SPI slave. Other SPI
     // controllers must not bind drivers for absent peripherals.
     if named(node, board::SPI) && !node.children.iter().any(|child| named(child, board::NOR)) {
@@ -258,19 +262,24 @@ fn modeled_client(node: &Node) -> bool {
     }
     !is_dart(node)
         && !named(node, board::IOMMU_MAPPER)
-        && compatibles(node)
-            .any(|name| board::models(name, |key| node.property(key).map(|p| p.value.as_slice())))
+        && compatibles(node).any(|name| {
+            board::models_under(
+                name,
+                |key| node.property(key).map(|p| p.value.as_slice()),
+                admission,
+            )
+        })
 }
 
 /// The IOMMU, GPIO and interrupt-controller phandles that visible clients
 /// under `node` require.
-fn client_providers(node: &Node, parents: &mut Vec<u32>) {
-    if modeled_client(node)
+fn client_providers(node: &Node, parents: &mut Vec<u32>, admission: Admission) {
+    if modeled_client(node, admission)
         && let Some(parent) = node.property("interrupt-parent").and_then(|p| p.as_u32())
     {
         parents.push(parent);
     }
-    if modeled_client(node)
+    if modeled_client(node, admission)
         && named(node, board::SPI)
         && let Some(phandle) = node
             .property("function-spi_cs0")
@@ -278,14 +287,14 @@ fn client_providers(node: &Node, parents: &mut Vec<u32>) {
     {
         parents.push(u32::from_le_bytes(phandle.try_into().expect("4 bytes")));
     }
-    if modeled_client(node)
+    if modeled_client(node, admission)
         && let Some(property) = node.property(IOMMU_PARENT)
     {
         let cells = property.value.as_chunks::<4>().0;
         parents.extend(cells.iter().map(|cell| u32::from_le_bytes(*cell)));
     }
     for child in &node.children {
-        client_providers(child, parents);
+        client_providers(child, parents, admission);
     }
 }
 
@@ -298,13 +307,13 @@ fn kept_mapper(node: &Node, parents: &[u32]) -> bool {
 }
 
 /// Whether the machine models `node` and it serves a visible device.
-fn modeled(node: &Node, parents: &[u32]) -> bool {
+fn modeled(node: &Node, parents: &[u32], admission: Admission) -> bool {
     if named(node, board::GPIO) {
         node.property(PHANDLE)
             .and_then(|p| p.as_u32())
             .is_some_and(|p| parents.contains(&p))
     } else if is_dart(node) {
-        modeled_dart(node)
+        modeled_dart(node, admission)
             && node
                 .children
                 .iter()
@@ -316,28 +325,34 @@ fn modeled(node: &Node, parents: &[u32]) -> bool {
     } else if named(node, board::IOMMU_MAPPER) {
         kept_mapper(node, parents)
     } else {
-        modeled_client(node)
+        modeled_client(node, admission)
     }
 }
 
 /// The phandles of the `iommu-mapper` nodes under `node` whose DART the
 /// machine does not model.
-fn unmodeled_mappers(node: &Node, mappers: &mut Vec<u32>) {
+fn unmodeled_mappers(node: &Node, mappers: &mut Vec<u32>, admission: Admission) {
     for child in &node.children {
-        if !modeled_dart(node)
+        if !modeled_dart(node, admission)
             && named(child, board::IOMMU_MAPPER)
             && let Some(phandle) = child.property(PHANDLE).and_then(|p| p.as_u32())
         {
             mappers.push(phandle);
         }
-        unmodeled_mappers(child, mappers);
+        unmodeled_mappers(child, mappers, admission);
     }
 }
 
 /// Removes `compatible` from each modeled device under `node` whose
 /// `iommu-parent` names one of `mappers`, in tree order.
-fn hide_unserved_clients(node: &mut Node, path: &str, mappers: &[u32], hidden: &mut Vec<String>) {
-    let unserved = modeled_client(node)
+fn hide_unserved_clients(
+    node: &mut Node,
+    path: &str,
+    mappers: &[u32],
+    hidden: &mut Vec<String>,
+    admission: Admission,
+) {
+    let unserved = modeled_client(node, admission)
         && node.property(IOMMU_PARENT).is_some_and(|property| {
             property
                 .value
@@ -353,7 +368,7 @@ fn hide_unserved_clients(node: &mut Node, path: &str, mappers: &[u32], hidden: &
     for child in &mut node.children {
         let name = child.name().unwrap_or("?");
         let path = format!("{path}/{name}");
-        hide_unserved_clients(child, &path, mappers, hidden);
+        hide_unserved_clients(child, &path, mappers, hidden, admission);
     }
 }
 
@@ -366,14 +381,25 @@ fn hide_unserved_clients(node: &mut Node, path: &str, mappers: &[u32], hidden: &
 /// declared required function providers are unavailable get `AAPL,ignore`
 /// and an entry in that same ledger.
 pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
+    hide_unmodeled_under(tree, Admission::default())
+}
+
+/// [`hide_unmodeled`] for a boot whose options admit more of the board's
+/// modeled devices (`board::Admission`): `--second-display` keeps the
+/// DCP-role pipeline (`dcp`, `dcp0-expert`, `disp0`) and, through their
+/// `iommu-parent`s, `dart-dcp` and `dart-disp0` with their mappers, and
+/// marks `iop-dcp-nub` a running native RTKit as `dcpext`'s. Nothing is
+/// added to the tree: a board without those nodes keeps none, and one with
+/// an incomplete graph loses all three, as `dcpext`'s would.
+pub fn hide_unmodeled_under(tree: &mut DeviceTree, admission: Admission) -> Vec<String> {
     let mut mappers = Vec::new();
-    unmodeled_mappers(&tree.root, &mut mappers);
+    unmodeled_mappers(&tree.root, &mut mappers, admission);
     let mut hidden = Vec::new();
-    hide_unserved_clients(&mut tree.root, "", &mappers, &mut hidden);
-    hide_incomplete_external_outputs(tree, &mut hidden);
+    hide_unserved_clients(&mut tree.root, "", &mappers, &mut hidden, admission);
+    hide_incomplete_external_outputs(tree, &mut hidden, admission);
     let mut parents = Vec::new();
-    client_providers(&tree.root, &mut parents);
-    visit(&mut tree.root, "", &parents, &[], &mut hidden);
+    client_providers(&tree.root, &mut parents, admission);
+    visit(&mut tree.root, "", &parents, &[], &mut hidden, admission);
     hide_unprovided_buttons(tree, &mut hidden);
     hide_unprovided_clients(tree, &mut hidden);
     hide_unused_spmi(tree, &mut hidden);
@@ -550,8 +576,18 @@ fn hide_unused_spmi(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
 /// source-backed graph. IOMMU failures above cannot leave an expert advertising
 /// a service for a controller that was removed. The final retirement pass also
 /// removes raw display-subsystem advertisements for a hidden pipe.
-fn hide_incomplete_external_outputs(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
+///
+/// A second display's pipeline the boot does not ask for is left to the
+/// ordinary pass, which hides it as an unmodeled device, as it always has.
+fn hide_incomplete_external_outputs(
+    tree: &mut DeviceTree,
+    hidden: &mut Vec<String>,
+    admission: Admission,
+) {
     for profile in board::EXTERNAL_OUTPUTS {
+        if profile.second_display && !admission.second_display {
+            continue;
+        }
         let paths = [profile.controller, profile.expert, profile.pipe]
             .map(|name| format!("/arm-io/{name}"));
         if tree.node(&paths[0]).is_none()
@@ -565,7 +601,7 @@ fn hide_incomplete_external_outputs(tree: &mut DeviceTree, hidden: &mut Vec<Stri
         let controller = tree.node(&paths[0]);
         let expert = tree.node(&paths[1]);
         let pipe = tree.node(&paths[2]);
-        let qualified = profile.admitted
+        let qualified = profile.admitted_under(admission)
             && controller.is_some_and(|n| {
                 named(n, board::ASC)
                     && n.property("role")
@@ -910,6 +946,7 @@ fn visit(
     parents: &[u32],
     inherited: &[&board::ChildModel],
     hidden: &mut Vec<String>,
+    admission: Admission,
 ) {
     let inherited_model = inherited
         .iter()
@@ -923,9 +960,13 @@ fn visit(
     }
     let own: Vec<(&str, &[u8])> = compatibles(node)
         .flat_map(|name| {
-            board::model_boot_properties(name, |key| node.property(key).map(|p| p.value.as_slice()))
-                .iter()
-                .copied()
+            board::model_boot_properties_under(
+                name,
+                |key| node.property(key).map(|p| p.value.as_slice()),
+                admission,
+            )
+            .iter()
+            .copied()
         })
         .collect();
     for (key, value) in own {
@@ -934,14 +975,19 @@ fn visit(
     }
     let owned: Vec<&board::ChildModel> = compatibles(node)
         .flat_map(|name| {
-            board::model_children(name, |key| node.property(key).map(|p| p.value.as_slice())).iter()
+            board::model_children_under(
+                name,
+                |key| node.property(key).map(|p| p.value.as_slice()),
+                admission,
+            )
+            .iter()
         })
         .chain(inherited_model.into_iter().flat_map(|model| model.children))
         .collect();
     let here = if path.is_empty() { "/" } else { path };
     if node.property(COMPATIBLE).is_some()
         && !structural(here)
-        && !modeled(node, parents)
+        && !modeled(node, parents, admission)
         && !inherited.iter().any(|model| named(node, model.compatible))
     {
         node.remove_property(COMPATIBLE);
@@ -950,7 +996,7 @@ fn visit(
     for child in &mut node.children {
         let name = child.name().unwrap_or("?");
         let path = format!("{path}/{name}");
-        visit(child, &path, parents, &owned, hidden);
+        visit(child, &path, parents, &owned, hidden, admission);
     }
 }
 

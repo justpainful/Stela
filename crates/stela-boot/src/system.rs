@@ -663,6 +663,7 @@ fn translation_store(
     mut files: BundleFiles,
     mut storage: Option<stela_drivers::Handoff>,
     cores: usize,
+    runners: usize,
     pending: u64,
 ) -> (BundleFiles, Option<stela_drivers::Handoff>) {
     use crate::engine::translations::PackRead;
@@ -670,7 +671,7 @@ fn translation_store(
     // Without a memory map the pack gets nothing; the parts' sizing
     // reports the map's absence.
     let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
-    let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
+    let budget = stela_boot_core::host_memory::pack_budget(free, cores, runners);
     let Some(store) = crate::engine::translations::read(budget) else {
         crate::status::done("none on this USB");
         return (files, storage);
@@ -750,15 +751,25 @@ fn load(
     };
     let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
-    let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
+    let runners = system.assigned_native_cores(available_cores, bundle_pes)?;
+    // Efficiency cores right after the PEs' run the GPUs' compile jobs.
+    let workers = crate::native_smp::firmware::compile_workers(
+        native_processors,
+        runners,
+        system.compile_workers,
+    );
+    let cores = runners + workers;
+    output::arguments(format_args!(
+        "NATIVE COMPILE WORKERS {workers} beside {runners} PE executors\n"
+    ));
     // The translation cache takes only what the parts and the guest leave,
     // so it is read last before they are reserved: only the engine image's
     // copy comes between.
     let image_bytes = crate::native_image::ResidentImage::allocation_bytes(snapshot.bytes);
-    let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
+    let (bundle, storage) = translation_store(bundle, storage, cores, runners, image_bytes);
     crate::status::begin("Setting up Stela's memory");
     let image = memory::prepare_image(&snapshot)?;
-    let mut memory = memory::reserve(cores, &image.ram)?;
+    let mut memory = memory::reserve(cores, runners, &image.ram)?;
     let tsc_hz = crate::firmware::tsc_hz();
     if !crate::cpu::INVARIANT_TSC.present() {
         output::arguments(format_args!(

@@ -1619,7 +1619,17 @@ struct SharedEntry {
     translation: Arc<SharedTranslation>,
     /// Immutable owner charge, computed once before admission.
     bytes: usize,
+    /// Charged to the blocks translated ahead of execution
+    /// ([`Store::ahead_bytes`]) until a PE runs it ([`Store::promote_shared`]).
+    ahead: bool,
 }
+
+/// The part of the shared bound blocks translated ahead of execution may
+/// take, as one in this many: speculation never takes the room of blocks
+/// PEs ran, and the oldest of them are not evicted for it. A quarter left
+/// 73% of a desktop session's blocks translated ahead unpublished, with the
+/// shared store evicting little: half of it.
+pub const AHEAD_SHARE: usize = 2;
 
 /// One local producer's shared offer, allocated and charged before the
 /// producer acquires the store lock.
@@ -1634,6 +1644,11 @@ impl StagedOffer {
     pub fn new(offer: Offer, bound: usize) -> Option<Self> {
         let (key, bytes) = Self::charge(&offer, bound)?;
         Some(Self::entry(key, bytes, offer.shared()))
+    }
+
+    /// Whether a store has yet to take it ([`Store::accept_shared`]).
+    pub fn pending(&self) -> bool {
+        self.entry.is_some()
     }
 
     fn charge(offer: &Offer, bound: usize) -> Option<(SharedKey, usize)> {
@@ -1654,7 +1669,11 @@ impl StagedOffer {
     fn entry(key: SharedKey, bytes: usize, translation: Arc<SharedTranslation>) -> Self {
         Self {
             key,
-            entry: Some(SharedEntry { translation, bytes }),
+            entry: Some(SharedEntry {
+                ahead: translation.ahead(),
+                translation,
+                bytes,
+            }),
         }
     }
 }
@@ -1823,6 +1842,9 @@ pub struct Store<'a> {
     shared_order: VecDeque<SharedKey>,
     shared_bytes: usize,
     shared_bound: usize,
+    /// Of `shared_bytes`, the blocks translated ahead no PE ran yet, at most
+    /// a [`AHEAD_SHARE`]th of the bound.
+    ahead_bytes: usize,
     misses: MissTables,
     pub counters: Counters,
 }
@@ -1901,6 +1923,7 @@ impl<'a> Store<'a> {
             shared_order: VecDeque::new(),
             shared_bytes: 0,
             shared_bound: 0,
+            ahead_bytes: 0,
             misses: MissTables::default(),
             taken: SeenFilter::default(),
             refused: SeenFilter::default(),
@@ -1952,6 +1975,13 @@ impl<'a> Store<'a> {
         }
     }
 
+    /// Whether it shares a block at `pc` of the page whose bytes hash to
+    /// `key`, in `context`, without counting a lookup: a block translated
+    /// ahead of execution would only take its place.
+    pub fn holds_shared(&self, key: &Digest, pc: u64, context: &Digest) -> bool {
+        self.shared.contains_key(&shared_key(key, pc, context))
+    }
+
     fn shared_usage(&self) -> usize {
         self.shared_bytes
             .saturating_add(self.shared_order.capacity() * size_of::<SharedKey>())
@@ -1961,11 +1991,25 @@ impl<'a> Store<'a> {
         while let Some(oldest) = self.shared_order.pop_front() {
             if let Some(evicted) = self.shared.remove(&oldest) {
                 self.shared_bytes -= evicted.bytes;
+                if evicted.ahead {
+                    self.ahead_bytes -= evicted.bytes;
+                }
                 self.misses.evicted(oldest);
                 return Some(evicted);
             }
         }
         None
+    }
+
+    /// A PE ran the shared block at `pc` of the page `key` in `context`, which
+    /// a compile worker translated ahead: it is charged as any block PEs
+    /// ran from now on, and no longer to the speculative share.
+    pub fn promote_shared(&mut self, key: &Digest, pc: u64, context: &Digest) {
+        if let Some(entry) = self.shared.get_mut(&shared_key(key, pc, context))
+            && core::mem::replace(&mut entry.ahead, false)
+        {
+            self.ahead_bytes -= entry.bytes;
+        }
     }
 
     /// Admit a preallocated shared block. The producer can drop a displaced
@@ -1976,8 +2020,34 @@ impl<'a> Store<'a> {
 
         let key = staged.key;
         self.misses.offered(key);
-        let bytes = staged.entry.as_ref()?.bytes;
+        let (bytes, ahead) = staged
+            .entry
+            .as_ref()
+            .map(|entry| (entry.bytes, entry.ahead))?;
         if bytes > self.shared_bound {
+            return None;
+        }
+        // A block translated ahead takes only free room in its share, and
+        // never a block's another offer or PEs' runs put there: the
+        // producer keeps it, declined.
+        if ahead {
+            if self.shared.contains_key(&key)
+                || self.ahead_bytes.saturating_add(bytes) > self.shared_bound / AHEAD_SHARE
+                || self.shared_usage().saturating_add(bytes) > self.shared_bound
+                || self.shared_order.try_reserve(1).is_err()
+            {
+                return None;
+            }
+            // A FIFO allocation can itself exceed the budget.
+            let fifo = self.shared_order.capacity() * size_of::<SharedKey>();
+            if self.shared_bytes.saturating_add(fifo).saturating_add(bytes) > self.shared_bound {
+                return None;
+            }
+            self.shared
+                .insert(key, staged.entry.take().expect("staged entry"));
+            self.shared_order.push_back(key);
+            self.shared_bytes += bytes;
+            self.ahead_bytes += bytes;
             return None;
         }
         let mut deferred = None;
@@ -1989,6 +2059,9 @@ impl<'a> Store<'a> {
                         <= self.shared_bound =>
                 {
                     self.shared_bytes = self.shared_bytes - slot.get().bytes + bytes;
+                    if slot.get().ahead {
+                        self.ahead_bytes -= slot.get().bytes;
+                    }
                     let old = slot.insert(staged.entry.take().expect("staged entry"));
                     retire(old, &mut deferred);
                     return deferred;
@@ -2550,6 +2623,52 @@ mod tests {
         assert!(store.accept_shared(&mut staged).is_none());
         assert!(staged.entry.is_some());
         assert!(store.prepared(&key, 0x1000, &context).is_none());
+    }
+
+    #[test]
+    fn blocks_translated_ahead_take_only_free_room_in_their_share_until_a_pe_runs_them() {
+        let key = Digest::of(b"page");
+        let ran = offer(0x1000, key);
+        let bytes = ran.clone().retained_bytes() + size_of::<(SharedKey, SharedEntry)>();
+        let (mut store, _) = Store::new(Digest::of(b"translator"), None);
+        // Room for two blocks per share part: two of them speculative, the
+        // FIFO's own charge left over.
+        store.share(2 * AHEAD_SHARE * bytes + 8 * size_of::<SharedKey>());
+        store.offer(ran.clone());
+        for pc in [0x1008, 0x1010, 0x1018] {
+            store.offer(offer(pc, key).marked_ahead());
+        }
+        let held = |store: &Store, pc| store.holds_shared(&key, pc, &ran.context());
+        assert!(held(&store, 0x1000));
+        assert!(held(&store, 0x1008) && held(&store, 0x1010));
+        // The share is full: the third waits rather than take more room.
+        assert!(!held(&store, 0x1018));
+        assert_eq!(store.ahead_bytes, 2 * bytes);
+        // A PE ran one: it is charged as PEs' blocks are, and the share has
+        // room again.
+        store.promote_shared(&key, 0x1008, &ran.context());
+        assert_eq!(store.ahead_bytes, bytes);
+        store.offer(offer(0x1018, key).marked_ahead());
+        assert!(held(&store, 0x1018));
+        // A block translated ahead never replaces one already shared, and
+        // a PE's own offer replaces one translated ahead.
+        store.offer(offer(0x1000, key).marked_ahead());
+        assert_eq!(store.ahead_bytes, 2 * bytes);
+        store.offer(offer(0x1010, key));
+        assert_eq!(store.ahead_bytes, bytes);
+        // Full of PEs' blocks, the store forgets its oldest for a PE's
+        // offer, never for speculation.
+        for pc in (0x1020..0x1060).step_by(8) {
+            store.offer(offer(pc, key));
+        }
+        let before = store.shared.len();
+        store.offer(offer(0x1060, key).marked_ahead());
+        assert!(store.shared.len() <= before);
+        assert!(!held(&store, 0x1060));
+        assert_eq!(
+            store.shared.values().filter(|entry| entry.ahead).count() * bytes,
+            store.ahead_bytes
+        );
     }
 
     #[test]

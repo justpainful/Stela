@@ -204,6 +204,62 @@ fn malformed_snoop_capabilities_rejected() {
 }
 
 #[test]
+fn an_express_less_pch_function_writes_its_vendor_devc() {
+    // A Skylake-and-later PCH HD Audio function (8086:7a50 on a B760) is
+    // root-complex integrated: PM50 -> MSI60 -> MSI-Xb0, no Express
+    // capability, and DEVC78 is a vendor register, as Linux writes it.
+    let (mut function, timer, bar) = pch_fixture(0x8c20, 2, 9);
+    let msi = function.config().words[24];
+    function.config().words[24] = (msi & !0xff00) | 0xb000;
+    function.config().words[28] = 0;
+    assert_ne!(function.config().words[30] & 0x0800, 0, "NSNPEN starts set");
+    prepare_model(&mut function, &timer, bar).unwrap();
+    assert!(
+        function
+            .config()
+            .writes
+            .iter()
+            .any(|(offset, _, _, _)| *offset == 0x78),
+        "the snoop control was written"
+    );
+    assert_eq!(function.config().words[30] & 0x0800, 0, "NSNPEN cleared");
+}
+
+#[test]
+fn a_parked_function_is_woken_to_d0_with_decode_for_the_mapped_preflight() {
+    // A PCH controller left in D3hot with memory decode off: the mapped
+    // preflight refused it `PowerNotReady` (8086:7a50 on a B760).
+    let (mut function, timer, bar) = pch_fixture(0x8c20, 2, 9);
+    let command = function.config().get16(regs::COMMAND);
+    function
+        .config()
+        .set16(regs::COMMAND, command & !regs::COMMAND_MEMORY);
+    function.config().set16(0x54, 3);
+    let bars: Vec<u32> = (0..6).map(|i| function.config().words[4 + i]).collect();
+    // SAFETY: the local model is the function's sole owner.
+    unsafe { enable_for_mapped_preflight(&mut function, bar, &timer) }.unwrap();
+    assert_eq!(function.config().get16(0x54) & 3, 0, "D0");
+    assert_ne!(
+        function.config().get16(regs::COMMAND) & regs::COMMAND_MEMORY,
+        0,
+        "memory decode on"
+    );
+    assert_eq!(
+        function.config().get16(regs::COMMAND) & regs::COMMAND_MASTER,
+        0,
+        "bus mastering left to the driver"
+    );
+    assert!(timer.now_us() >= 10_000, "the D3hot exit's 10 ms");
+    let after: Vec<u32> = (0..6).map(|i| function.config().words[4 + i]).collect();
+    assert_eq!(bars, after);
+    // Already awake: nothing more is written.
+    let written = function.config().writes.len();
+    // SAFETY: as above.
+    unsafe { enable_for_mapped_preflight(&mut function, bar, &timer) }.unwrap();
+    assert_eq!(function.config().writes.len(), written);
+}
+
+#[test]
 fn snoop_failure_stops_at_the_failed_control() {
     for variant in 0..3 {
         let (mut function, timer, bar) = pch_fixture(0x9ca0, 2, 9);

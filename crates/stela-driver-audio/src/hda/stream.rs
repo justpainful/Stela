@@ -443,6 +443,60 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         Ok(())
     }
 
+    /// Write PCM into a running analog playback ring at `offset`, as an
+    /// owner that follows the link position itself keeps its frames ahead
+    /// of it (`stela_boot_core::host_audio`): aligned volatile words, as the
+    /// HDMI refill writes them, never a slice over RAM the controller reads.
+    /// The owner keeps its writes out of the span from LPIB through the
+    /// stream's FIFO ([`Self::stream_fifo_bytes`]), which the controller may
+    /// have fetched already; bytes written there play as the controller
+    /// fetched them. An HDMI-bound stream refills through its own owner.
+    pub fn write_running_pcm(
+        &mut self,
+        id: StreamId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.minimum_guard()?;
+        if self.hdmi_stream_port(id).is_some() {
+            return Err(Error::InvalidStream);
+        }
+        let stream = self.stream(id)?;
+        if !stream.running {
+            return Err(Error::StreamStopped);
+        }
+        if stream.direction != Direction::Playback
+            || !offset.is_multiple_of(4)
+            || !bytes.len().is_multiple_of(4)
+            || offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > stream.buffer.len())
+        {
+            return Err(Error::InvalidBuffer);
+        }
+        let buffer = &mut self.streams[usize::from(id.index)]
+            .as_mut()
+            .ok_or(Error::InvalidStream)?
+            .buffer;
+        for (word, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            buffer.write(offset + word * 4, u32::from_le_bytes(*chunk).to_le());
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The stream's FIFO size in bytes (SDnFIFOS, HDA 1.0a 3.3.39): how far
+    /// past LPIB the controller may have fetched a playback ring.
+    pub fn stream_fifo_bytes(&mut self, id: StreamId) -> Result<u16, Error> {
+        self.minimum_guard()?;
+        self.stream(id)?;
+        let offset = stream_base(id.index) + 0x10;
+        match self.registers.read16(offset) {
+            u16::MAX => Err(Error::RegisterUnavailable { offset }),
+            fifo => Ok(fifo),
+        }
+    }
+
     pub fn start(&mut self, id: StreamId) -> Result<(), Error> {
         self.minimum_guard()?;
         if self.routing_failed {

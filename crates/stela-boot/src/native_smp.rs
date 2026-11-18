@@ -29,13 +29,14 @@ pub(crate) unsafe fn validate(
     requested: Option<usize>,
 ) -> Result<Option<&'static firmware::Capture>> {
     let cores = handoff.native_resources.cores as usize;
-    if cores == 0 || cores > topology::MAX_CORES {
+    let runners = handoff.native_resources.runners as usize;
+    if cores == 0 || cores > topology::MAX_CORES || runners == 0 || runners > cores {
         return Err(refuse!("native processor count is outside capacity"));
     }
     let resources = &handoff.native_resources;
-    // The loader reserves fewer than requested only when firmware left no
-    // AP startup page.
-    if requested.is_some_and(|requested| cores > requested)
+    // The loader reserves fewer PE executors than requested only when
+    // firmware left no AP startup page; compile workers come on top.
+    if requested.is_some_and(|requested| runners > requested)
         || resources.stacks.bytes != resources::STACK_BYTES * cores as u64
         || resources.stacks.physical == 0
     {
@@ -103,7 +104,7 @@ pub(crate) unsafe fn validate(
     }
     let last = resources::partition(
         cores,
-        cores,
+        runners,
         cores - 1,
         handoff.code.bytes,
         handoff.pool.bytes,

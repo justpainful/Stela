@@ -789,6 +789,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if !matches && let Some(translations) = self.host.translations() {
                     translations.note(super::StoreEvent::SharedRejected);
                 }
+                self.note_ahead(&compiled, matches);
                 if matches {
                     self.statistics.shared += 1;
                     self.count_store_source(StoreSource::Shared);
@@ -925,6 +926,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
             );
             self.code.rebases.keep(key, offset as u16, context, entry);
         }
+        // Its successors in this page, compiled on processors that run no
+        // PE while this one runs it ([`super::ahead`]).
+        if let (Some((key, record)), Some(_)) = (&stored, &context)
+            && !successors.is_empty()
+        {
+            self.translate_ahead(
+                pc,
+                physical,
+                *key,
+                record.as_deref(),
+                &emission.preparation,
+                &successors,
+            );
+        }
         // A store keeps an offer's stored form within its own bound, and its
         // pack writer sheds offers before the heap runs short (writer
         // `govern`): memory low, as the heap rests once
@@ -943,6 +958,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 emission: emission.clone(),
                 successors,
                 quiet: self.cpu.pstate.el == 0,
+                ahead: false,
             };
             translations.offer(offer);
             self.statistics.offered += 1;

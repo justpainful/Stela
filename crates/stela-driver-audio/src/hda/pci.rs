@@ -504,6 +504,8 @@ fn capabilities<C: ConfigSpace>(
     }
     // Capability bodies and controls are checked separately so the one owned
     // PCIe Device Control field is allowed without allowing body/body aliases.
+    // An unknown body that starts below the end of PCH78 could cover it.
+    let mut unknown_before_devc = false;
     for entry in config.capabilities() {
         let entry = entry?;
         let (offset16, id) = (entry.offset, entry.id);
@@ -531,6 +533,11 @@ fn capabilities<C: ConfigSpace>(
         };
         let start = usize::from(offset16);
         let end = start + usize::from(entry.bytes);
+        if !matches!(id, CAP_PM | CAP_MSI | CAP_MSIX | CAP_PCIE)
+            && start < usize::from(SCH_HDA_DEVC + 2)
+        {
+            unknown_before_devc = true;
+        }
         if reset_policy == ResetPolicy::IntelClockGate
             && ((start < usize::from(CGCTL + 4) && usize::from(CGCTL) < end)
                 // An unknown body's end cannot prove vendor-control ownership.
@@ -565,10 +572,19 @@ fn capabilities<C: ConfigSpace>(
             *slot = Some(offset16);
         }
     }
-    // PCH78 is Device Control, so require its known endpoint owner.
-    // Missing/unknown capabilities do not authorize writing an ambiguous body.
-    if controls.contains(&PCH_SNOOP) && found.pcie != Some(SCH_HDA_DEVC - 8) {
-        return refuse(CapabilityRefusal::PcieOwnerMissing { found: found.pcie });
+    // On ICH and older PCH functions PCH78 is PCIe Device Control, so its
+    // known endpoint owner is required. A Skylake-and-later PCH HD Audio
+    // function (8086:7a50 on a B760) is root-complex integrated with no
+    // Express capability: there PCH78 is the vendor DEVC register, which
+    // Linux's azx_init_pci writes for AZX_DCAPS_SCH_SNOOP without a
+    // capability check. Known bodies over it were refused above
+    // (ControlOverlap); an unknown body that may cover it still refuses.
+    if controls.contains(&PCH_SNOOP) {
+        match found.pcie {
+            Some(owner) if owner == SCH_HDA_DEVC - 8 => {}
+            None if !unknown_before_devc => {}
+            found => return refuse(CapabilityRefusal::PcieOwnerMissing { found }),
+        }
     }
     Ok(found)
 }
@@ -664,6 +680,91 @@ pub unsafe fn prepare_cold_with_registers<'a, C: ConfigSpace, R: Registers>(
 ) -> Result<PciRegisters<R, &'a mut Function<C>>, AttachError> {
     // SAFETY: forwarded original-owner cold containment prerequisites.
     unsafe { prepare_mapped(function, bar0, timer, ownership, registers, false) }
+}
+
+/// Linux `azx_probe`'s `pci_enable_device` for the mapped paths, which require
+/// the function in D0 with memory decode on: once the identity proves a plain
+/// HD Audio function (no DSP or unknown profile, [`identify`]), bring it from
+/// D3hot or D2 to D0 with the PCI PM waits, restore its BARs when the exit
+/// reset them, and enable memory decode only. Bus mastering, snoop, MSI and
+/// every controller register stay untouched, for the preflight to inspect.
+/// A function already in D0 with decode on sees no write. Firmware or the
+/// native mount can leave a parked PCH controller in D3hot or with decode off
+/// (an MSI PRO B760M-P's 8086:7a50 refused `PowerNotReady` without this).
+///
+/// # Safety
+/// The platform prerequisites of [`prepare_with_registers`] apply, except the
+/// D0/decode state this establishes; the caller keeps BAR0 reserved and
+/// unmoved and exclusively owns the function's configuration space.
+pub unsafe fn enable_for_mapped_preflight<C: ConfigSpace>(
+    function: &mut Function<C>,
+    bar0: Bar,
+    timer: &impl Timer,
+) -> Result<(), AttachError> {
+    timer.check().map_err(AttachError::MinimumDelay)?;
+    let selected = identify(function)?;
+    let config = function.config();
+    let (base, _, wide) = validated_bar(config, bar0)?;
+    let (_, caps) = controls_and_capabilities(config, selected)?;
+    let command = config.read16(regs::COMMAND)?;
+    if command == u16::MAX {
+        return Err(AttachError::ConfigurationRejected);
+    }
+    if let Some(pm) = caps.pm {
+        let version = config.read16(pm + 2)? & 7;
+        let value = config.read16(pm + 4)?;
+        if !(1..=3).contains(&version) || value == u16::MAX {
+            return Err(AttachError::UnsupportedPowerManagement);
+        }
+        let state = value & PM_STATE;
+        if state != 0 {
+            // As `prepare`: save the BARs a D3hot exit may reset, and keep
+            // decode and mastering off across the transition.
+            let mut bars = [0; 6];
+            for (index, bar) in bars.iter_mut().enumerate() {
+                *bar = config.read32(regs::BASE_ADDRESS_0 + index as u16 * 4)?;
+            }
+            if bars.contains(&u32::MAX) {
+                return Err(AttachError::ConfigurationRejected);
+            }
+            let quiet = command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER)
+                | regs::COMMAND_INTX_DISABLE;
+            config.write16(regs::COMMAND, quiet)?;
+            // PME_Status is W1C: write zero to preserve pending wake evidence.
+            config.write16(pm + 4, value & !(PM_STATE | PM_PME_ENABLE | PM_PME_STATUS))?;
+            delay(
+                timer,
+                match state {
+                    3 => 10_000,
+                    2 => 200,
+                    _ => 0,
+                },
+            )?;
+            if config.read16(pm + 4)? & PM_STATE != 0 {
+                return Err(AttachError::PowerTransition);
+            }
+            if state == 3 && value & PM_NO_SOFT_RESET == 0 {
+                for (index, value) in bars.iter().enumerate() {
+                    config.write32(regs::BASE_ADDRESS_0 + index as u16 * 4, *value)?;
+                }
+            }
+        }
+    }
+    if !bar_matches(config, base, wide)? {
+        return Err(AttachError::InvalidBar);
+    }
+    let command = config.read16(regs::COMMAND)?;
+    if command == u16::MAX {
+        return Err(AttachError::ConfigurationRejected);
+    }
+    if command & regs::COMMAND_MEMORY == 0 {
+        let enabled = command | regs::COMMAND_MEMORY;
+        config.write16(regs::COMMAND, enabled)?;
+        if config.read16(regs::COMMAND)? & regs::COMMAND_MEMORY == 0 {
+            return Err(AttachError::ConfigurationRejected);
+        }
+    }
+    Ok(())
 }
 
 unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(

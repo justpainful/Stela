@@ -107,7 +107,7 @@
 //! accumulated lag, as on a machine whose counter was paused, and ahead by
 //! any idle leaps. A shared count repays the lag its holds left: once no
 //! hold is in force it runs [`SLEW_PARTS`]⁻¹ (1%) faster than the host's,
-//! in steps of at most [`SLEW_STEP_PARTS`]⁻¹ of the stall limit, until it
+//! [`FAST_SLEW_PARTS`]⁻¹ (10%) while more than a second is owed, in steps of at most [`SLEW_STEP_PARTS`]⁻¹ of the stall limit, until it
 //! is back on the host's count ([`SharedClock::look`]). A step only raises
 //! the offset, so every reader's count stays monotonic, and waits and
 //! native deadlines count the slew in, so no timer is late for it.
@@ -206,6 +206,26 @@ const UNBOUNDED: u64 = u64::MAX;
 /// of wall time.
 pub(super) const SLEW_PARTS: u64 = 100;
 
+/// While more than [`FAST_LAG_STALLS`] stall limits of lag are owed (a
+/// second at 50 ms), the slew repays one count for each this many host
+/// counts instead: 10% fast. A long freeze leaves minutes of lag, which at
+/// 1% takes days to repay, and the guest's time of day stays that far
+/// behind meanwhile (TLS certificates, two-factor codes and Apple's
+/// sign-in compare it with the servers'). Timers still fire on their
+/// count; they only come that much sooner in wall time while it lasts.
+pub(super) const FAST_SLEW_PARTS: u64 = 10;
+pub(super) const FAST_LAG_STALLS: u64 = 20;
+
+/// The host counts the slew takes to repay one count while `lag` counts
+/// are owed, with a stall limit of `stall` counts.
+fn slew_parts(lag: u64, stall: u64) -> u64 {
+    if stall != 0 && lag > stall.saturating_mul(FAST_LAG_STALLS) {
+        FAST_SLEW_PARTS
+    } else {
+        SLEW_PARTS
+    }
+}
+
 /// In parts of the stall limit: the least host time between two slew
 /// steps (3.1 ms at 50 ms, a step of at most 31 us), so that the state
 /// native reads share sees at most a few hundred writes a second while
@@ -271,14 +291,17 @@ struct Seen {
     lag: u64,
     slewed: u64,
     host: u64,
+    /// The host counts a slew step takes for each count it repays at this
+    /// lag ([`slew_parts`]).
+    parts: u64,
 }
 
 impl Seen {
     /// The highest the offset can be at host count `host`: a slew adds at
-    /// most one count for each [`SLEW_PARTS`] host counts since `slewed`,
-    /// and never more than the lag. A ceiling only lowers the count.
+    /// most one count for each `parts` host counts since `slewed`, and
+    /// never more than the lag. A ceiling only lowers the count.
     fn offset_by(&self, host: u64) -> u64 {
-        let ahead = host.saturating_sub(self.slewed) / SLEW_PARTS;
+        let ahead = host.saturating_sub(self.slewed) / self.parts.max(1);
         self.offset.wrapping_add(self.lag.min(ahead))
     }
 
@@ -291,9 +314,11 @@ impl Seen {
         if self.lag == 0 || plain <= first {
             return plain;
         }
-        // The least `d` with `d + d / SLEW_PARTS` at least `plain - slewed`.
+        // The least `d` with `d + d / parts` at least `plain - slewed`. A
+        // lag that falls below the fast slew's bound on the way slews
+        // slower after, so the answer is early, never late.
         let distance = plain - self.slewed;
-        let full = self.slewed + distance - distance / (SLEW_PARTS + 1);
+        let full = self.slewed + distance - distance / (self.parts.max(1) + 1);
         full.max(plain.saturating_sub(self.lag)).max(first)
     }
 }
@@ -542,14 +567,16 @@ impl SharedClock {
         let slewed = self.slewed.load(Ordering::Relaxed);
         let since = host.saturating_sub(slewed);
         if self.state.ceiling.load(Ordering::Relaxed) == UNBOUNDED && lag != 0 && since >= step {
-            let repay = lag.min(since / SLEW_PARTS);
+            // The rate of the lag this step starts from, as readers that
+            // saw this lag predict it ([`Seen::offset_by`]).
+            let parts = slew_parts(lag, self.stall.load(Ordering::Relaxed));
+            let repay = lag.min(since / parts);
             self.state
                 .offset
                 .store(offset.wrapping_add(repay), Ordering::Relaxed);
             // The remainder counts toward the next step; repaid in full,
             // the next lag's slew starts from its settle.
-            self.slewed
-                .store(slewed + repay * SLEW_PARTS, Ordering::Relaxed);
+            self.slewed.store(slewed + repay * parts, Ordering::Relaxed);
             self.repaid.fetch_add(repay, Ordering::Relaxed);
         }
         self.unlock(sequence);
@@ -665,11 +692,13 @@ impl SharedClock {
             let host = sampled(counter);
             fence(Ordering::Acquire);
             if self.state.sequence.load(Ordering::Relaxed) == sequence {
+                let lag = target.wrapping_sub(offset);
                 let seen = Seen {
                     offset,
-                    lag: target.wrapping_sub(offset),
+                    lag,
                     slewed,
                     host,
+                    parts: slew_parts(lag, self.stall.load(Ordering::Relaxed)),
                 };
                 return (host.wrapping_add(offset).min(ceiling), seen);
             }
@@ -690,11 +719,13 @@ impl SharedClock {
             let slewed = self.slewed.load(Ordering::Relaxed);
             fence(Ordering::Acquire);
             if self.state.sequence.load(Ordering::Relaxed) == sequence {
+                let lag = target.wrapping_sub(offset);
                 return Seen {
                     offset,
-                    lag: target.wrapping_sub(offset),
+                    lag,
                     slewed,
                     host: 0,
+                    parts: slew_parts(lag, self.stall.load(Ordering::Relaxed)),
                 };
             }
         }

@@ -16,6 +16,7 @@
 //! when they allow host transfers and otherwise at the start of the next
 //! submission, and stay there.
 mod blocks;
+mod compose;
 mod deferral;
 pub use deferral::take_turn_work as take_pipeline_turn_work;
 mod device_generated;
@@ -262,7 +263,8 @@ unsafe extern "system" fn forward(
 /// `stela_metal_resolve_dispatches_kernel`, `stela_metal_store_texels_kernel`,
 /// `stela_metal_load_texels_kernel`, `stela_metal_average_samples_kernel`,
 /// `stela_metal_decode_etc_kernel`, `stela_metal_decode_pvrtc_kernel`,
-/// `stela_metal_reorder_blocks_kernel` and `stela_metal_decode_astc_kernel`
+/// `stela_metal_reorder_blocks_kernel`, `stela_metal_decode_astc_kernel` and
+/// `stela_metal_compose_kernel`
 /// (`compiler/metal_abi.h`).
 #[derive(Clone, Copy, Debug)]
 pub struct InternalKernels {
@@ -303,6 +305,10 @@ pub struct InternalKernels {
     /// Decodes a buffer's ASTC LDR blocks into a texture's image as
     /// [`decode_etc`](Self::decode_etc) does.
     pub decode_astc: ShaderCode,
+    /// Composes the guest's display frames per
+    /// [`Arguments`](super::compose::Arguments), one thread per scanout
+    /// pixel in workgroups of `WORKGROUP_SIZE`.
+    pub compose: ShaderCode,
 }
 
 /// How the driver takes memory a CPU reaches: its kernel driver maps a dma-buf.
@@ -613,6 +619,12 @@ pub struct NativeBackend {
     decode_pvrtc: vk::Pipeline,
     reorder_blocks: vk::Pipeline,
     decode_astc: vk::Pipeline,
+    compose: vk::Pipeline,
+    /// The display frames composed here ([`compose`]), once a scanout
+    /// buffer was imported.
+    compositor: Option<compose::Compositor>,
+    /// The family of the queue.
+    queue_family: u32,
     /// The cache compiled pipelines read and fill, kept across boots.
     store: pipeline_store::Persisted,
     /// Pipeline creations deferred outside the service's turn.
@@ -868,6 +880,9 @@ impl NativeBackend {
             decode_pvrtc: vk::Pipeline::null(),
             reorder_blocks: vk::Pipeline::null(),
             decode_astc: vk::Pipeline::null(),
+            compose: vk::Pipeline::null(),
+            compositor: None,
+            queue_family: family,
             store: pipeline_store::Persisted::none(loader.log),
             deferral: deferral::Deferral::default(),
             premade: premade::Premade::default(),
@@ -902,6 +917,12 @@ impl NativeBackend {
         backend.decode_pvrtc = backend.create_compute(&kernel(kernels.decode_pvrtc))?;
         backend.reorder_blocks = backend.create_compute(&kernel(kernels.reorder_blocks))?;
         backend.decode_astc = backend.create_compute(&kernel(kernels.decode_astc))?;
+        // The display's compose is an extra: a kernel the driver does not
+        // take leaves the display composed on the CPU, never the device
+        // unopened ([`Self::import_compose_target`] refuses then).
+        backend.compose = backend
+            .create_compute(&kernel(kernels.compose))
+            .unwrap_or(vk::Pipeline::null());
         Ok(backend)
     }
 
@@ -1397,7 +1418,9 @@ impl NativeBackend {
             }
             self.mappings.remove(&raw(memory));
             self.zeroing.forget(&self.device, memory);
-            self.retired.push_back(token);
+            if token != compose::COMPOSE_TOKEN {
+                self.retired.push_back(token);
+            }
             for evicted in self.import_cache.keep(ranges, memory, exported) {
                 self.unbound.push(raw(evicted.memory));
                 self.free_after_turn(Freed {
@@ -1996,6 +2019,7 @@ impl Drop for NativeBackend {
                 }
             }
         }
+        self.destroy_compositor();
         // Images jobs made that no call took; the device is idle.
         for image in self.premade.drain() {
             premade::destroy(&self.device, premade::Kind::Image(image));
@@ -2047,6 +2071,7 @@ impl Drop for NativeBackend {
             self.device.destroy_pipeline(self.decode_pvrtc, None);
             self.device.destroy_pipeline(self.reorder_blocks, None);
             self.device.destroy_pipeline(self.decode_astc, None);
+            self.device.destroy_pipeline(self.compose, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_sampler(self.null_sampler, None);
@@ -3438,6 +3463,21 @@ impl Backend for NativeBackend {
             None => self.unsignaled.extend_from_slice(handles),
         }
         Ok(())
+    }
+
+    fn import_compose_target(&mut self, handle: u32, fd: i32, bytes: u64) -> Result<()> {
+        NativeBackend::import_compose_target(self, handle, fd, bytes)
+    }
+
+    fn compose(
+        &mut self,
+        job: &crate::metal::compose::Job<'_>,
+    ) -> Result<crate::metal::compose::Submitted> {
+        self.compose_frame(job)
+    }
+
+    fn compose_marker(&self) -> Option<NonNull<AtomicU32>> {
+        self.compose_word()
     }
 
     fn calibrated_timestamps(&mut self) -> Result<(u64, u64)> {

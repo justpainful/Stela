@@ -92,6 +92,7 @@ main(void)
    compiles(stela_metal_decode_pvrtc_kernel, "decode pvrtc");
    compiles(stela_metal_decode_astc_kernel, "decode astc");
    compiles(stela_metal_reorder_blocks_kernel, "reorder blocks");
+   compiles(stela_metal_compose_kernel, "compose");
    puts("metal abi kernels compile through NAK");
    glsl_type_singleton_decref();
    return 0;

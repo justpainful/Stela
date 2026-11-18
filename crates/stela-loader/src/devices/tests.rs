@@ -1469,3 +1469,243 @@ fn a_hidden_neural_engine_withdraws_its_capability_and_keeps_its_links() {
     // Once withdrawn, a second preparation has nothing to note.
     assert!(hide_unmodeled(&mut tree).is_empty());
 }
+
+/// The J473AP's two display pipelines, `dcpext` and the DCP-role one, as
+/// its DeviceTree gives them: phandles, mapper streams and classes.
+fn display_pipelines(with_dcp_expert: bool) -> DeviceTree {
+    let with = |mut node: Node, properties: &[(&str, &[u8])]| {
+        for &(key, value) in properties {
+            node.set_property(key, value.to_vec()).unwrap();
+        }
+        node
+    };
+    let cells =
+        |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let controller = |name: &str, role: &[u8], mapper: u32, nub: &str| {
+        with(
+            node(
+                name,
+                Some(b"iop,ascwrap-v4\0"),
+                vec![node(nub, Some(b"iop-nub,rtbuddy-v2\0"), vec![])],
+            ),
+            &[
+                ("role", role),
+                (IOMMU_PARENT, &cells(&[mapper])),
+                (DEVICE_TYPE, b"dcp\0"),
+            ],
+        )
+    };
+    let expert = |name: &str, role: &[u8]| {
+        with(
+            node(name, Some(b"dcp-expert-v1\0"), vec![]),
+            &[("role", role), ("join-power-plane", &cells(&[1]))],
+        )
+    };
+    let pipe = |name: &str, compatible: &str, mappers: [u32; 2], kind: &[u8]| {
+        with(
+            node(name, Some(&[compatible.as_bytes(), &[0]].concat()), vec![]),
+            &[
+                (IOMMU_PARENT, &cells(&mappers)),
+                (DEVICE_TYPE, kind),
+                ("external", &cells(&[1])),
+            ],
+        )
+    };
+    let dart = |name: &str, mappers: Vec<Node>| node(name, Some(b"dart,t8110\0"), mappers);
+    let mut io = vec![
+        dart("dart-dcpext", vec![mapper("mapper-dcpext", 0xc8)]),
+        controller("dcpext", board::DCPEXT_ROLE, 0xc8, "iop-dcpext-nub"),
+        expert("dcpext-expert", board::DCPEXT_ROLE),
+        dart(
+            "dart-dispext0",
+            vec![
+                mapper("mapper-dispext0", 0xca),
+                mapper("mapper-dispext0-piodma", 0xcb),
+            ],
+        ),
+        pipe(
+            "dispext0",
+            board::DISPEXT,
+            [0xca, 0xcb],
+            b"ext-display-subsystem\0",
+        ),
+        dart("dart-dcp", vec![mapper("mapper-dcp", 0xbd)]),
+        controller("dcp", board::DCP_ROLE, 0xbd, "iop-dcp-nub"),
+        dart(
+            "dart-disp0",
+            vec![
+                mapper("mapper-disp0", 0xbf),
+                mapper("mapper-disp0-piodma", 0xc0),
+            ],
+        ),
+        pipe("disp0", board::DISP0, [0xbf, 0xc0], b"display-subsystem\0"),
+        typed(
+            node("dptx-phy", Some(b"dptx-phy,t8112\0"), vec![]),
+            b"AAPL,dptx-phy\0",
+        ),
+        typed(
+            node(
+                "display-crossbar0",
+                Some(b"display-crossbar,t8112\0"),
+                vec![],
+            ),
+            b"AAPL,display-crossbar\0",
+        ),
+    ];
+    if with_dcp_expert {
+        io.push(expert("dcp0-expert", board::DCP_ROLE));
+    }
+    DeviceTree {
+        root: node("device-tree", None, vec![node("arm-io", None, io)]),
+    }
+}
+
+const DCPEXT_GRAPH: [&str; 9] = [
+    "/arm-io/dart-dcpext",
+    "/arm-io/dart-dcpext/mapper-dcpext",
+    "/arm-io/dcpext",
+    "/arm-io/dcpext/iop-dcpext-nub",
+    "/arm-io/dcpext-expert",
+    "/arm-io/dart-dispext0",
+    "/arm-io/dart-dispext0/mapper-dispext0",
+    "/arm-io/dart-dispext0/mapper-dispext0-piodma",
+    "/arm-io/dispext0",
+];
+const DCP_GRAPH: [&str; 9] = [
+    "/arm-io/dart-dcp",
+    "/arm-io/dart-dcp/mapper-dcp",
+    "/arm-io/dcp",
+    "/arm-io/dcp/iop-dcp-nub",
+    "/arm-io/dcp0-expert",
+    "/arm-io/dart-disp0",
+    "/arm-io/dart-disp0/mapper-disp0",
+    "/arm-io/dart-disp0/mapper-disp0-piodma",
+    "/arm-io/disp0",
+];
+
+/// By default the DCP-role pipeline stays hidden as an unmodeled device,
+/// with the ledger `hide_unmodeled` always wrote.
+#[test]
+fn a_default_boot_keeps_dcpext_its_only_display() {
+    let mut tree = display_pipelines(true);
+    let mut same = tree.clone();
+    let hidden = hide_unmodeled(&mut tree);
+    assert_eq!(
+        hide_unmodeled_under(&mut same, board::Admission::default()),
+        hidden
+    );
+    assert_eq!(same, tree);
+    for path in DCPEXT_GRAPH {
+        assert!(tree.property(path, COMPATIBLE).is_some(), "{path}");
+    }
+    for path in DCP_GRAPH
+        .into_iter()
+        .chain(["/arm-io/dptx-phy", "/arm-io/display-crossbar0"])
+    {
+        assert!(tree.property(path, COMPATIBLE).is_none(), "{path}");
+        assert!(hidden.iter().any(|entry| entry == path), "{path}");
+    }
+    // Hidden, the pipe no longer advertises a display subsystem, and its
+    // coprocessor's nub is no running RTKit.
+    assert!(tree.property("/arm-io/disp0", DEVICE_TYPE).is_none());
+    assert!(
+        tree.property("/arm-io/dcp/iop-dcp-nub", "running")
+            .is_none()
+    );
+    assert!(
+        tree.property("/arm-io/dcpext/iop-dcpext-nub", "running")
+            .is_some()
+    );
+}
+
+/// `--second-display` keeps the whole DCP-role graph beside the DCPEXT
+/// one, its nub a running native RTKit, and nothing else of the display
+/// hardware the model does not drive.
+#[test]
+fn a_second_display_keeps_the_dcp_pipeline_and_its_darts() {
+    let second = board::Admission {
+        second_display: true,
+    };
+    let original = display_pipelines(true);
+    let mut tree = original.clone();
+    let hidden = hide_unmodeled_under(&mut tree, second);
+    for path in DCPEXT_GRAPH.into_iter().chain(DCP_GRAPH) {
+        assert!(tree.property(path, COMPATIBLE).is_some(), "{path}");
+        assert!(!hidden.iter().any(|entry| entry == path), "{path}");
+    }
+    assert_eq!(hidden, ["/arm-io/dptx-phy", "/arm-io/display-crossbar0"]);
+    assert_eq!(
+        tree.property("/arm-io/disp0", DEVICE_TYPE).unwrap().value,
+        b"display-subsystem\0"
+    );
+    for key in ["pre-loaded", "running", "no-firmware-service"] {
+        assert!(
+            tree.property("/arm-io/dcp/iop-dcp-nub", key).is_some(),
+            "{key}"
+        );
+    }
+    // Nothing is added: the same nodes, in the same order.
+    let names = |tree: &DeviceTree| {
+        tree.node("/arm-io")
+            .unwrap()
+            .children
+            .iter()
+            .map(|child| String::from(child.name().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&tree), names(&original));
+    // Kept, the graph is stable.
+    assert!(hide_unmodeled_under(&mut tree, second).is_empty());
+
+    // Without its power expert the controller and its pipe go together,
+    // and with them their DARTs; the DCPEXT graph stays whole.
+    let mut incomplete = display_pipelines(false);
+    let hidden = hide_unmodeled_under(&mut incomplete, second);
+    for path in [
+        "/arm-io/dcp",
+        "/arm-io/disp0",
+        "/arm-io/dart-dcp",
+        "/arm-io/dart-disp0",
+    ] {
+        assert!(incomplete.property(path, COMPATIBLE).is_none(), "{path}");
+        assert!(hidden.iter().any(|entry| entry == path), "{path}");
+    }
+    for path in DCPEXT_GRAPH {
+        assert!(incomplete.property(path, COMPATIBLE).is_some(), "{path}");
+    }
+}
+
+/// The real J473AP DeviceTree under `--second-display`: both pipelines'
+/// graphs stay, the DPTX PHY and crossbar do not, and the ATC PHYs are
+/// left as they are without it.
+#[test]
+#[ignore = "oracle: STELA_TEST_J473_DT"]
+fn original_j473_second_display_keeps_both_pipelines() {
+    let bytes = std::fs::read(std::env::var("STELA_TEST_J473_DT").unwrap()).unwrap();
+    let mut tree = DeviceTree::parse(&bytes).unwrap();
+    hide_unmodeled_under(
+        &mut tree,
+        board::Admission {
+            second_display: true,
+        },
+    );
+    for path in DCPEXT_GRAPH.into_iter().chain(DCP_GRAPH) {
+        assert!(tree.property(path, COMPATIBLE).is_some(), "{path}");
+    }
+    for path in ["/arm-io/dptx-phy", "/arm-io/display-crossbar0"] {
+        assert!(tree.property(path, COMPATIBLE).is_none(), "{path}");
+    }
+    let mut default = DeviceTree::parse(&bytes).unwrap();
+    hide_unmodeled(&mut default);
+    for path in DCP_GRAPH {
+        assert!(default.property(path, COMPATIBLE).is_none(), "{path}");
+    }
+    // The ATC PHYs are admitted, or not, as they are without the option.
+    for path in ["/arm-io/atc-phy0", "/arm-io/atc-phy1"] {
+        assert_eq!(
+            tree.property(path, COMPATIBLE),
+            default.property(path, COMPATIBLE),
+            "{path}"
+        );
+    }
+}

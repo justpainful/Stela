@@ -57,7 +57,8 @@
 //! firmware is not told the driver stopped (its EP/FP stop waits seconds).
 //! DMA buffers live until reboot when that reset is not observed, and on
 //! startup/transmit errors. OWN is the sole ownership transfer; timed-out
-//! transmit slots are never overwritten.
+//! transmit slots are never overwritten, except by `Link::recover`, Linux's
+//! `rtl_reset_work`, after a MAC reset it saw complete.
 
 use super::{Link, LinkError, MAX_FRAME, MIN_FRAME, Mac, check_frame};
 use crate::{
@@ -1014,6 +1015,46 @@ fn publish<R: Registers, T: Timer>(
     }
     Ok(())
 }
+/// Linux `rtl_reset_work`, which `rtl8169_tx_timeout` schedules once the
+/// stack's watchdog found the transmit queue stopped for
+/// `RTL8169_TX_TIMEOUT`: `rtl8169_cleanup` ([`Hardware::stop`]), whose
+/// completed MAC reset alone proves the chip writes neither ring; both
+/// rings as at the start in their own DMA buffers ([`Ring::reclaim`]);
+/// then `rtl_hw_start`: the MAC configuration ([`Hardware::configure_mac`],
+/// without a firmware script), the station address, receive maximum,
+/// descriptor bases and enable ([`publish`]), and the signal's events. The
+/// PHY keeps its link: Linux's reset work does not touch it either.
+///
+/// A stop that never saw its reset leaves both rings as they were, since
+/// the chip may still write them. A configuration or publication that
+/// fails resets the MAC again, as the start does, with the rings set and
+/// the chip disabled. The waits are each bounded: the stop's stay under
+/// 100 ms for every revision, and an RTL8168H's whole restart waits about
+/// 8 ms in the register model, most of it the stop's fixed 2 ms and the
+/// polls of its FIFOs, reset and configuration commands.
+fn restart<R: Registers, T: Timer>(
+    hw: &mut Hardware<'_, R, T>,
+    receive: &mut Ring,
+    transmit: &mut Ring,
+    mac: Mac,
+    signalled: bool,
+) -> Result<(), Error> {
+    hw.stop()?;
+    receive.reclaim(true);
+    transmit.reclaim(false);
+    let started = hw
+        .configure_mac(None)
+        .and_then(|()| publish(hw, receive, transmit, mac).map_err(Error::from));
+    if let Err(error) = started {
+        let _ = hw.reset();
+        return Err(error);
+    }
+    if signalled {
+        hw.interrupts_on(SIGNALLED_EVENTS);
+    }
+    Ok(())
+}
+
 impl Drop for Realtek {
     /// Linux `rtl8169_down`'s register sequence ([`Hardware::stop`]). The
     /// rings are freed only once the MAC reset completed; otherwise they
@@ -1053,11 +1094,55 @@ impl Link for Realtek {
             return Err(LinkError::NoCarrier);
         }
         if !self.transmit.available() {
+            // Linux rtl_tx's "8168 hack": TxPoll requests are lost when
+            // frames are queued too close together, so it rings the
+            // doorbell again while sent descriptors are still queued. This
+            // driver reaps no completion, and a full ring is where a lost
+            // request would last: every descriptor stays with the chip and
+            // no later send rings again. The refused send asks once more.
+            fence(Ordering::SeqCst);
+            kick_transmit(&self.device, self.revision);
             return Err(LinkError::Busy);
         }
         self.transmit.transmit(frame)?;
         fence(Ordering::SeqCst);
         kick_transmit(&self.device, self.revision);
+        Ok(())
+    }
+    /// Linux `rtl_reset_work` ([`restart`]), for the caller's watchdog. A
+    /// chip that has left the bus is not touched. An RTL8117 (version 52)
+    /// that ran its MAC firmware is refused: `rtl_hw_start_8117` applies
+    /// it on every start, and its image was lent to the start alone.
+    /// Afterwards the link is read again, and a link that is up gets its
+    /// per-speed patch (`rtl_link_chg_patch`) as at the start.
+    fn recover(&mut self) -> Result<(), LinkError> {
+        if self.device.read32(TX_CONFIG) == u32::MAX {
+            return Err(LinkError::Adapter(format!(
+                "{} restart: registers read all ones: the chip does not answer",
+                self.location
+            )));
+        }
+        let firmware_skipped = self
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, Warning::FirmwareSkipped { .. }));
+        if self.revision.version == 52 && self.revision.firmware.is_some() && !firmware_skipped {
+            return Err(LinkError::Adapter(format!(
+                "{} restart: its MAC firmware was lent to the start alone",
+                self.location
+            )));
+        }
+        let mut hardware = Hardware::new(&self.device, &self.clock, self.revision, self.function);
+        restart(
+            &mut hardware,
+            &mut self.receive,
+            &mut self.transmit,
+            self.mac,
+            self.signalled,
+        )
+        .map_err(|error| LinkError::Adapter(format!("{} restart: {error}", self.location)))?;
+        self.link.status = None;
+        self.link.last_phy_poll = None;
         Ok(())
     }
     fn signals(&self) -> bool {

@@ -115,6 +115,15 @@ impl Ring {
             }
         }
     }
+    /// After a completed MAC reset, the ring as at the start in the same
+    /// DMA buffers: Linux `rtl8169_tx_clear` and `rtl8169_init_ring_indexes`
+    /// for the transmit ring, whose frames the controller still held are
+    /// dropped, and `rtl8169_mark_to_asic` of every receive descriptor.
+    /// Nothing is allocated; the counts carry on.
+    pub fn reclaim(&mut self, receive: bool) {
+        self.next = 0;
+        self.initialize(receive);
+    }
     fn offer(&mut self, index: usize) {
         let start = index * self.stride;
         self.buffers.bytes_mut()[start..start + UNWRITTEN.len()].copy_from_slice(&UNWRITTEN);

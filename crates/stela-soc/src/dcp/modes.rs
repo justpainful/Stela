@@ -908,12 +908,15 @@ impl Advertised {
         xml.0
     }
 
-    /// How the monitor connects: DCP's DisplayPort through the Mac's HDMI port.
-    pub fn transport() -> String {
+    /// How the monitor connects: DCP's DisplayPort through the Mac's HDMI
+    /// port (`hdmi`, `dcpext`'s, whose DP-to-HDMI converter is J473AP's
+    /// `dp2hdmi-gpio`), or straight from DCP's DisplayPort, as `disp0`'s
+    /// USB-C DisplayPort does.
+    pub fn transport(hdmi: bool) -> String {
         let mut xml = Xml(String::new());
         xml.raw("<dict>")
             .string("Upstream", "DP")
-            .string("Downstream", "HDMI")
+            .string("Downstream", if hdmi { "HDMI" } else { "DP" })
             .raw("</dict>");
         xml.0
     }

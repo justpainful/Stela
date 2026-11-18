@@ -610,6 +610,77 @@ fn a_stall_s_lag_is_repaid_by_a_bounded_slew_with_timers_on_their_count() {
 }
 
 #[test]
+fn a_long_freeze_s_lag_is_repaid_ten_times_faster_until_a_second_is_left() {
+    let (shared, mut clocks) = busy_clocks(3, FREQUENCY);
+    let stall = FREQUENCY * STALL_MILLIS / 1000;
+    let fast_bound = stall * FAST_LAG_STALLS;
+    clocks[2].idle(|| 1000, 0, None);
+    let (mut deadline, mut armed) = (1500, 1000);
+    let mut wake = clocks[2].wake_at(deadline, 1000);
+    // PE 0 retires nothing for 1.5 s, then runs; PE 1 runs throughout.
+    let frozen = 30 * stall;
+    let resumed = 1000 + frozen;
+    let lag = frozen - stall;
+    // The fast slew repays all but a second's bound at one count in ten.
+    let fast_until = resumed + (lag - fast_bound) * FAST_SLEW_PARTS;
+    let end = fast_until + 20 * stall;
+    let step = shared.slew_step();
+    let (mut retired, mut seen) = ([0u64; 2], [0u64; 3]);
+    for host in 1001..end {
+        if host % 10 == 0 {
+            for pe in 0..2 {
+                if pe == 0 && host < resumed {
+                    continue;
+                }
+                retired[pe] += 100;
+                clocks[pe].mark(|| host, retired[pe], None);
+            }
+            if clocks[1].below(deadline, || host) {
+                assert!(shared.count(|| host) < deadline, "at {host}");
+            }
+        }
+        if host == wake {
+            clocks[2].look(|| host);
+            let count = clocks[2].read(|| host);
+            if count >= deadline {
+                if armed > resumed {
+                    assert!(count - deadline <= 2, "at {host}: {count} for {deadline}");
+                }
+                deadline = count + 1000;
+                armed = host;
+            }
+            wake = clocks[2].wake_at(deadline, host);
+            assert!(wake > host, "at {host}: waits again at once");
+        }
+        for (pe, clock) in clocks.iter_mut().enumerate() {
+            let count = clock.read(|| host);
+            assert!(count >= seen[pe], "at {host}: {count} after {}", seen[pe]);
+            assert!(count <= host, "at {host}: overshoot to {count}");
+            seen[pe] = count;
+        }
+        if host == resumed + 1 {
+            assert_eq!(shared.lag(), lag);
+        }
+        if host > resumed && host + 2 * step < fast_until {
+            // About one count in ten while more than the bound is owed.
+            let expected = lag - (host - resumed) / FAST_SLEW_PARTS;
+            let owed = shared.lag();
+            assert!(
+                owed.abs_diff(expected) <= step / FAST_SLEW_PARTS + 2,
+                "at {host}: {owed} for {expected}"
+            );
+        }
+    }
+    // Then the plain 1% slew: the bound is left, less what it repaid since.
+    let owed = shared.lag();
+    assert!(owed <= fast_bound, "{owed}");
+    assert!(
+        fast_bound - owed <= 20 * stall / SLEW_PARTS + 2 * step,
+        "{owed}"
+    );
+}
+
+#[test]
 fn no_slew_runs_while_a_hold_is_in_force() {
     let (shared, mut first, second) = pair();
     // A first stop leaves lag, a second one holds the count again.

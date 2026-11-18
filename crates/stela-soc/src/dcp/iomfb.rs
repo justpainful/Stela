@@ -121,6 +121,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use stela_contracts::Refusal;
 use stela_contracts::refuse;
+use stela_soc_data::dcp::ExternalIdentity;
 
 /// The classes whose methods the model answers.
 const AP: &str = "IOMobileFramebufferAP";
@@ -332,6 +333,21 @@ pub struct Pacing {
     /// The display's refresh period, in counter ticks, for the sample's
     /// report.
     pub refresh: u64,
+    /// Frames the scanout's host GPU took to compose
+    /// ([`Scanout::try_present_layers`]), and those it refused, which the
+    /// CPU composed instead: whether the GPU path runs, and how often it
+    /// fails. A sink that declines a frame counts in neither.
+    pub gpu_frames: u32,
+    pub gpu_fallbacks: u32,
+    /// Each GPU frame from its compose's hand-off (the look that latched
+    /// it) to the look that found the GPU done and completed its swaps;
+    /// and each frame composed on the CPU outside the devices' lock, from
+    /// that hand-off to the look that took the compose back. Both are on
+    /// the counter, so they hold the wait for the next look as well as the
+    /// compose: the same measure for either composer. A present composed
+    /// in place starts and ends at one counter reading, and is not timed.
+    pub gpu: Latency,
+    pub cpu_compose: Latency,
 }
 
 /// How many swaps each pacing window samples ([`Pacing::swaps`]).
@@ -516,7 +532,7 @@ impl core::fmt::Display for Pacing {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / COUNTER_HZ as f64;
         write!(
             f,
-            "DCP PACING seconds={:.1} presented={} submitted={} merged={} per_second={:.1} gap_ms={:.1}/{:.1}/{:.1} stalls={} late_ms={:.1}/{:.1} deepest={} reordered={} ahead_of_gpu={} fence_waits={} fence_timeouts={} calls={} unmodeled={} color_matrix={} moved={} swap_ms=n:avg/max fence={} notice={} latch={} complete={} total={} vsync={}",
+            "DCP PACING seconds={:.1} presented={} submitted={} merged={} per_second={:.1} gap_ms={:.1}/{:.1}/{:.1} stalls={} late_ms={:.1}/{:.1} deepest={} reordered={} ahead_of_gpu={} fence_waits={} fence_timeouts={} calls={} unmodeled={} color_matrix={} moved={} swap_ms=n:avg/max fence={} notice={} latch={} complete={} total={} vsync={} gpu_frames={} gpu_fallbacks={} gpu_ms={} cpu_compose_ms={}",
             ms(self.ticks) / 1000.0,
             self.presented,
             self.submitted,
@@ -547,6 +563,10 @@ impl core::fmt::Display for Pacing {
             self.complete,
             self.total,
             self.vsync,
+            self.gpu_frames,
+            self.gpu_fallbacks,
+            self.gpu,
+            self.cpu_compose,
         )?;
         let [one, two, three, few, many] = self.refreshes;
         write!(
@@ -760,7 +780,18 @@ struct Batch {
     count: usize,
     planes: [Option<scanout::Layer>; swap::LAYERS],
     layers: Vec<scanout::Layer>,
+    /// Each layer's surface ID, where one of the swaps shown set its slot
+    /// ([`Scanout::try_present_layers`]).
+    surface_ids: Vec<Option<u32>>,
     damage: Option<core::ops::Range<usize>>,
+}
+
+/// A present the scanout's host GPU is composing: what it latched, and
+/// the GPU's ticket. Its swaps complete once the GPU is done
+/// ([`Methods::finish_compose`]).
+struct GpuPresent {
+    batch: Batch,
+    pending: scanout::GpuPending,
 }
 
 /// The IOMFB methods of the one connected display, presenting to a host
@@ -768,6 +799,10 @@ struct Batch {
 pub struct Methods {
     /// The booted build's method interface: which tag names which method.
     interface: &'static Interface,
+    /// Which of the board's display pipes this is: what it answers for
+    /// the main display, its framebuffer ID and its monitor's transport,
+    /// and the identity it publishes the monitor under.
+    identity: ExternalIdentity,
     /// The host scanout, `None` while a compose outside the devices' lock
     /// has it ([`super::compose`]).
     scanout: Option<Box<dyn Scanout>>,
@@ -779,6 +814,11 @@ pub struct Methods {
     /// The present whose compose runs outside the devices' lock, and what
     /// it hands back.
     composing: Option<(Batch, Arc<Handoff<Composition>>)>,
+    /// The present the host GPU is composing, once its compose ended: the
+    /// scanout is back, but no other present starts before it finishes.
+    gpu: Option<GpuPresent>,
+    /// The host GPU refused a frame, which is reported once.
+    gpu_refusal_reported: bool,
     /// A compose read past its resolved pages: the next present is made in
     /// place.
     in_place: bool,
@@ -981,10 +1021,13 @@ impl Methods {
             });
         Self {
             interface,
+            identity: ExternalIdentity::Unnumbered,
             mode: scanout.mode(),
             scanout: Some(scanout),
             frame: scanout::Composed::default(),
             composing: None,
+            gpu: None,
+            gpu_refusal_reported: false,
             in_place: false,
             compose_stall_reported: false,
             shown: None,
@@ -1041,6 +1084,13 @@ impl Methods {
             shut_down: false,
             now: 0,
         }
+    }
+
+    /// These methods as the board's display pipe `identity`
+    /// ([`answer_for`], [`Advertised::transport`], [`pipe_uuid`]).
+    pub fn identified(mut self, identity: ExternalIdentity) -> Self {
+        self.identity = identity;
+        self
     }
 
     pub(super) fn display_state(&self) -> Rc<RefCell<DisplayState>> {
@@ -1159,7 +1209,7 @@ impl Methods {
     fn repaint_wanted(&self) -> bool {
         self.shown.is_some()
             && !self.repaint_refused
-            && self.composing.is_none()
+            && !self.composing()
             && !self.shut_down
             && self.display.borrow().active()
             && self
@@ -1387,19 +1437,21 @@ impl Methods {
     /// if a swap is ready and no compose is in flight: the swaps it shows,
     /// the newest one's layers and the rows that may change.
     fn batch(&mut self, now: u64) -> Option<Batch> {
-        if !self.display.borrow().active() || self.composing.is_some() {
+        if !self.display.borrow().active() || self.composing() {
             return None;
         }
         self.refresh(now);
         if !self.swap_ready(now) {
             // The frame on screen again, whole, completing no swap.
             let planes = self.shown.filter(|_| self.repaint_wanted())?;
+            let layers: Vec<scanout::Layer> = planes.iter().flatten().copied().collect();
             return Some(Batch {
                 now,
                 due: now,
                 count: 0,
                 planes,
-                layers: planes.iter().flatten().copied().collect(),
+                surface_ids: alloc::vec![None; layers.len()],
+                layers,
                 damage: None,
             });
         }
@@ -1408,6 +1460,17 @@ impl Methods {
         let newest = &self.frames[count - 1];
         let planes = newest.planes;
         let layers = newest.layers();
+        // A slot's surface is the one the newest swap that set it named.
+        let shown = || self.frames.iter().take(count).rev();
+        let surface_ids = (0..swap::LAYERS)
+            .filter(|&slot| planes[slot].is_some())
+            .map(|slot| {
+                shown()
+                    .find(|frame| frame.updated & 1 << slot != 0)
+                    .map(|frame| frame.surface_ids[slot])
+                    .filter(|&id| id != 0)
+            })
+            .collect();
         let updated = self
             .frames
             .iter()
@@ -1422,6 +1485,7 @@ impl Methods {
             count,
             planes,
             layers,
+            surface_ids,
             damage,
         })
     }
@@ -1438,7 +1502,7 @@ impl Methods {
         page: u64,
         resolve: impl FnMut(u64) -> core::result::Result<u64, stela_contracts::dma::DmaError>,
     ) -> Option<Compose> {
-        if self.composing.is_some() || self.scanout.is_none() || self.in_place {
+        if self.composing() || self.scanout.is_none() || self.in_place {
             return None;
         }
         // Read-only until it is certain the compose leaves: the batch is
@@ -1451,6 +1515,7 @@ impl Methods {
             scanout,
             composed,
             probe.layers.clone(),
+            probe.surface_ids.clone(),
             probe.damage.clone(),
             pages,
         );
@@ -1483,9 +1548,10 @@ impl Methods {
         ))
     }
 
-    /// Whether a compose outside the devices' lock is in flight.
+    /// Whether a compose outside the devices' lock is in flight, or the
+    /// host GPU is still composing the frame one handed it.
     pub fn composing(&self) -> bool {
-        self.composing.is_some()
+        self.composing.is_some() || self.gpu.is_some()
     }
 
     /// Take back what a finished compose left, if it did: the scanout and
@@ -1493,8 +1559,13 @@ impl Methods {
     /// presented, `Ok(false)` when nothing finished or a read missed the
     /// resolved pages (the latch stays open for a present in place), and
     /// the present's refusal. A compose in flight is waited for at most
-    /// `spins` spin-loop hints.
+    /// `spins` spin-loop hints. A frame the host GPU took presents only
+    /// once the GPU is done with it, which is asked again for at most
+    /// `spins` hints; until then this is `Ok(false)` and the swaps wait.
     pub fn finish_compose(&mut self, spins: u64) -> Result<bool> {
+        if self.gpu.is_some() {
+            return Ok(self.finish_gpu(spins));
+        }
         let Some((_, done)) = &self.composing else {
             return Ok(false);
         };
@@ -1504,6 +1575,8 @@ impl Methods {
             composed,
             result,
             missed,
+            gpu,
+            gpu_refused,
         }) = finished
         else {
             return Ok(false);
@@ -1511,16 +1584,64 @@ impl Methods {
         let (batch, _) = self.composing.take().expect("checked above");
         self.scanout = Some(sink);
         self.frame = composed;
+        if let Some(reason) = gpu_refused {
+            self.pacing.gpu_fallbacks += 1;
+            if !core::mem::replace(&mut self.gpu_refusal_reported, true) {
+                self.reported.push(format!(
+                    "IOMFB the host GPU refused to compose a frame: {reason}; \
+                     the CPU composes the frames it refuses"
+                ));
+            }
+        }
+        if let Some(pending) = gpu {
+            self.pacing.gpu_frames += 1;
+            self.gpu = Some(GpuPresent { batch, pending });
+            return Ok(self.finish_gpu(spins));
+        }
         if missed {
             self.in_place = true;
             return Ok(false);
         }
+        self.pacing
+            .cpu_compose
+            .add(self.now.saturating_sub(batch.now));
         if batch.count == 0 {
             return self.repainted(result).map(|()| false);
         }
         result?;
         self.presented(batch);
         Ok(true)
+    }
+
+    /// Finish the present the host GPU is composing once the GPU is done,
+    /// asking at most `spins` spin-loop hints apart: true when it presented
+    /// a swap. The GPU wrote the scanout whole or not at all, so a present
+    /// it took does not fail here.
+    fn finish_gpu(&mut self, spins: u64) -> bool {
+        let Some(GpuPresent { pending, .. }) = &self.gpu else {
+            return false;
+        };
+        let scanout = self
+            .scanout
+            .as_mut()
+            .expect("a GPU present gives the scanout back");
+        let mut left = spins;
+        while !scanout.gpu_pending_done(pending) {
+            if left == 0 {
+                return false;
+            }
+            core::hint::spin_loop();
+            left -= 1;
+        }
+        let GpuPresent { batch, .. } = self.gpu.take().expect("checked above");
+        self.pacing.gpu.add(self.now.saturating_sub(batch.now));
+        if batch.count == 0 {
+            // The frame on screen again ([`Self::repainted`]): no swap.
+            self.unshown = 0;
+            return false;
+        }
+        self.presented(batch);
+        true
     }
 
     /// Finish a present of the frame on screen again: it completes no swap.
@@ -1550,6 +1671,7 @@ impl Methods {
             count,
             planes,
             layers,
+            surface_ids: _,
             damage: _,
         } = batch;
         // A vblank passed during a compose opened a new latch: it stays.
@@ -1822,15 +1944,21 @@ impl Methods {
             ("TimingElements", advertised.timing_elements()),
             ("ColorElements", advertised.color_elements()),
             ("DisplayAttributes", advertised.display_attributes()),
-            ("Transport", Advertised::transport()),
-            ("IOMFBUUID", advertised.uuid()),
+            ("Transport", Advertised::transport(self.identity.hdmi())),
+            (
+                "IOMFBUUID",
+                format!(
+                    "<string>{}</string>",
+                    pipe_uuid(self.identity, advertised.display_uuid())
+                ),
+            ),
         ];
         let (width, height) = advertised.native();
         let published = Log::Published {
             width,
             height,
             image_cm: (advertised.edid[21], advertised.edid[22]),
-            uuid: advertised.display_uuid(),
+            uuid: pipe_uuid(self.identity, advertised.display_uuid()),
             from_monitor: advertised.from_monitor(),
             rates: advertised.rates().collect(),
         };
@@ -2382,7 +2510,7 @@ impl Service for Methods {
                 self.swap_info.clear();
                 Ok(Step::Return(Vec::new()))
             }
-            _ => match answer(row, input, output, self.mode()) {
+            _ => match answer_for(row, input, output, self.mode(), self.identity) {
                 Ok(Some(bytes)) => Ok(Step::Return(bytes)),
                 // A refusal here would leave the AP's call open for good: it
                 // waits, and the link retries the call. It is answered
@@ -2782,10 +2910,36 @@ fn bool_reply(ok: bool) -> Vec<u8> {
     u32::from(ok).to_le_bytes().to_vec()
 }
 
+/// The display identity `identity`'s pipe publishes its monitor under:
+/// the monitor's own ([`Advertised::display_uuid`]) on the board's main
+/// external pipe, as it always was, and on the second display the same with
+/// the pipe in its clock-sequence field (`8000` becomes `8001`), so that two
+/// monitors macOS cannot tell apart by their EDIDs, or two shown at one size
+/// without one, are still two displays to it, each keeping its own settings.
+pub fn pipe_uuid(identity: ExternalIdentity, uuid: String) -> String {
+    match identity {
+        ExternalIdentity::Disp0 => uuid.replacen("-4000-8000-", "-4000-8001-", 1),
+        ExternalIdentity::Unnumbered | ExternalIdentity::Numbered(_) => uuid,
+    }
+}
+
 /// Answer a stateless query for the fixed `mode`, or `None` for a method with
 /// no model. The output must be exactly the length the AP's header allocated
 /// (the interface's size); a mismatch refuses rather than truncates.
 pub fn answer(row: &Method, input: &[u8], output: u32, mode: Mode) -> Result<Option<Vec<u8>>> {
+    answer_for(row, input, output, mode, ExternalIdentity::Unnumbered)
+}
+
+/// [`answer`] for the display pipe `identity`: the main display is the
+/// board's external pipe alone, and each pipe has its own framebuffer ID
+/// ([`ExternalIdentity::main_display`], [`ExternalIdentity::framebuffer_id`]).
+pub fn answer_for(
+    row: &Method,
+    input: &[u8],
+    output: u32,
+    mode: Mode,
+    identity: ExternalIdentity,
+) -> Result<Option<Vec<u8>>> {
     let out = output as usize;
     let sized = |bytes: Vec<u8>| -> Result<Option<Vec<u8>>> {
         if bytes.len() == out {
@@ -2811,14 +2965,16 @@ pub fn answer(row: &Method, input: &[u8], output: u32, mode: Mode) -> Result<Opt
             bytes.extend_from_slice(&mode.height.to_le_bytes());
             sized(bytes)
         }
-        // is_external: the one HDMI display is external.
+        // is_external: every modeled pipe is external, `disp0` too (J473AP
+        // `/arm-io/disp0` `external` = 1).
         (UP, "is_external") => sized(bool_reply(true)),
         // headless: a display is connected, so not headless (0).
         (UP, "headless") => sized(bool_reply(false)),
-        // is_main_display: the one connected display is main.
-        (AP, "is_main_display") => sized(bool_reply(true)),
-        // get_framebuffer_id: the single framebuffer's id.
-        (AP, "get_framebuffer_id") => sized(1u32.to_le_bytes().to_vec()),
+        // is_main_display: the board's external pipe is main; a second
+        // display is not.
+        (AP, "is_main_display") => sized(bool_reply(identity.main_display())),
+        // get_framebuffer_id: the pipe's own framebuffer's id.
+        (AP, "get_framebuffer_id") => sized(identity.framebuffer_id().to_le_bytes().to_vec()),
         // set_display_device(index) -> link status, not bool. The AP
         // wrapper (0x3d77988) passes this word to iomfb_status_from_link
         // (0x3d9cf30): 0 succeeds; 1 maps to kIOReturnError (0xe00002bc).

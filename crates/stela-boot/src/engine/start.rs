@@ -60,6 +60,9 @@ fn from_disk(
     let mut defaults = boot_bundle::Options {
         ecid: options.ecid,
         boot_command: options.boot_command,
+        // `--second-display`: the tree keeps the `dcp`/`disp0` pipe's nodes
+        // for the guest's second display.
+        second_display: options.second_display,
         boot_args: format!(
             "-v serial=3 serial-device-name=uart0 ml-timeout-debug-ack={} noidle=1",
             stela_boot_core::guest_timeouts::picoseconds(DEBUG_ACK_SECONDS)
@@ -773,7 +776,7 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
     // SAFETY: the physical inventory and loader-owned reservations
     // were validated before any SIPI; the BSP Host is installed, guest entry
     // is excluded, and APs remain parked until canonical worker publication.
-    let executors = unsafe {
+    let mut executors = unsafe {
         crate::native_smp::executor::start(
             handoff,
             native_processors.expect("validated native roster"),
@@ -785,7 +788,18 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
     .unwrap_or_else(|error| {
         output::fatal(format_args!("owned native AP bootstrap refused: {error:?}"))
     });
+    // The executors past the PEs' run the GPUs' compile jobs, and no PE:
+    // what follows sees only the PEs' executors.
+    let runners = handoff.native_resources.runners as usize;
+    let workers = executors.take_workers(runners);
     match executors.failure() {
+        // Only a compile worker failed: every PE's executor started.
+        Some(failure) if executors.started() == runners => {
+            output::arguments(format_args!(
+                "NATIVE COMPILE WORKER startup failed: {failure:?}; PEs' processors take the jobs\n"
+            ));
+            crate::status::done("");
+        }
         Some(failure) => {
             output::arguments(format_args!("NATIVE AP startup failed: {failure:?}\n"));
             if options.native_bootstrap_check || options.native_shared_check {
@@ -796,7 +810,7 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
             crate::status::warn(&alloc::format!(
                 "{} of {} cores started; macOS runs on {}",
                 executors.started(),
-                handoff.native_resources.cores,
+                runners,
                 executors.started(),
             ));
         }
@@ -806,6 +820,7 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
         handoff.apic_base,
         layout::physical(handoff.apic_base & crate::apic::BASE_ADDRESS),
     );
+    super::workers::start(&workers, &sender, handoff.tsc_hz);
     #[cfg(feature = "diagnostics")]
     if options.native_bootstrap_check || options.native_shared_check {
         check_processors(boot, host, &executors, &sender);
@@ -956,6 +971,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
+                host_audio,
                 host_network,
                 usb_disks,
                 guest_network,
@@ -1101,6 +1117,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.as_ref().map(bluetooth::HostBluetooth::kind),
+            guest_audio: host_audio.is_some(),
         },
         board.as_ref(),
         &core_locks,
@@ -1185,6 +1202,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
+                host_audio,
                 guest_network,
                 host_nor,
                 host_disks,
@@ -1643,6 +1661,8 @@ struct Placement<'a> {
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
     guest_bluetooth: Option<stela_soc::machine::UsbBluetooth>,
+    /// Whether the guest's hub carries the USB headset.
+    guest_audio: bool,
 }
 
 /// The placed devices, the USB port a restore drives, and whether guest
@@ -1747,6 +1767,28 @@ fn place_devices(
         .or_else(headless_scanout);
     #[cfg(not(feature = "nvk"))]
     let scanout = firmware_scanout(false).or_else(headless_scanout);
+    // `--second-display`: the `disp0` pipe's scanout, the GPU's second
+    // output in its own mode, else a headless one the guest still arranges
+    // (the mount refuses a visible second pipe without a scanout).
+    let more_scanouts: alloc::vec::Vec<alloc::boxed::Box<dyn stela_soc::machine::Scanout>> =
+        match options.second_display {
+            false => alloc::vec::Vec::new(),
+            true => {
+                let headless = || {
+                    output::arguments(format_args!(
+                        "DISPLAY second display: no second GPU output was taken; a headless \
+                         1920x1080 scanout stands in\n"
+                    ));
+                    alloc::boxed::Box::new(display::HeadlessScanout::new(1920, 1080))
+                        as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
+                };
+                #[cfg(feature = "nvk")]
+                let second = gpu::display::second_scanout().unwrap_or_else(headless);
+                #[cfg(not(feature = "nvk"))]
+                let second = headless();
+                alloc::vec![second]
+            }
+        };
     hardware_step("devices");
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
@@ -1781,6 +1823,7 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
+                audio: placement.guest_audio,
             },
             scanout,
             firmware: &firmware,
@@ -1790,6 +1833,7 @@ fn place_devices(
             }),
         },
         memory,
+        more_scanouts,
     ) {
         Ok(devices) => devices,
         Err(error) => output::fatal(format_args!(
@@ -2413,7 +2457,7 @@ fn install_host(handoff: &'static Handoff, options: &Options, ram: &[RamRange]) 
     let cores = handoff.native_resources.cores as usize;
     let partition = crate::native_smp::resources::partition(
         cores,
-        cores,
+        handoff.native_resources.runners as usize,
         0,
         handoff.code.bytes,
         handoff.pool.bytes,
@@ -2988,6 +3032,7 @@ struct HostDevices {
     host_input: Option<input::HostInput>,
     host_usb: Option<usb::HostUsb>,
     host_bluetooth: Option<bluetooth::HostBluetooth>,
+    host_audio: Option<audio::HostAudio>,
     host_network: Option<Result<network::Shared>>,
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_network: Option<network::GuestNetwork>,
@@ -3017,6 +3062,7 @@ fn start_devices(
     let mut fdr_device = None;
     let mut host_usb = None;
     let mut host_bluetooth: Option<bluetooth::HostBluetooth> = None;
+    let mut host_audio: Option<audio::HostAudio> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -3075,8 +3121,12 @@ fn start_devices(
             let owned_wifi = wifi_network(handoff, options);
             let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
-                stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
-                    .saturating_sub(owned_usb.len())
+                stela_soc::machine::UsbCables::disk_ports(
+                    options.guest_network,
+                    options.input,
+                    options.audio(),
+                )
+                .saturating_sub(owned_usb.len())
             });
             let root = handoff.root;
             let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
@@ -3161,6 +3211,8 @@ fn start_devices(
                 isa_bridges,
                 usb,
                 bluetooth: host_controller,
+                hda,
+                usb_audio,
                 usb_disks,
                 disks,
                 power,
@@ -3223,6 +3275,10 @@ fn start_devices(
                     .screen
                     .and_then(|screen| screen.pci_source)
                     .map(|source| format!("{}", source.address));
+                // `--second-display`: the take splits the GPU's outputs into
+                // the main display and a second one in its own mode.
+                #[cfg(feature = "nvk")]
+                gpu::display::want_second_display(options.second_display);
                 gpu::serve(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
@@ -3255,6 +3311,16 @@ fn start_devices(
                 host_bluetooth = Some(bluetooth::HostBluetooth::modeled(handoff.root));
             }
             drop(host_controller);
+            // The guest's headset, whose sound plays on the host's analog
+            // output (`--audio`, on by default). Without it the HD Audio
+            // controllers stay attached, unused, for the boot.
+            if options.audio() {
+                host_audio = Some(audio::HostAudio::new(hda, usb_audio, handoff.root));
+            } else {
+                Vec::leak(hda);
+                // Their drop stops their endpoints through the xHCI.
+                network::in_loader_root(handoff.root, || drop(usb_audio));
+            }
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {
@@ -3368,6 +3434,7 @@ fn start_devices(
         host_input,
         host_usb,
         host_bluetooth,
+        host_audio,
         host_network,
         usb_disks,
         guest_network,

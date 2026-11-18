@@ -236,6 +236,16 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
 /// regular file's path in the bundle, mode, SHA-256 and bytes, in path order.
 /// Its executable is the code the boot's trust cache lists, so the kext and
 /// the trust cache always name the same plugin.
+/// A path inside a bundle as the guest spells it: its components joined by
+/// `/`, whichever separator the build host uses.
+pub(crate) fn spelled(relative: &Path) -> Result<String> {
+    Ok(relative
+        .components()
+        .map(|part| part.as_os_str().to_str().context("a file name is not UTF-8"))
+        .collect::<Result<Vec<_>>>()?
+        .join("/"))
+}
+
 fn bundle_header(bundle: &Path) -> Result<String> {
     use std::fmt::Write as _;
     let mut files = Vec::new();
@@ -259,10 +269,7 @@ fn bundle_header(bundle: &Path) -> Result<String> {
     let mut files: Vec<(String, Vec<u8>)> = files
         .into_iter()
         .map(|path| {
-            let name = path
-                .strip_prefix(bundle)?
-                .to_str()
-                .context("a file name is not UTF-8")?;
+            let name = &spelled(path.strip_prefix(bundle)?)?;
             ensure!(
                 name.bytes()
                     .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\'),

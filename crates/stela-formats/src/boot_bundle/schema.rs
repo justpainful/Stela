@@ -309,6 +309,11 @@ pub struct Options {
     /// Applied after every other DeviceTree change.
     #[serde(default)]
     pub overlay: Vec<OverlayProperty>,
+    /// Keep the board's second display pipeline visible (`--second-display`;
+    /// `stela_soc_data::board::Admission`). Written only when set, so a
+    /// manifest without it reads, and is written, as before.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub second_display: bool,
 }
 
 /// The defaults of `stela-dev boot prepare` for an installed system: 8 GiB of
@@ -333,6 +338,7 @@ impl Default for Options {
             root: None,
             ecid: None,
             overlay: Vec::new(),
+            second_display: false,
         }
     }
 }

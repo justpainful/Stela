@@ -320,12 +320,16 @@ impl Linux {
             common_environment.profile(&mut common_build, None, &[], None);
             let mut common_build = upstream_build(&common_build, Path::new("src/compat"));
             upstream_warnings(&mut common_build);
+            // The producer joins its registration header to its compat root,
+            // so its separator is the host's: built the same way, the path
+            // matches it on Windows too.
+            let common_registration = Path::new("src/compat").join("stela/registration.h");
             let common_profiles = COMMON
                 .iter()
                 .map(|spec| {
                     linux_capture::profile(
                         &common_build,
-                        Path::new("src/compat/stela/registration.h"),
+                        &common_registration,
                         *spec,
                         Path::new("../stela-linux"),
                     )

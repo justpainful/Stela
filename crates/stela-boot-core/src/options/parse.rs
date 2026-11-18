@@ -75,6 +75,30 @@ impl ParseState<'_> {
                 }
                 options.guest_pes = Some(count);
             }
+            COMPILE_WORKERS => {
+                if options.compile_workers.is_some() {
+                    return Err(Error::DuplicateCompileWorkers);
+                }
+                let count = value()
+                    .ok_or(Error::CompileWorkerCount)?
+                    .parse::<usize>()
+                    .map_err(|_| Error::CompileWorkerCount)?;
+                if count > crate::compile_workers::MOST {
+                    return Err(Error::CompileWorkerCount);
+                }
+                options.compile_workers = Some(count);
+            }
+            AUDIO => {
+                if options.audio.is_some() {
+                    return Err(Error::DuplicateAudio);
+                }
+                options.audio = Some(match value() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(Error::AudioValue),
+                });
+            }
+            SECOND_DISPLAY => flag(&mut options.second_display, Error::DuplicateSecondDisplay)?,
             DISPLAY_SIZE => {
                 let size = value().ok_or(Error::DisplaySize)?;
                 let (width, height) = size.split_once('x').ok_or(Error::DisplaySize)?;

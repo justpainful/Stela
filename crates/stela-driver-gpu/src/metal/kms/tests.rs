@@ -1,12 +1,14 @@
 use super::*;
 use alloc::{vec, vec::Vec};
 
+mod gpu;
 mod listing;
 mod outputs;
 mod power;
 mod reconnect;
 mod scaling;
 mod scanout;
+mod split;
 
 fn mode(width: u16, height: u16, kind: u32) -> ModeInfo {
     ModeInfo {
@@ -98,6 +100,8 @@ struct Card {
     /// What a sequence request answers: whether the controller is on and
     /// its last vertical blank's time; and the controllers asked.
     vblank: Option<(u32, i64)>,
+    /// Controller 41's own answer, where it is not [`Self::vblank`].
+    vblank_41: Option<(u32, i64)>,
     sequences: Vec<u32>,
     /// Dumb buffers and framebuffers given back, and mappings removed.
     destroyed: Vec<u32>,
@@ -156,6 +160,7 @@ impl Card {
             set_error: None,
             map_refusals: 0,
             vblank: None,
+            vblank_41: None,
             sequences: Vec::new(),
             destroyed: Vec::new(),
             removed: Vec::new(),
@@ -400,7 +405,11 @@ unsafe impl Drm for &mut Card {
                     assert!(self.immediate, "a sequence asked where it must wait");
                     let sequence = &mut *argument.cast::<CrtcSequence>();
                     self.sequences.push(sequence.crtc);
-                    let Some((active, ns)) = self.vblank else {
+                    let vblank = match sequence.crtc {
+                        41 => self.vblank_41.or(self.vblank),
+                        _ => self.vblank,
+                    };
+                    let Some((active, ns)) = vblank else {
                         return -22;
                     };
                     sequence.active = active;
@@ -408,6 +417,11 @@ unsafe impl Drm for &mut Card {
                     sequence.sequence_ns = ns;
                 }
                 REMOVE_FB => self.removed.push(*argument.cast::<u32>()),
+                PRIME_HANDLE_TO_FD => {
+                    let prime = &mut *argument.cast::<PrimeHandle>();
+                    assert_eq!(prime.flags, PRIME_FLAGS);
+                    prime.fd = 1000 + prime.handle as i32;
+                }
                 DESTROY_DUMB => self
                     .destroyed
                     .push((*argument.cast::<DestroyDumb>()).handle),

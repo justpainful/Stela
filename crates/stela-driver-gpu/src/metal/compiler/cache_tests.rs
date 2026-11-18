@@ -213,6 +213,7 @@ fn caching() -> (AirCompiler, u64) {
         decode_pvrtc_kernel: kernel,
         reorder_blocks_kernel: kernel,
         decode_astc_kernel: kernel,
+        compose_kernel: kernel,
         release,
         buffer_reads,
         nir_options: [NonNull::dangling(); super::NIR_STAGES],

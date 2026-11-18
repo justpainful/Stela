@@ -174,9 +174,25 @@ pub trait Link {
     fn diagnostic(&mut self) -> Option<String> {
         None
     }
+    /// Restart an adapter whose rings stopped moving, in place, and go on
+    /// with the same station address and DMA buffers: Linux's transmit
+    /// watchdog (`dev_watchdog`) calls a driver's `ndo_tx_timeout` once
+    /// the queue was stopped for its timeout with carrier, and r8169's
+    /// `rtl8169_tx_timeout` schedules `rtl_reset_work`, which stops and
+    /// resets the chip, sets both rings as at the start and starts it
+    /// again. Frames the adapter held are dropped, as Linux's
+    /// `rtl8169_tx_clear` drops them; what [`Self::transmit`] refused stays
+    /// with the caller. The caller decides when ([`watchdog::Watchdog`]).
+    /// The default is a driver without such a restart.
+    fn recover(&mut self) -> Result<(), LinkError> {
+        Err(LinkError::Adapter(String::from(
+            "the adapter's driver has no in-place restart",
+        )))
+    }
 }
 
 mod timing;
+pub mod watchdog;
 
 #[cfg(test)]
 mod mac_tests {

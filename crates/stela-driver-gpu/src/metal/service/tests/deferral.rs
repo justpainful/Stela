@@ -748,3 +748,18 @@ fn a_call_waiting_for_an_unstarted_job_tells_the_platform() {
     let report = shared.take_job_report();
     assert_eq!((report.ran, report.deferred, report.repeated), (1, 1, 2));
 }
+
+/// The display's compose takes a turn of its own, unless a call holds the
+/// turn past the wait, when nothing runs; with no compose marker on the
+/// device, no frame is shown done.
+#[test]
+fn a_compose_runs_in_its_own_turn_unless_the_turn_stays_held() {
+    let shared = SharedService::new(service_on(MockBackend::new()), host(|_| {}));
+    let marked = shared.with_device(0, |device| device.compose_word().is_some());
+    assert_eq!(marked, Some(false));
+    let held = shared.try_turn().unwrap();
+    assert_eq!(shared.with_device(0, |_| ()), None);
+    drop(held);
+    assert_eq!(shared.with_device(0, |_| 7), Some(7));
+    assert_eq!(shared.compose_shows(1), None);
+}

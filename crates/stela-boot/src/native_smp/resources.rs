@@ -11,7 +11,11 @@ pub(crate) use stela_boot_core::native_resources::*;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Resources {
+    /// Executors the loader reserved: the PEs' and the compile workers'.
     pub cores: u32,
+    /// The first of them, which run PEs; the rest are compile workers
+    /// (`stela_boot_core::compile_workers`).
+    pub runners: u32,
     /// Active parts of each exact owner's fixed native code ring.
     pub code_parts: u32,
     /// Owned LOADER_CODE page below 1 MiB, absent for the serial path.
@@ -30,6 +34,7 @@ impl Default for Resources {
     fn default() -> Self {
         Self {
             cores: 1,
+            runners: 1,
             code_parts: MAX_CODE_PARTS,
             sipi: 0,
             stacks: Region::default(),

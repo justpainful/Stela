@@ -566,6 +566,7 @@ fn the_published_controller_owns_real_commands_shared_power_and_transport_lifeti
             ExternalIdentity::Numbered(1),
             "dispext1:dcpav-controller-epic:0",
         ),
+        (ExternalIdentity::Disp0, "disp0:dcpav-controller-epic:0"),
     ] {
         check_published_controller(identity, name);
     }
@@ -578,8 +579,10 @@ fn check_published_controller(identity: ExternalIdentity, name: &str) {
     let mut ram = Ram::new(RAM, AV_BUFFER + 0x4000);
     let published = controller_start(&mut coprocessor, &mut ram);
     assert_eq!(&published[8..11], &[0x11, 0, 1]);
-    assert_eq!(&published[16..47], &name.as_bytes()[..31]);
-    assert_eq!(published[47], 0);
+    // strlcpy32: at most 31 bytes, the rest of the field NUL.
+    let shown = name.len().min(31);
+    assert_eq!(&published[16..16 + shown], &name.as_bytes()[..shown]);
+    assert!(published[16 + shown..48].iter().all(|&byte| byte == 0));
     let properties = core::str::from_utf8(&published[48..published.len() - 1]).unwrap();
     assert_eq!(published.last(), Some(&0));
     for expected in [
@@ -649,9 +652,54 @@ fn a_presented_swap_completes_on_a_coprocessor_stream() {
         ExternalIdentity::Unnumbered,
         ExternalIdentity::Numbered(0),
         ExternalIdentity::Numbered(1),
+        ExternalIdentity::Disp0,
     ] {
         check_presented_swap(identity);
     }
+}
+
+/// The second display's log names its pipe on every line; the main
+/// display's reads as it always did.
+#[test]
+fn the_second_displays_log_names_its_pipe() {
+    let mut lines = Vec::new();
+    for identity in [ExternalIdentity::Unnumbered, ExternalIdentity::Disp0] {
+        let (scanout, _) = screen(4, 2);
+        let mut coprocessor =
+            Coprocessor::for_external(scanout, Some(RAM), identity, build_26a434()).unwrap();
+        let mut ram = Ram::new(RAM, AV_BUFFER + 0x4000);
+        controller_start(&mut coprocessor, &mut ram);
+        let mut endpoint = up(&mut coprocessor, &mut ram);
+        call(&mut endpoint, &mut ram, 0, b"A412", &[], 4, true);
+        dma(&mut coprocessor, &mut ram).unwrap();
+        let logged: Vec<String> = core::iter::from_fn(|| coprocessor.take_log())
+            .map(|entry| entry.to_string())
+            .collect();
+        assert!(!logged.is_empty());
+        lines.push(logged);
+    }
+    assert!(lines[0].iter().all(|line| !line.starts_with("DCP disp0 ")));
+    assert_eq!(lines[0].len(), lines[1].len());
+    for (main, second) in lines[0].iter().zip(&lines[1]) {
+        // Each of an entry's lines, a payload's rows too.
+        for (main, second) in main.split('\n').zip(second.split('\n')) {
+            // The same kind of entry, the pipe named after `DCP`.
+            let rest = second.strip_prefix("DCP disp0 ").unwrap();
+            assert_eq!(
+                main.split_whitespace().nth(1),
+                rest.split_whitespace().next()
+            );
+        }
+    }
+    let main_display = |lines: &[String]| {
+        lines
+            .iter()
+            .find(|line| line.contains("A412"))
+            .cloned()
+            .unwrap()
+    };
+    assert!(main_display(&lines[0]).ends_with("out=0x4 in=[]"));
+    assert!(main_display(&lines[1]).starts_with("DCP disp0 call A412"));
 }
 
 #[test]

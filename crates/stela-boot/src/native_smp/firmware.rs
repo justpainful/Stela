@@ -449,6 +449,21 @@ pub(crate) fn capture_inventory() -> Result<(Region, usize), Error> {
     Ok((region, logical as usize))
 }
 
+/// The compile workers to start beside `runners` PE executors
+/// (`stela_boot_core::compile_workers`), from the core classes of the
+/// processors the inventory `region` selects, in its order.
+pub(crate) fn compile_workers(region: Region, runners: usize, requested: Option<usize>) -> usize {
+    // SAFETY: as `capture_inventory`: the loader's own initialized record,
+    // directly accessible before ExitBootServices.
+    let capture = unsafe { Capture::read(region.physical as *const u8) };
+    let selected = (capture.core_count as usize).min(topology::MAX_CORES);
+    let classes: Vec<_> = capture.snapshots[..selected]
+        .iter()
+        .map(Snapshot::core_class)
+        .collect();
+    stela_boot_core::compile_workers::count(requested, runners, &classes)
+}
+
 pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
     let handle = boot::get_handle_for_protocol::<MpServices>().map_err(|_| Error::NoMpServices)?;
     let mp =

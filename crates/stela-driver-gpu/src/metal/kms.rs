@@ -25,6 +25,19 @@
 //! mode set the driver refused or a wake that skipped its disconnected
 //! monitor, the next output that is on paces.
 //!
+//! Two displays: [`Display::take_split`] gives the guest's second display
+//! an output of its own instead of the mirror. The output the take above
+//! would give the picture to stays the main display's, with every other
+//! output that mirrors it; the next connected output (the firmware's lit
+//! one first, then DRM's order) is the second display's, alone, in its own
+//! monitor's mode, as a desktop extended across two monitors. Both share
+//! the node, the DRM master, and each holds apart what the other runs: its
+//! connectors, controllers and encoders ([`Held`]), which it never takes,
+//! joins or lights, so a hot-plug of one output never reaches the other's.
+//! Each has its own three buffers, its own mode and refresh, and paces its
+//! own flips on its own controller: a flip the engine is busy with on one
+//! stays queued there and holds nothing of the other's.
+//!
 //! Each connector read is kept as a [`Listing`] for the boot log: every
 //! mode it lists and why each was passed over.
 //!
@@ -40,6 +53,12 @@
 //! [`Display::flush`] on the boot processor. A flip the engine has not
 //! finished answers `EBUSY` and stays queued for the next flush; a newer
 //! frame meanwhile replaces the queued one in the same hidden buffer.
+//!
+//! A frame the GPU composes ([`Display::begin_gpu_frame`]) is written into
+//! the hidden buffer by the GPU, which imports it as a dma-buf
+//! ([`Display::export_buffer`]); the buffer takes no flip until the GPU is
+//! done ([`Display::finish_gpu_frame`]), which then queues it as a
+//! present does.
 //!
 //! Display sleep: [`Display::set_power`] turns every shown output's controller
 //! off, as Linux's fbdev helper does for a blanked console, and back on in its
@@ -83,6 +102,7 @@ const OBJECT_PROPERTIES: u32 = request::<ObjectProperties>(0xb9);
 const SET_OBJECT_PROPERTY: u32 = request::<SetProperty>(0xba);
 const GET_BLOB: u32 = request::<Blob>(0xac);
 const VERSION: u32 = request::<Version>(0x00);
+const PRIME_HANDLE_TO_FD: u32 = request::<PrimeHandle>(0x2d);
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -306,6 +326,19 @@ struct Blob {
     data: u64,
 }
 
+/// `struct drm_prime_handle`.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct PrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+
+/// `DRM_CLOEXEC | DRM_RDWR`: the dma-buf a buffer is exported as is
+/// written by another driver's device (the Metal device, composing).
+const PRIME_FLAGS: u32 = 0o2_000_000 | 0o2;
+
 /// `struct drm_mode_obj_set_property`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -335,6 +368,9 @@ pub enum Error {
     Allocation,
     /// The display does not run the refresh rate asked for.
     NoRate,
+    /// The GPU is still writing the hidden buffer
+    /// ([`Display::begin_gpu_frame`]).
+    GpuWriting,
 }
 
 /// A DRM primary node of the bound GPU.
@@ -413,6 +449,52 @@ pub struct Scaled {
     pub picture: (u32, u32),
 }
 
+/// What another [`Display`] on the same node holds, which this one never
+/// takes, never joins and never lights ([`Display::take_split`]): its
+/// connectors, and the controllers and encoders its outputs run on. A
+/// display alone on its card holds nothing apart, and every connector is
+/// its to take.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Held {
+    /// The only connectors this display may take, where it is given some:
+    /// the second display's one output.
+    only: Option<Vec<u32>>,
+    /// Connectors, controllers and encoders the other display holds.
+    connectors: Vec<u32>,
+    crtcs: Vec<u32>,
+    encoders: Vec<u32>,
+}
+
+impl Held {
+    /// Whether connector `id` is this display's to take.
+    fn takes(&self, id: u32) -> bool {
+        !self.connectors.contains(&id) && self.only.as_ref().is_none_or(|only| only.contains(&id))
+    }
+
+    /// Hold apart, besides, what `other`'s outputs run on.
+    fn hold(&mut self, other: &[Head]) {
+        for head in other {
+            self.connectors.push(head.connector);
+            self.crtcs.push(head.crtc);
+            self.encoders.push(head.encoder);
+        }
+    }
+}
+
+/// The two displays [`Display::take_split`] takes on one node.
+#[derive(Debug)]
+pub struct Split<D> {
+    /// The guest's main display: the output today's take gives the
+    /// picture to, and every other output that mirrors it.
+    pub main: Display<D>,
+    /// The guest's second display on the next connected output alone, in
+    /// its own monitor's mode, or why there is none: [`Error::NoOutput`]
+    /// when no other connected output can run a controller, else the
+    /// driver's refusal of its take. Without it its output, if any, is the
+    /// main display's again, as without a split.
+    pub second: Result<Display<D>, Error>,
+}
+
 /// The outputs a [`Display`] runs.
 #[derive(Debug)]
 pub struct Display<D> {
@@ -436,6 +518,11 @@ pub struct Display<D> {
     stale: [Range<usize>; 3],
     /// The hidden buffer holds a frame whose flip is not requested yet.
     queued: bool,
+    /// The GPU is writing a frame into the hidden buffer
+    /// ([`Self::begin_gpu_frame`]): no flip shows that buffer and no CPU
+    /// frame is made in it until [`Self::finish_gpu_frame`] or
+    /// [`Self::abandon_gpu_frame`].
+    gpu_writing: bool,
     /// The row a producer fills before it is copied to video memory.
     row: Vec<u8>,
     /// The outputs showing the picture; the first paces the flips and
@@ -467,6 +554,8 @@ pub struct Display<D> {
     listings: Vec<Listing>,
     /// The connector [`Self::join`] or [`Self::restore`] last read.
     looked: Option<Listing>,
+    /// What another display on the node holds ([`Self::take_split`]).
+    held: Held,
 }
 
 /// Looks at which a shown output connected again is set once more, or a
@@ -537,6 +626,17 @@ struct Failed<D> {
     /// The connector of the output that gives the picture, when the
     /// driver refused its mode set: another output may give it.
     first: Option<u32>,
+}
+
+/// The hidden buffer as [`Display::begin_gpu_frame`] hands it to the GPU:
+/// its dumb handle (which [`Display::export_buffer`] exports), the bytes
+/// between its rows and its size, and the rows the GPU's frame must write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuTarget {
+    pub handle: u32,
+    pub pitch: usize,
+    pub bytes: usize,
+    pub rows: Range<usize>,
 }
 
 /// A complete frame in the hidden buffer. Dropping it leaves the display
@@ -734,6 +834,18 @@ pub fn detected<D: Drm>(drm: &mut D) -> Result<bool, Error> {
     Ok(false)
 }
 
+/// How many connectors of `drm` have a display as its driver last detected
+/// them, with no probe: whether a second display ([`Display::take_split`])
+/// has a monitor of its own yet.
+pub fn connected_outputs<D: Drm>(drm: &mut D) -> Result<usize, Error> {
+    let (_, connectors) = resources(drm)?;
+    let mut connected = 0;
+    for id in connectors {
+        connected += usize::from(detected_on(drm, id)?);
+    }
+    Ok(connected)
+}
+
 fn output<D: Drm>(drm: &mut D, id: u32) -> Result<Output, Error> {
     for _ in 0..ENUMERATION_ATTEMPTS {
         let mut sized = Connector {
@@ -791,14 +903,17 @@ fn reach<D: Drm>(drm: &mut D, encoders: &[u32], crtcs: &[u32]) -> Result<u32, Er
     Ok(reach & present)
 }
 
-/// The first of `crtcs` in `reach` that no head runs.
-fn free_crtc(reach: u32, crtcs: &[u32], heads: &[Head]) -> Option<u32> {
+/// The first of `crtcs` in `reach` that no head runs and another display
+/// does not hold.
+fn free_crtc(reach: u32, crtcs: &[u32], heads: &[Head], held: &Held) -> Option<u32> {
     crtcs
         .iter()
         .take(u32::BITS as usize)
         .enumerate()
         .find(|&(index, crtc)| {
-            reach >> index & 1 != 0 && heads.iter().all(|head| head.crtc != *crtc)
+            reach >> index & 1 != 0
+                && heads.iter().all(|head| head.crtc != *crtc)
+                && !held.crtcs.contains(crtc)
         })
         .map(|(_, &crtc)| crtc)
 }
@@ -810,12 +925,12 @@ fn free_crtc(reach: u32, crtcs: &[u32], heads: &[Head]) -> Option<u32> {
 /// it and the first would go dark. A DisplayPort hub's outputs (MST) each
 /// list the same encoders, one a controller, of which the driver takes
 /// the one of the controller set, so each output of the hub shows while
-/// one is free, as Linux's fbdev helper lights them.
-fn free_encoder(encoders: &[u32], heads: &[Head]) -> Option<u32> {
-    encoders
-        .iter()
-        .copied()
-        .find(|&encoder| heads.iter().all(|head| head.encoder != encoder))
+/// one is free, as Linux's fbdev helper lights them. One another display
+/// holds is not free.
+fn free_encoder(encoders: &[u32], heads: &[Head], held: &Held) -> Option<u32> {
+    encoders.iter().copied().find(|&encoder| {
+        heads.iter().all(|head| head.encoder != encoder) && !held.encoders.contains(&encoder)
+    })
 }
 
 /// Whether whoever shows the output's picture to the guest can describe a
@@ -1449,12 +1564,84 @@ impl<D: Drm> Display<D> {
     /// every other: the first refusal is the take's answer only when no
     /// other output can give the mode, or, for [`Wanted::Size`], none can
     /// give that size.
-    pub fn take_fitting(mut drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
+    pub fn take_fitting(drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
+        Self::take_among(drm, wanted, fits, Held::default(), false).map(|(display, _)| display)
+    }
+
+    /// Two displays on one node, `main` and `second` being the same node:
+    /// the guest's main display, as [`Self::take_fitting`] takes it for
+    /// `wanted` but without the second display's output, and the guest's
+    /// second display on that output alone, in its mode for `second_wanted`
+    /// (`Wanted::Native((0, 0))`: its monitor's own).
+    ///
+    /// The main display keeps the output [`plan`] gives the picture to
+    /// among every usable output, as the take without a split would; the
+    /// second display's is the next usable output, the firmware's lit one
+    /// first, then DRM's order. The main display is then planned without
+    /// it, so a monitor that mirrored a size both ran shows its own size:
+    /// a 2560x1440 monitor beside a 1920x1080 one runs 2560x1440. A third
+    /// output mirrors the main display, and one connected later joins it.
+    ///
+    /// The main display takes its controllers and encoders first; the
+    /// second takes one neither of the main's outputs runs, and from then
+    /// on each holds the other's apart ([`Held`]). With one usable output,
+    /// or a second whose take the driver refuses, the main display is
+    /// [`Self::take_fitting`]'s, every output its own again, and
+    /// [`Split::second`] says why there is no second. A refusal of the
+    /// main display's take is the answer, as [`Self::take_fitting`]'s.
+    pub fn take_split(
+        main: D,
+        second: D,
+        wanted: Wanted,
+        second_wanted: Wanted,
+        fits: Fits<'_>,
+    ) -> Result<Split<D>, Error> {
+        let (mut main, split) = Self::take_among(main, wanted, fits, Held::default(), true)?;
+        let Some(id) = split else {
+            return Ok(Split {
+                main,
+                second: Err(Error::NoOutput),
+            });
+        };
+        let mut held = Held {
+            only: Some(alloc::vec![id]),
+            ..Held::default()
+        };
+        held.hold(&main.heads);
+        let second =
+            Self::take_among(second, second_wanted, fits, held, false).map(|(display, _)| display);
+        match &second {
+            Ok(second) => main.held.hold(&second.heads),
+            // Its output mirrors the main display again where it can: the
+            // next look tries it, as an output connected after the take.
+            Err(_) => {
+                main.held = Held::default();
+                main.others.push((id, 1));
+            }
+        }
+        Ok(Split { main, second })
+    }
+
+    /// [`Self::take_fitting`] of the connectors `held` leaves this display,
+    /// on controllers and encoders it does not hold. With `split`, the
+    /// usable output after the one [`plan`] gives the picture to among
+    /// them all is left out too, for a second display: its connector is
+    /// the second answer and is held apart from then on.
+    fn take_among(
+        mut drm: D,
+        wanted: Wanted,
+        fits: Fits<'_>,
+        mut held: Held,
+        split: bool,
+    ) -> Result<(Self, Option<u32>), Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
         let mut usable = Vec::new();
         let mut others = Vec::new();
         let mut dark = Vec::new();
         for &id in &connectors {
+            if !held.takes(id) {
+                continue;
+            }
             let found = output(&mut drm, id)?;
             let reach = match found.connected && !found.modes.is_empty() {
                 true => reach(&mut drm, &found.encoders, &crtcs)?,
@@ -1481,6 +1668,18 @@ impl<D: Drm> Display<D> {
         }
         // What the firmware lit first, then DRM's order.
         usable.sort_by_key(|(_, found, _)| !found.lit);
+        // The second display's output: the first usable one after the one
+        // that would give the picture to them all.
+        let mut second = None;
+        if split && usable.len() > 1 {
+            let modes: Vec<&[ModeInfo]> =
+                usable.iter().map(|(_, found, _)| &*found.modes).collect();
+            let gives = plan(&modes, wanted, fits).map_or(0, |(_, gives)| gives);
+            let index = usize::from(gives == 0);
+            let (id, _, _) = usable.remove(index);
+            held.connectors.push(id);
+            second = Some(id);
+        }
         // The outputs the driver refused to set as the one that gives the
         // mode, each with its answer.
         let mut refusals: Vec<(u32, Error)> = Vec::new();
@@ -1517,8 +1716,11 @@ impl<D: Drm> Display<D> {
                 .map(|(_, output)| *output);
             for (id, found, reach) in core::iter::once(giver).chain(rest) {
                 let (id, reach) = (*id, *reach);
-                let free =
-                    free_crtc(reach, &crtcs, &heads).zip(free_encoder(&found.encoders, &heads));
+                let free = free_crtc(reach, &crtcs, &heads, &held).zip(free_encoder(
+                    &found.encoders,
+                    &heads,
+                    &held,
+                ));
                 let Some((crtc, encoder)) = free else {
                     others.push((id, RESTORE_TRIES));
                     let verdicts = listing::follows(&found.modes, size, None);
@@ -1606,15 +1808,17 @@ impl<D: Drm> Display<D> {
                 set if rates.iter().any(|mode| refresh(mode) == refresh(&set)) => rates,
                 set => alloc::vec![set],
             };
-            return Ok(Self {
+            let display = Self {
                 size_mm: (width != 0 && height != 0).then_some((width, height)),
                 edid,
                 preferred,
                 rates,
                 smaller,
                 refused: scaling_refused.or(display.refused),
+                held,
                 ..display
-            });
+            };
+            return Ok((display, second));
         }
     }
 
@@ -1667,6 +1871,7 @@ impl<D: Drm> Display<D> {
             // Each buffer holds black, and the front the console's text.
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
             queued: false,
+            gpu_writing: false,
             row: Vec::new(),
             heads,
             crtcs,
@@ -1679,6 +1884,7 @@ impl<D: Drm> Display<D> {
             retime: None,
             listings,
             looked: None,
+            held: Held::default(),
         };
         if let Err(error) = display.set_mode(0) {
             release_all(&mut display.drm, &display.buffers);
@@ -2028,8 +2234,11 @@ impl<D: Drm> Display<D> {
         }
         let size = (self.width, self.height);
         let reach = reach(&mut self.drm, &found.encoders, &self.crtcs)?;
-        let free = free_crtc(reach, &self.crtcs, &self.heads)
-            .zip(free_encoder(&found.encoders, &self.heads));
+        let free = free_crtc(reach, &self.crtcs, &self.heads, &self.held).zip(free_encoder(
+            &found.encoders,
+            &self.heads,
+            &self.held,
+        ));
         let (Some((crtc, encoder)), Some(shown)) = (free, self.heads.first()) else {
             let verdicts = listing::follows(&found.modes, size, None);
             let role = Role::Dark(Dark::Taken);
@@ -2205,6 +2414,9 @@ impl<D: Drm> Display<D> {
     /// Shows `rows`, blue-low pixels of [`Self::size`] top to bottom, at the
     /// next vertical blank.
     pub fn present(&mut self, rows: &[u8]) -> Result<(), Error> {
+        if self.gpu_writing {
+            return Err(Error::GpuWriting);
+        }
         let row = self.width as usize * BYTES_PER_PIXEL as usize;
         let expected = row * self.height as usize;
         if rows.len() != expected {
@@ -2234,6 +2446,11 @@ impl<D: Drm> Display<D> {
         damage: Option<Range<usize>>,
         mut fill: impl FnMut(usize, &mut [u8]) -> Result<(), Refusal>,
     ) -> Result<PreparedFrame<'_, D>, Refusal> {
+        if self.gpu_writing {
+            return Err(refuse!(
+                "the GPU is still writing the hidden scanout buffer"
+            ));
+        }
         let height = self.height as usize;
         let damage = damage.map_or(0..height, |rows| {
             rows.start.min(height)..rows.end.min(height)
@@ -2271,6 +2488,98 @@ impl<D: Drm> Display<D> {
             || self.power.is_some()
             || self.retime.is_some()
             || self.heads.iter().any(|head| head.behind)
+    }
+
+    /// Hand the hidden buffer to the GPU for a frame it composes: the rows
+    /// `damage` names (`None`: every row) and those the buffer lacks since
+    /// it last held a frame, which [`GpuTarget::rows`] gives. A frame
+    /// queued there and not yet flipped is superseded: the GPU's frame is
+    /// the newer, and the buffer already holds the older's other rows.
+    /// Until [`Self::finish_gpu_frame`] or [`Self::abandon_gpu_frame`] the
+    /// buffer takes no flip and no CPU frame, so nothing the GPU has not
+    /// finished shows. The front and the buffer that shows until the last
+    /// flip lands are untouched.
+    pub fn begin_gpu_frame(&mut self, damage: Option<Range<usize>>) -> Result<GpuTarget, Error> {
+        if self.gpu_writing {
+            return Err(Error::GpuWriting);
+        }
+        let height = self.height as usize;
+        let damage = damage.map_or(0..height, |rows| {
+            rows.start.min(height)..rows.end.min(height)
+        });
+        for stale in &mut self.stale {
+            *stale = union(stale.clone(), damage.clone());
+        }
+        self.queued = false;
+        self.gpu_writing = true;
+        let hidden = &self.buffers[2];
+        Ok(GpuTarget {
+            handle: hidden.handle,
+            pitch: hidden.pitch,
+            bytes: hidden.bytes,
+            rows: self.stale[2].clone(),
+        })
+    }
+
+    /// What [`Self::begin_gpu_frame`] would hand the GPU for `damage`,
+    /// changing nothing: what a compose is prepared for before it is known
+    /// to run.
+    pub fn gpu_target(&self, damage: Option<Range<usize>>) -> GpuTarget {
+        let height = self.height as usize;
+        let damage = damage.map_or(0..height, |rows| {
+            rows.start.min(height)..rows.end.min(height)
+        });
+        let hidden = &self.buffers[2];
+        GpuTarget {
+            handle: hidden.handle,
+            pitch: hidden.pitch,
+            bytes: hidden.bytes,
+            rows: union(self.stale[2].clone(), damage),
+        }
+    }
+
+    /// The GPU finished the frame [`Self::begin_gpu_frame`] gave it: the
+    /// hidden buffer holds it whole, and its flip is queued (requested at
+    /// once where a request completes now, as a present's is).
+    pub fn finish_gpu_frame(&mut self) -> Result<(), Error> {
+        if !self.gpu_writing {
+            return Ok(());
+        }
+        self.gpu_writing = false;
+        self.stale[2] = 0..0;
+        self.queue()
+    }
+
+    /// The GPU's frame will not be shown (its work failed or was given up
+    /// on): the hidden buffer holds no known frame, so the next frame
+    /// fills it whole, and nothing is flipped.
+    pub fn abandon_gpu_frame(&mut self) {
+        if core::mem::replace(&mut self.gpu_writing, false) {
+            self.stale[2] = 0..self.height as usize;
+        }
+    }
+
+    /// Whether the GPU is writing the hidden buffer.
+    pub fn gpu_writing(&self) -> bool {
+        self.gpu_writing
+    }
+
+    /// The dma-buf of the buffer whose dumb handle is `handle` (one of
+    /// [`GpuTarget::handle`]'s), for the GPU that composes to import and
+    /// write; the caller owns the descriptor. The request waits for the
+    /// processor that serves requests where it is not this one, so it is
+    /// made where [`Drm::immediate`] holds.
+    pub fn export_buffer(&mut self, handle: u32) -> Result<i32, Error> {
+        if !self.buffers.iter().any(|buffer| buffer.handle == handle) {
+            return Err(Error::InvalidBuffer);
+        }
+        let mut prime = PrimeHandle {
+            handle,
+            flags: PRIME_FLAGS,
+            fd: -1,
+        };
+        call(&mut self.drm, PRIME_HANDLE_TO_FD, &mut prime)?;
+        Ok(prime.fd)
     }
 
     /// The refresh rates in millihertz the display runs its size at, fastest
@@ -2342,7 +2651,7 @@ impl<D: Drm> Display<D> {
         // output that is on paces until a look sets the first again; with
         // none on the frame stays queued.
         let pacer = self.heads.iter().position(|head| !head.off);
-        if let (true, Some(pacer)) = (self.queued, pacer) {
+        if let (true, false, Some(pacer)) = (self.queued, self.gpu_writing, pacer) {
             match self.flip(pacer, self.buffers[2].framebuffer) {
                 0 => {
                     self.queued = false;

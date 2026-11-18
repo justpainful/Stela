@@ -142,6 +142,14 @@ enum Cached {
 }
 
 impl AudioDevice<super::Native> {
+    /// The device's idVendor and idProduct.
+    pub fn identity(&self) -> (u16, u16) {
+        self.transport.identity()
+    }
+    /// The device's place in the topology.
+    pub fn location(&self) -> &str {
+        self.transport.location()
+    }
     /// Query an advertised UAC2 terminal connector through native EP0.
     /// The returned channel observation grants no routing or PCM permission.
     pub fn connector_status(&mut self, terminal: u8) -> Result<super::ConnectorStatus, Error> {

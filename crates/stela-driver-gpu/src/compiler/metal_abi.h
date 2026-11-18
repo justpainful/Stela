@@ -616,6 +616,52 @@ nir_def *stela_metal_decode_astc(nir_builder *b, nir_def *words, nir_def *x, nir
 nir_shader *stela_metal_decode_astc_kernel(const nir_shader_compiler_options *options);
 nir_shader *stela_metal_reorder_blocks_kernel(const nir_shader_compiler_options *options);
 
+/* ComposeArguments (metal/compose.rs), which the compose kernel reads at the
+ * push constants' arguments address: the address of the scanout buffer the
+ * frame is written to and the bytes between its rows, the pixel count
+ * (width times the rows written), the screen's width, the first row
+ * written, and up to STELA_METAL_COMPOSE_LAYERS_MAX layers, bottom to top.
+ * A layer gives the address of its source rectangle's top-left pixel and
+ * the bytes between its rows, its flags, its source size, its destination
+ * rectangle (x, y, width, height), the end of its on-screen columns and
+ * rows, and for STELA_METAL_COMPOSE_XR10 the address of its alpha plane's
+ * pixel under that top-left one and that plane's row bytes. */
+#define STELA_METAL_COMPOSE_DESTINATION 0u
+#define STELA_METAL_COMPOSE_COUNT 8u
+#define STELA_METAL_COMPOSE_PITCH 12u
+#define STELA_METAL_COMPOSE_WIDTH 16u
+#define STELA_METAL_COMPOSE_FIRST_ROW 20u
+#define STELA_METAL_COMPOSE_LAYER_COUNT 24u
+#define STELA_METAL_COMPOSE_LAYERS 32u
+#define STELA_METAL_COMPOSE_LAYER_BYTES 64u
+#define STELA_METAL_COMPOSE_LAYERS_MAX 4u
+#define STELA_METAL_COMPOSE_BYTES 288u
+#define STELA_METAL_COMPOSE_SOURCE 0u
+#define STELA_METAL_COMPOSE_STRIDE 8u
+#define STELA_METAL_COMPOSE_FLAGS 12u
+#define STELA_METAL_COMPOSE_SOURCE_WIDTH 16u
+#define STELA_METAL_COMPOSE_SOURCE_HEIGHT 20u
+#define STELA_METAL_COMPOSE_X 24u
+#define STELA_METAL_COMPOSE_Y 28u
+#define STELA_METAL_COMPOSE_WIDTH_SHOWN 32u
+#define STELA_METAL_COMPOSE_HEIGHT_SHOWN 36u
+#define STELA_METAL_COMPOSE_COLUMNS_END 40u
+#define STELA_METAL_COMPOSE_ROWS_END 44u
+#define STELA_METAL_COMPOSE_ALPHA 48u
+#define STELA_METAL_COMPOSE_ALPHA_STRIDE 56u
+/* A layer's flags: red in the low byte (else blue), colour premultiplied by
+ * alpha, and RGB10A8_2P_XR10 (extended-range codes, alpha in its plane). */
+#define STELA_METAL_COMPOSE_RGBA 1u
+#define STELA_METAL_COMPOSE_PREMULTIPLIED 2u
+#define STELA_METAL_COMPOSE_XR10 4u
+
+/* Thread n writes pixel n % width of row first + n / width of the scanout:
+ * the layers that cover it, bottom to top over opaque black, each taking
+ * the source pixel under the destination pixel's centre and blended
+ * source-over in 8-bit integers (value * weight + 127) / 255 as the DCP's
+ * CPU compose does, written blue-low with alpha opaque. */
+nir_shader *stela_metal_compose_kernel(const nir_shader_compiler_options *options);
+
 /* The raw texel at x and y of a level of PVRTC blocks of codec, columns
  * by rows blocks of powers of two, at the 64-bit address blocks. */
 nir_def *stela_metal_decode_pvrtc(nir_builder *b, nir_def *blocks, nir_def *columns,

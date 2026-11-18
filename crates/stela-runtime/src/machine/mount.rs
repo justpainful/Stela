@@ -27,7 +27,7 @@ use stela_soc::machine::memory_resources::MemoryResources;
 use stela_soc::machine::sep_state;
 use stela_soc::machine::typec;
 use stela_soc::machine::{RtcAnchor, RtcEpoch};
-use stela_soc_data::board::{Board, PmgrBankRefusal};
+use stela_soc_data::board::{Board, DcpController, PmgrBankRefusal};
 use stela_soc_data::pmu::WallClock;
 
 /// The regions iBoot leaves in the memory controller's lock groups:
@@ -107,7 +107,9 @@ pub struct Inputs<'f> {
     /// adapter, on the last connector.
     pub input: bool,
     pub usb: UsbCables,
-    /// The display coprocessor's monitor.
+    /// The display coprocessor's monitor: the main display's
+    /// (`Board::dcp`, J473AP `dcpext`). A second display's comes with
+    /// [`devices_with_displays`].
     pub scanout: Option<Box<dyn Scanout>>,
     /// Board device firmware images by guest file name.
     pub firmware: &'f dyn Fn(&str) -> Option<&'f [u8]>,
@@ -138,6 +140,25 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     console: C,
     inputs: Inputs<'_>,
     memory: Option<MemoryResources>,
+    log: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<(AppleDevices, Option<UsbId>)> {
+    devices_with_displays(board, console, inputs, memory, Vec::new(), log)
+}
+
+/// [`devices_with_memory`] with the monitors of the board's further display
+/// pipes: the scanouts, in [`Board::displays`] order, are
+/// [`Inputs::scanout`] (index 0, the main display, `dcpext`) and then
+/// `more_scanouts` (index 1, the second display `disp0`, which a boot's
+/// DeviceTree shows under `--second-display`). A visible pipe without its
+/// scanout refuses, as the main one always has; a scanout the board has no
+/// pipe for is left unused, and the log says so. With no further scanout
+/// and no second pipe the mount is [`devices_with_memory`]'s, unchanged.
+pub fn devices_with_displays<C: ConsoleSink + 'static>(
+    board: &Board,
+    console: C,
+    inputs: Inputs<'_>,
+    memory: Option<MemoryResources>,
+    more_scanouts: Vec<Box<dyn Scanout>>,
     log: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<(AppleDevices, Option<UsbId>)> {
     validate_memory(board, memory.as_ref())?;
@@ -211,7 +232,8 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     if let Some(memory) = memory {
         add_native_memory(&mut devices, memory, log)?;
     }
-    add_display(&mut devices, board, &darts, scanout, build)?;
+    let scanouts = core::iter::once(scanout).chain(more_scanouts.into_iter().map(Some));
+    add_displays(&mut devices, board, &darts, scanouts, build, log)?;
     if let Some(sep) = board.sep {
         add_sep(
             &mut devices,
@@ -573,19 +595,81 @@ fn add_native_memory(
     Ok(())
 }
 
-/// The dcpext display coprocessor and its register apertures, presenting
-/// to the host's scanout, mastering through its DART and reading swap
-/// surfaces through the display pipe's.
-fn add_display(
+/// Each display pipeline the board shows ([`Board::displays`]) with its
+/// scanout, in order: the main display (`dcpext`) and then the second
+/// (`disp0`). Without a second pipe, the main display alone is placed
+/// exactly as it always was.
+///
+/// The J473AP DeviceTree gives both pipes the same three SoC-level
+/// apertures after their own (the PMP's PTD update bank and two PMGR
+/// blocks, J473AP `disp0` and `dispext0` `reg` 4..6): those are the
+/// first pipe's to place, and the second places only the apertures it does
+/// not share.
+fn add_displays(
     devices: &mut AppleDevices,
     board: &Board,
     darts: &Darts<'_>,
-    scanout: Option<Box<dyn Scanout>>,
+    scanouts: impl Iterator<Item = Option<Box<dyn Scanout>>>,
     build: &'static stela_formats::builds::Build,
+    log: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<()> {
-    let Some(dcp) = board.dcp.as_ref() else {
-        return Ok(());
-    };
+    let displays: Vec<&DcpController> = board.displays().collect();
+    let mut scanouts: Vec<Option<Box<dyn Scanout>>> = scanouts.collect();
+    // Only a further scanout can be unused: the main display's, which every
+    // mount is given, stays unreported on a board without one, as always.
+    let unused = scanouts
+        .iter()
+        .skip(displays.len().max(1))
+        .filter(|scanout| scanout.is_some())
+        .count();
+    if scanouts.len() < displays.len() {
+        scanouts.resize_with(displays.len(), || None);
+    }
+    let mut placed: Vec<(u64, u64)> = Vec::new();
+    for (index, (dcp, scanout)) in displays.into_iter().zip(scanouts).enumerate() {
+        let scanout = scanout.ok_or_else(|| match index {
+            0 => refuse!("visible external DCP requires one actual scanout"),
+            _ => refuse!(
+                "visible second display {role} requires a second actual scanout",
+                role = dcp.role
+            ),
+        })?;
+        add_display(devices, dcp, darts, scanout, build, &placed)?;
+        if index > 0 {
+            log(format_args!(
+                "DEVICES display {index} {role} wrapper={wrapper:#x} irqs={irqs:x?} \
+                 link=dart{link}:{stream} surface={surface:?} main=0\n",
+                role = dcp.role,
+                wrapper = dcp.wrapper.0,
+                irqs = dcp.interrupts,
+                link = dcp.iommu,
+                stream = dcp.stream,
+                surface = dcp.surface,
+            ));
+        }
+        placed.extend(dcp.regions.iter().map(|&(_, span)| span));
+    }
+    if unused > 0 {
+        log(format_args!(
+            "DEVICES display: {unused} further scanout(s) unused; the board shows no display \
+             pipe for them\n"
+        ));
+    }
+    Ok(())
+}
+
+/// A display coprocessor and its register apertures, presenting to the
+/// host's scanout, mastering through its DART and reading swap surfaces
+/// through the display pipe's. Apertures in `placed`, an earlier pipe's,
+/// stay that pipe's.
+fn add_display(
+    devices: &mut AppleDevices,
+    dcp: &DcpController,
+    darts: &Darts<'_>,
+    scanout: Box<dyn Scanout>,
+    build: &'static stela_formats::builds::Build,
+    placed: &[(u64, u64)],
+) -> Result<()> {
     for route in &dcp.surface_routes {
         devices.validate_native_dart(
             "DCP declared surface mapper",
@@ -593,7 +677,6 @@ fn add_display(
             route.stream as usize,
         )?;
     }
-    let scanout = scanout.ok_or(refuse!("visible external DCP requires one actual scanout"))?;
     let range = |(physical, bytes): (u64, u64)| Range { physical, bytes };
     devices.add_dcpext(
         DcpextNub {
@@ -627,6 +710,7 @@ fn add_display(
     let regions: Vec<(&'static str, Range)> = dcp
         .regions
         .iter()
+        .filter(|&&(_, reg)| !placed.contains(&reg))
         .map(|&(name, reg)| (name, range(reg)))
         .collect();
     let mut display_darts = Vec::new();
@@ -755,9 +839,10 @@ fn add_usbs(
         let id = devices.add_usb(controller, darts.native(controller.iommu, 0)?)?;
         // The native keyboard and pointer plug into the last connector
         // (J473AP usb-drd1), the Mac being the downstream-facing port.
-        let hub = input || !usb.disks.is_empty() || usb.network.is_some();
+        let hub = input || !usb.disks.is_empty() || usb.network.is_some() || usb.audio;
         if hub && index + 1 == usbs && index != 0 {
             let disks = usb.disks.len();
+            let audio = if usb.audio { "headset" } else { "none" };
             // Whether a network adapter is attached, never its station
             // address: logs are shared, and an address printed as decimal
             // bytes escapes the usual masking.
@@ -768,7 +853,8 @@ fn add_usbs(
             };
             devices.attach_input(controller.port, core::mem::take(&mut usb))?;
             log(format_args!(
-                "INPUT attached to USB-C port {} with {disks} USB disks, network={network}\n",
+                "INPUT attached to USB-C port {} with {disks} USB disks, network={network} \
+                 audio={audio}\n",
                 controller.port
             ));
         }
@@ -968,6 +1054,137 @@ mod tests {
             messages
                 .iter()
                 .all(|message| message.contains("no register/lifecycle model"))
+        );
+    }
+
+    /// The J473AP's two display pipelines mounted from a fixture DeviceTree
+    /// (`fixture_support::two_display_pipelines`) with stand-in host inputs.
+    fn mount_displays(
+        tree: &[u8],
+        main: bool,
+        more: usize,
+    ) -> (Result<AppleDevices>, Board, Vec<String>) {
+        extern crate std;
+        use std::string::ToString;
+        use stela_soc::machine::{ConsoleBusy, ScanoutFormat, ScanoutMode};
+        struct Discard;
+        impl ConsoleSink for Discard {
+            fn transmit(&mut self, _: u8) -> core::result::Result<(), ConsoleBusy> {
+                Ok(())
+            }
+        }
+        impl Scanout for Discard {
+            fn mode(&self) -> ScanoutMode {
+                ScanoutMode {
+                    width: 1920,
+                    height: 1080,
+                    format: ScanoutFormat::Bgra8888,
+                }
+            }
+            fn present(&mut self, _: &[u8]) -> core::result::Result<(), stela_contracts::Refusal> {
+                Ok(())
+            }
+        }
+        let board = stela_soc_data::board::board(tree).unwrap();
+        let firmware = |_: &str| None;
+        let mut log = Vec::new();
+        let more_scanouts = (0..more)
+            .map(|_| Box::new(Discard) as Box<dyn Scanout>)
+            .collect();
+        let mounted = devices_with_displays(
+            &board,
+            Discard,
+            Inputs {
+                programmed: memory_locks(None, &ctrr::CoreLocks::default()),
+                reset: None,
+                now: 0,
+                wall: None,
+                rtc_anchor: None,
+                backing: None,
+                sep_state: None,
+                sep_observe: false,
+                sep_recovery_policy_nonce: None,
+                entropy: Box::new(|bytes: &mut [u8]| {
+                    bytes.fill(0);
+                    Ok(())
+                }),
+                restore: false,
+                input: false,
+                usb: UsbCables::default(),
+                scanout: main.then(|| Box::new(Discard) as Box<dyn Scanout>),
+                firmware: &firmware,
+                build: Some(stela_formats::builds::DEFAULT),
+            },
+            None,
+            more_scanouts,
+            &mut |arguments| log.push(arguments.to_string()),
+        )
+        .map(|(devices, _)| devices);
+        (mounted, board, log)
+    }
+
+    #[test]
+    fn a_second_display_mounts_beside_the_first_with_its_own_scanout() {
+        use stela_soc_data::board::fixture_support::{
+            SHARED_DISPLAY_APERTURE, two_display_pipelines,
+        };
+        let tree = two_display_pipelines(true, true);
+        let (mounted, board, log) = mount_displays(&tree, true, 1);
+        let devices = mounted.unwrap();
+        assert_eq!(board.displays().count(), 2);
+        // Each pipe has its own coprocessor; the aperture both pipes name
+        // is the first one's, placed once.
+        assert_eq!(devices.coprocessor_diagnostics().len(), 2);
+        let second = board.second_display.as_ref().unwrap();
+        assert!(
+            second
+                .regions
+                .iter()
+                .any(|&(_, span)| span == SHARED_DISPLAY_APERTURE)
+        );
+        let named: Vec<&String> = log
+            .iter()
+            .filter(|line| line.starts_with("DEVICES display"))
+            .collect();
+        assert_eq!(named.len(), 1, "{log:?}");
+        assert!(named[0].starts_with("DEVICES display 1 DCP wrapper=0x231c00000 "));
+        assert!(named[0].ends_with(" main=0\n"));
+
+        // A visible second pipe without its scanout refuses by name.
+        let refused = mount_displays(&tree, true, 0).0.err().unwrap();
+        assert!(
+            refused
+                .to_string()
+                .contains("visible second display DCP requires a second actual scanout"),
+            "{refused}"
+        );
+        // So does the main one, as it always did.
+        let refused = mount_displays(&tree, false, 1).0.err().unwrap();
+        assert!(
+            refused
+                .to_string()
+                .contains("visible external DCP requires one actual scanout"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn without_a_second_pipe_the_main_display_mounts_as_it_always_did() {
+        use stela_soc_data::board::fixture_support::two_display_pipelines;
+        // A template's DCP-role coprocessor is not a second display.
+        let tree = two_display_pipelines(false, true);
+        let (mounted, board, log) = mount_displays(&tree, true, 0);
+        let devices = mounted.unwrap();
+        assert!(board.second_display.is_none());
+        assert_eq!(devices.coprocessor_diagnostics().len(), 1);
+        assert!(!log.iter().any(|line| line.starts_with("DEVICES display")));
+        // A scanout the board has no pipe for is left unused, and said so.
+        let (mounted, _, log) = mount_displays(&tree, true, 1);
+        assert_eq!(mounted.unwrap().coprocessor_diagnostics().len(), 1);
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("DEVICES display: 1 further scanout(s) unused")),
+            "{log:?}"
         );
     }
 }

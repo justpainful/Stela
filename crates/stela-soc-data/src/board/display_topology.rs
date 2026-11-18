@@ -1,8 +1,9 @@
 //! DeviceTree placement and validation for display topology.
 use super::dma_routes::{native_dma_mapper_list, native_dma_phandle, native_dma_route};
 use super::{
-    ASC, DCP_EXPERT, DCP_EXPERT_HARDWARE_FEATURES, DISPLAY_CROSSBAR, DPTX_PHY, Iommu, Node, Vec,
-    asc, dcp, external_output, format, rtbuddy_nub,
+    ASC, DCP_EXPERT, DCP_EXPERT_HARDWARE_FEATURES, DISPLAY_CROSSBAR, DPTX_PHY, ExternalOutput,
+    Iommu, Node, RTBUDDY, Vec, asc, dcp, external_output, format, rtbuddy_nub,
+    second_display_output,
 };
 use crate::{Refusal, Result};
 use stela_contracts::{refusal::Within, refuse};
@@ -81,6 +82,62 @@ pub(super) fn dcp_device(
             "one GOP resource cannot back two external pipelines"
         ));
     }
+    place_output(io, node, profile, translate, darts).map(Some)
+}
+
+/// The second display pipeline ([`super::DCP_ROLE`]), placed as
+/// [`dcp_device`] places the main one, when the DeviceTree presents it
+/// admitted. A board template keeps the DCP-role coprocessor's `compatible`
+/// too, so that alone admits nothing: the boot chain admits the pipeline
+/// only for a boot that asks for it (`stela_loader::devices`, under
+/// [`super::Admission::second_display`]), and marks its nub then, as every
+/// modeled coprocessor's, a `running` native RTKit. A visible DCP-role
+/// coprocessor without that mark is the template's, and none is placed.
+pub(super) fn second_display_device(
+    io: &Node<'_>,
+    translate: &dyn Fn(u64) -> Option<u64>,
+    darts: &[Iommu],
+) -> Result<Option<DcpController>> {
+    let children = io
+        .children()
+        .ok_or(refuse!("DCP arm-io children are malformed"))?;
+    let mut matches = children.iter().filter_map(|n| {
+        n.compatible(ASC)
+            .then(|| n.property("role").and_then(second_display_output))
+            .flatten()
+            .map(|profile| (n, profile))
+    });
+    let Some((node, profile)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(refuse!(
+            "two DCP-role coprocessors cannot back one second display"
+        ));
+    }
+    let admitted = node.children().is_some_and(|nubs| {
+        nubs.iter()
+            .any(|nub| nub.compatible(RTBUDDY) && nub.property("running").is_some())
+    });
+    if !admitted {
+        return Ok(None);
+    }
+    place_output(io, node, profile, translate, darts).map(Some)
+}
+
+/// Place the coprocessor `node` of `profile`'s pipeline: its nub, its
+/// same-role expert, its pipe and their DMA routes, refusing an incomplete
+/// or ambiguous graph.
+fn place_output(
+    io: &Node<'_>,
+    node: &Node<'_>,
+    profile: &ExternalOutput,
+    translate: &dyn Fn(u64) -> Option<u64>,
+    darts: &[Iommu],
+) -> Result<DcpController> {
+    let children = io
+        .children()
+        .ok_or(refuse!("DCP arm-io children are malformed"))?;
     let path = format!("/arm-io/{}", profile.controller);
     let err = |what: &'static str| refuse!("{path}", path).because(Refusal::new(what));
     let place = |offset: u64, bytes: u64| -> Result<(u64, u64)> {
@@ -225,7 +282,7 @@ pub(super) fn dcp_device(
             }
         }
     }
-    Ok(Some(DcpController {
+    Ok(DcpController {
         phandle,
         mapper,
         surface_phandle,
@@ -243,14 +300,14 @@ pub(super) fn dcp_device(
         iommu,
         stream,
         window: node.property("truncate-dvas").map(|_| darts[iommu].vm_base),
-    }))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::*;
     use super::*;
-    use crate::board::fixture_support::tree_with_io;
+    use crate::board::fixture_support::{self, tree_with_io};
 
     #[test]
     fn dcp_placement_reads_the_wrapper_irqs_nub_and_display_apertures_without_admitting_it() {
@@ -439,5 +496,103 @@ mod tests {
         assert!(!models(DCP_EXPERT, |key| (key == "role")
             .then_some(b"DCP\0".as_slice())));
         assert!(board(&build(b"DCP\0", true, false)).unwrap().dcp.is_none());
+    }
+
+    #[test]
+    fn second_display_is_placed_only_once_the_boot_chain_admits_it() {
+        // A template's DCP-role coprocessor is not a second display: the
+        // main pipeline alone is placed, as it always was.
+        let template = board(&fixture_support::two_display_pipelines(false, true)).unwrap();
+        assert_eq!(template.dcp.as_ref().map(|dcp| dcp.role), Some("DCPEXT"));
+        assert!(template.second_display.is_none());
+        assert_eq!(template.displays().count(), 1);
+
+        let found = board(&fixture_support::two_display_pipelines(true, true)).unwrap();
+        let main = found.dcp.as_ref().expect("dcpext stays the main display");
+        let second = found.second_display.as_ref().expect("disp0 is placed");
+        assert_eq!(
+            found.displays().map(|dcp| dcp.role).collect::<Vec<_>>(),
+            ["DCPEXT", "DCP"]
+        );
+        assert_eq!(main.identity, dcp::ExternalIdentity::Unnumbered);
+        assert_eq!(second.identity, dcp::ExternalIdentity::Disp0);
+        assert_eq!(second.wrapper, (0x2_31c0_0000, 0x6c000));
+        assert_eq!(second.interrupts, [0x218, 0x217, 0x21a, 0x219]);
+        assert!(second.quiesced);
+        // Its own DARTs and streams: dart-dcp stream 5 for the link, with
+        // no truncate-dvas window, and dart-disp0 stream 0 for surfaces.
+        assert_eq!(second.mapper, 0xbd);
+        assert_ne!(second.iommu, main.iommu);
+        assert_eq!(
+            found.darts[second.iommu].instances[0].physical,
+            0x2_3130_c000
+        );
+        assert_eq!(second.stream, 5);
+        assert_eq!(second.window, None);
+        assert_eq!(main.window, Some(0x8_0000_0000));
+        let (surface, stream) = second.surface.expect("disp0 surfaces");
+        assert_ne!(Some((surface, stream)), main.surface);
+        assert_eq!(found.darts[surface].instances[0].physical, 0x2_3130_4000);
+        assert_eq!(stream, 0);
+        assert_eq!(
+            second
+                .surface_routes
+                .iter()
+                .map(|r| (r.mapper, r.mapper_context, r.stream))
+                .collect::<Vec<_>>(),
+            [(0xbf, 0, 0), (0xc0, 4, 4)]
+        );
+        // Only the pipe's own aperture: the crossbar and DPTX PHY stay
+        // `dcpext`'s optional views, and hidden.
+        assert_eq!(
+            second.regions,
+            [
+                ("disp0", (0x2_3000_0000, 0x61c000)),
+                ("disp0", fixture_support::SHARED_DISPLAY_APERTURE),
+            ]
+        );
+        assert_eq!(main.regions[1], ("dispext0", second.regions[1].1));
+
+        // An admitted coprocessor without its power expert refuses.
+        assert!(board(&fixture_support::two_display_pipelines(true, false)).is_err());
+    }
+
+    #[test]
+    fn second_display_claims_hold_only_under_its_admission() {
+        let dcp = |key: &str| (key == "role").then_some(DCP_ROLE);
+        let second = Admission {
+            second_display: true,
+        };
+        assert!(!models(ASC, dcp) && !models(DCP_EXPERT, dcp) && !models(DISP0, |_| None));
+        assert!(model_children(ASC, dcp).is_empty());
+        assert!(models_under(ASC, dcp, second));
+        assert!(models_under(DCP_EXPERT, dcp, second));
+        assert!(models_under(DISP0, |_| None, second));
+        assert_eq!(
+            model_children_under(ASC, dcp, second)[0].compatible,
+            RTBUDDY
+        );
+        assert!(model_boot_properties_under(ASC, dcp, second).is_empty());
+        assert!(
+            model_children_under(ASC, dcp, second)[0]
+                .boot_properties
+                .iter()
+                .any(|&(key, _)| key == "running")
+        );
+        // The rest of the board is admitted as it always is.
+        let dcpext = |key: &str| (key == "role").then_some(DCPEXT_ROLE);
+        assert!(models_under(ASC, dcpext, second) && models(ASC, dcpext));
+        assert!(!models_under(DPTX_PHY, |_| None, second));
+        assert!(!models_under(DISPLAY_CROSSBAR, |_| None, second));
+        // The DCP role never stands in for the board's one external output.
+        assert!(external_output(DCP_ROLE).is_none());
+        let profile = second_display_output(DCP_ROLE).expect("disp0 profile");
+        assert!(!profile.admitted_under(Admission::default()));
+        assert!(profile.admitted_under(second));
+        assert_eq!(
+            (profile.controller, profile.expert, profile.pipe),
+            ("dcp", "dcp0-expert", "disp0")
+        );
+        assert!(second_display_output(DCPEXT_ROLE).is_none());
     }
 }

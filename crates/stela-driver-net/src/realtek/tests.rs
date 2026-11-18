@@ -313,6 +313,7 @@ mod nbase_admission;
 mod nbase_bp;
 mod nbase_d_cp;
 mod packet_io;
+mod recovery;
 mod registers;
 mod stop;
 mod stuck_registers;

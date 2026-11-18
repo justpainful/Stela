@@ -158,8 +158,10 @@ impl AppleDevices {
             disks,
             network,
             bluetooth,
+            audio,
         } = cables;
-        let extras = usize::from(network.is_some()) + usize::from(bluetooth.is_some());
+        let extras =
+            usize::from(network.is_some()) + usize::from(bluetooth.is_some()) + usize::from(audio);
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
@@ -182,6 +184,7 @@ impl AppleDevices {
                 UsbBluetooth::Host => Hci::new(),
                 UsbBluetooth::Model => Hci::modeled(crate::usb::hci::model::address(self.ecid)),
             }),
+            audio: audio.then(Audio::new),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
@@ -193,6 +196,41 @@ impl AppleDevices {
             speed: typec::Usb2Speed::High,
         }))?;
         Ok(())
+    }
+
+    fn usb_audio(&mut self) -> Option<&mut Audio> {
+        self.usb_masters
+            .iter_mut()
+            .find_map(|master| master.peripheral.as_mut()?.ports.audio.as_mut())
+    }
+
+    /// Moves up to `out.len()` frames the guest played on its headset to
+    /// `out`, its mute and volume applied; the number moved, 0 without a
+    /// headset.
+    pub fn audio_take(&mut self, out: &mut [[i32; AUDIO_CHANNELS]]) -> usize {
+        self.usb_audio().map_or(0, |audio| audio.take(out))
+    }
+
+    /// Whether the guest streams to its headset, and the stream's status;
+    /// `None` without a headset.
+    pub fn audio_status(&mut self) -> Option<(bool, UsbAudioStatus)> {
+        let audio = self.usb_audio()?;
+        Some((audio.streaming(), audio.status()))
+    }
+
+    /// Whether the guest captures from its headset's microphone, and the
+    /// capture's status; `None` without a headset.
+    pub fn audio_capture_status(&mut self) -> Option<(bool, UsbAudioCaptureStatus)> {
+        let audio = self.usb_audio()?;
+        Some((audio.capturing(), audio.capture_status()))
+    }
+
+    /// Mono microphone samples, MSB-aligned in 32 bits, for the guest's
+    /// headset; dropped without one.
+    pub fn audio_give(&mut self, samples: &[i32]) {
+        if let Some(audio) = self.usb_audio() {
+            audio.give(samples);
+        }
     }
 
     pub(super) fn usb_network(&mut self) -> Result<&mut Ecm> {

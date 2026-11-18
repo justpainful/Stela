@@ -1,10 +1,11 @@
 //! Compatible and role matching for the native models exposed in the DeviceTree.
 use super::{
-    AES, AICS, ASC, BOOT_FIRMWARE, BUTTONS, CLPC, DCP_EXPERT, DCPEXT_ROLE, DISPEXT, DISPEXT_T6000,
-    DOCK_PORT, GFX_MAPPER, GPIO, GPIO_S5L, GPIO_T6000, HPM, HPM_MANAGER, IOMMU_MAPPER, MCC, NOR,
-    NVRAM, PMGR2_IMPLEMENTATION, PMU, RTBUDDY, SEP, SEP_NUB, SMC_PMU, SOCS, SPI, SPMI, SYSCFG,
-    T6000_EXTERNAL_OUTPUT_ADMITTED, UART, WATCHDOG, admitted_gpu, atc_phy_compatible,
-    dart_topology, gpio_profile, i2c_compatible, memory_resources, usb_controller_compatible,
+    AES, AICS, ASC, Admission, BOOT_FIRMWARE, BUTTONS, CLPC, DCP_EXPERT, DCP_ROLE, DCPEXT_ROLE,
+    DISP0, DISPEXT, DISPEXT_T6000, DOCK_PORT, GFX_MAPPER, GPIO, GPIO_S5L, GPIO_T6000, HPM,
+    HPM_MANAGER, IOMMU_MAPPER, MCC, NOR, NVRAM, PMGR2_IMPLEMENTATION, PMU, RTBUDDY, SEP, SEP_NUB,
+    SMC_PMU, SOCS, SPI, SPMI, SYSCFG, T6000_EXTERNAL_OUTPUT_ADMITTED, UART, WATCHDOG, admitted_gpu,
+    atc_phy_compatible, dart_topology, gpio_profile, i2c_compatible, memory_resources,
+    usb_controller_compatible,
 };
 
 /// A compatible may require a distinguishing property and may own children
@@ -169,20 +170,69 @@ pub(super) const ROLE_MODELS: &[ModelClaim] = &[
     },
 ];
 
+/// The second display pipeline's claims ([`DCP_ROLE`]): its coprocessor,
+/// whose `iop-dcp-nub` reads as the native RTKit `dcpext`'s does, and its
+/// power expert, which `AppleDCPExpert` binds and IOMFB waits for, as for
+/// `dcpext`. Its pipe `disp0` is claimed by compatible ([`DISP0`]) and its
+/// DARTs, `dart,t8110`, as every such DART is, while a kept client names
+/// their mappers. A boot admits them only under
+/// [`Admission::second_display`].
+const SECOND_DISPLAY_MODELS: &[ModelClaim] = &[
+    ModelClaim {
+        compatible: ASC,
+        property: ("role", DCP_ROLE),
+        children: &[NATIVE_RTKIT],
+        boot_properties: &[],
+        admitted: true,
+    },
+    ModelClaim {
+        compatible: DCP_EXPERT,
+        property: ("role", DCP_ROLE),
+        children: &[],
+        boot_properties: &[],
+        admitted: true,
+    },
+];
+
+/// The role claims a boot with `admission` admits.
+fn claims(admission: Admission) -> impl Iterator<Item = &'static ModelClaim> {
+    let second: &'static [ModelClaim] = if admission.second_display {
+        SECOND_DISPLAY_MODELS
+    } else {
+        &[]
+    };
+    ROLE_MODELS.iter().chain(second)
+}
+
+/// The admitted claim a compatible and its distinguishing properties match.
+fn claim<'a>(
+    name: &str,
+    property: &impl Fn(&str) -> Option<&'a [u8]>,
+    admission: Admission,
+) -> Option<&'static ModelClaim> {
+    claims(admission).find(|claim| {
+        claim.admitted
+            && claim.compatible == name
+            && property(claim.property.0) == Some(claim.property.1)
+    })
+}
+
 /// Child compatibles claimed by a matching parent model. The loader uses
 /// this relationship before changing the tree, without relying on paths.
 pub fn model_children<'a>(
     name: &str,
     property: impl Fn(&str) -> Option<&'a [u8]>,
 ) -> &'static [ChildModel] {
-    ROLE_MODELS
-        .iter()
-        .find(|claim| {
-            claim.admitted
-                && claim.compatible == name
-                && property(claim.property.0) == Some(claim.property.1)
-        })
-        .map_or(&[], |claim| claim.children)
+    model_children_under(name, property, Admission::default())
+}
+
+/// [`model_children`] for a boot with `admission`.
+pub fn model_children_under<'a>(
+    name: &str,
+    property: impl Fn(&str) -> Option<&'a [u8]>,
+    admission: Admission,
+) -> &'static [ChildModel] {
+    claim(name, &property, admission).map_or(&[], |claim| claim.children)
 }
 
 /// Boot-chain properties a matching claimed node carries itself.
@@ -190,44 +240,58 @@ pub fn model_boot_properties<'a>(
     name: &str,
     property: impl Fn(&str) -> Option<&'a [u8]>,
 ) -> &'static [(&'static str, &'static [u8])] {
-    ROLE_MODELS
-        .iter()
-        .find(|claim| {
-            claim.admitted
-                && claim.compatible == name
-                && property(claim.property.0) == Some(claim.property.1)
-        })
-        .map_or(&[], |claim| claim.boot_properties)
+    model_boot_properties_under(name, property, Admission::default())
+}
+
+/// [`model_boot_properties`] for a boot with `admission`.
+pub fn model_boot_properties_under<'a>(
+    name: &str,
+    property: impl Fn(&str) -> Option<&'a [u8]>,
+    admission: Admission,
+) -> &'static [(&'static str, &'static [u8])] {
+    claim(name, &property, admission).map_or(&[], |claim| claim.boot_properties)
 }
 
 /// Whether a compatible and its distinguishing properties name a modeled
 /// device. The loader also checks provider and parent/child relationships.
 pub fn models<'a>(name: &str, property: impl Fn(&str) -> Option<&'a [u8]>) -> bool {
-    [
-        UART,
-        WATCHDOG,
-        IOMMU_MAPPER,
-        AES,
-        MCC,
-        // Direct MCC has a native cold owner. Its descriptor must still pass
-        // full source validation and mount requires that owner.
-        memory_resources::COMPATIBLE,
-        SPI,
-        NOR,
-        BOOT_FIRMWARE,
-        NVRAM,
-        SYSCFG,
-        GPIO,
-        HPM_MANAGER,
-        HPM,
-        DOCK_PORT,
-        SPMI,
-        PMU,
-        BUTTONS,
-        DISPEXT,
-        CLPC,
-    ]
-    .contains(&name)
+    models_under(name, property, Admission::default())
+}
+
+/// [`models`] for a boot with `admission`: the devices every boot admits,
+/// and those its options add.
+pub fn models_under<'a>(
+    name: &str,
+    property: impl Fn(&str) -> Option<&'a [u8]>,
+    admission: Admission,
+) -> bool {
+    admission.second_display && name == DISP0
+        || claim(name, &property, admission).is_some()
+        || [
+            UART,
+            WATCHDOG,
+            IOMMU_MAPPER,
+            AES,
+            MCC,
+            // Direct MCC has a native cold owner. Its descriptor must still pass
+            // full source validation and mount requires that owner.
+            memory_resources::COMPATIBLE,
+            SPI,
+            NOR,
+            BOOT_FIRMWARE,
+            NVRAM,
+            SYSCFG,
+            GPIO,
+            HPM_MANAGER,
+            HPM,
+            DOCK_PORT,
+            SPMI,
+            PMU,
+            BUTTONS,
+            DISPEXT,
+            CLPC,
+        ]
+        .contains(&name)
         || i2c_compatible(name, property("compatible"))
         || usb_controller_compatible(name, property("compatible"))
         || T6000_EXTERNAL_OUTPUT_ADMITTED && name == DISPEXT_T6000
@@ -244,9 +308,4 @@ pub fn models<'a>(name: &str, property: impl Fn(&str) -> Option<&'a [u8]>) -> bo
         || atc_phy_compatible(name, property("compatible"))
         || SOCS.iter().any(|soc| soc.pmgr == name)
         || name == PMGR2_IMPLEMENTATION
-        || ROLE_MODELS.iter().any(|claim| {
-            claim.admitted
-                && claim.compatible == name
-                && property(claim.property.0) == Some(claim.property.1)
-        })
 }

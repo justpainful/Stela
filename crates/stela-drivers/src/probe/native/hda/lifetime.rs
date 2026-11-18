@@ -61,6 +61,24 @@ impl OriginalUsers {
     }
 }
 
+impl OriginalUsers {
+    /// The cold grant, as VMD's finalization takes it (`probe::native`): the
+    /// HD Audio function is attached after ExitBootServices, so no firmware
+    /// driver runs any more; the native mount parked it with Bus Master clear
+    /// and its interrupts unrouted; and the native driver is polled, so no
+    /// original IRQ, EOI, CPU or deferred work user of this function remains
+    /// to retire. It is bound to the function's configuration epoch of the
+    /// attach, which `prepare` checks again before any root drain or bind.
+    ///
+    /// # Safety
+    /// Only after ExitBootServices, for a function the native mount parked,
+    /// with no other Stela user of it, and `retained` read from its owned
+    /// configuration in the same attach.
+    pub(super) unsafe fn cold_grant(retained: ConfigRetention) -> Self {
+        Self { retained }
+    }
+}
+
 /// # Safety
 /// The original provider owns exact UC BAR0/native widths and keeps actual
 /// mapping/reservation/backing while shared accessors exist. Failed retirement
@@ -412,6 +430,78 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             }
         }
     }
+    /// Allocate a playback stream of `periods` periods of `period_bytes`
+    /// in `format` from this owner's DMA domain, silence its ring, program
+    /// `route` for it with `options`, and start it: a cyclic analog output
+    /// its owner writes ahead of with [`Self::write_output`].
+    pub fn start_output(
+        &mut self,
+        graph: &hda::CodecGraph,
+        route: &hda::AnalogRoute,
+        format: audio::PcmFormat,
+        period_bytes: usize,
+        periods: usize,
+        options: hda::PinOptions,
+    ) -> Result<hda::StreamId, Error> {
+        self.admit()?;
+        let r = self.owner.resources();
+        let controller = r.controller.as_mut().ok_or(Error::Terminal)?;
+        let mut allocator = RecordingAllocator {
+            inner: r.dma.as_mut().ok_or(Error::Terminal)?,
+            failure: None,
+        };
+        let id = controller
+            .allocate_stream(
+                audio::Direction::Playback,
+                format,
+                period_bytes,
+                periods,
+                &mut allocator,
+            )
+            .map_err(|error| {
+                allocator
+                    .failure
+                    .map_or(Error::Controller(error), Error::Allocation)
+            })?;
+        controller.write_pcm(id, 0, &alloc::vec![0; period_bytes * periods])?;
+        controller.configure_analog_route(graph, route, id, 0, options)?;
+        controller.start(id)?;
+        Ok(id)
+    }
+
+    /// A running output's link position in bytes; an error once its DMA
+    /// stopped.
+    pub fn output_position(&mut self, id: hda::StreamId) -> Result<u32, Error> {
+        self.admit()?;
+        let controller = self.owner.resources().controller.as_mut();
+        let status = controller.ok_or(Error::Terminal)?.status(id)?;
+        if !status.running {
+            return Err(Error::Controller(audio::Error::StreamStopped));
+        }
+        Ok(status.position_bytes)
+    }
+
+    /// PCM for a running output at `offset` (`Controller::write_running_pcm`).
+    pub fn write_output(
+        &mut self,
+        id: hda::StreamId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.admit()?;
+        let controller = self.owner.resources().controller.as_mut();
+        Ok(controller
+            .ok_or(Error::Terminal)?
+            .write_running_pcm(id, offset, bytes)?)
+    }
+
+    /// The output's FIFO size in bytes (`Controller::stream_fifo_bytes`).
+    pub fn output_fifo_bytes(&mut self, id: hda::StreamId) -> Result<u16, Error> {
+        self.admit()?;
+        let controller = self.owner.resources().controller.as_mut();
+        Ok(controller.ok_or(Error::Terminal)?.stream_fifo_bytes(id)?)
+    }
+
     pub fn close(&mut self) -> Result<(), Error> {
         self.admit()?;
         // Admission closes BEFORE any protocol/MMIO callback. Unwind leaves

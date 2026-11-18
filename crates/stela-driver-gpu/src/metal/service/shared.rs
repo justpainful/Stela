@@ -162,6 +162,11 @@ pub struct SharedService<B: Backend, C: Compiler> {
     /// that clears it waits for them, so no read outlives the device.
     marker: AtomicPtr<AtomicU32>,
     marker_readers: AtomicU32,
+    /// The device's compose marker as the last turn saw it, null for none
+    /// or a lost device, and the processors reading it now, as for
+    /// `marker` ([`SharedService::compose_shows`]).
+    compose_marker: AtomicPtr<AtomicU32>,
+    compose_readers: AtomicU32,
     upkeep_asked: AtomicBool,
     look_budget: AtomicU64,
     /// Refused submissions whose command buffers' connections were not yet
@@ -621,6 +626,7 @@ impl<B: Backend, C: Compiler> Drop for Turn<'_, B, C> {
         let submitted = device.submitted_serial();
         let serial = device.completed_serial();
         let word = device.completion_word();
+        let compose_word = device.compose_word();
         // While some connection's work is held or completes on the late
         // timeline, completion differs by connection: the service answers
         // each poll, and no waiter publishes the timeline's value.
@@ -637,6 +643,10 @@ impl<B: Backend, C: Compiler> Drop for Turn<'_, B, C> {
         match word {
             Some(word) => self.0.marker.store(word.as_ptr(), Ordering::SeqCst),
             None => self.0.forget_marker(),
+        }
+        match compose_word {
+            Some(word) => self.0.compose_marker.store(word.as_ptr(), Ordering::SeqCst),
+            None => self.0.forget_compose_marker(),
         }
         // Publish one snapshot before making the completion observable. A
         // waiter may have published past what this holder saw; a lost device
@@ -680,6 +690,36 @@ impl<B: Backend, C: Compiler> SharedService<B, C> {
         } else {
             value
         })
+    }
+
+    /// Whether the GPU finished the display frame of `ticket`
+    /// ([`crate::metal::compose`]), read from the host's view of the
+    /// compose marker: no turn, no driver call, from any processor. `None`
+    /// when no live device holds a marker, as after a loss, when the frame
+    /// will never be shown finished.
+    pub fn compose_shows(&self, ticket: u64) -> Option<bool> {
+        self.compose_readers.fetch_add(1, Ordering::SeqCst);
+        let word = self.compose_marker.load(Ordering::SeqCst);
+        // SAFETY: a turn clears the pointer and waits for its readers
+        // before the device that owns the word can go
+        // (`forget_compose_marker`).
+        let marker = (!word.is_null()).then(|| unsafe { (*word).load(Ordering::Acquire) });
+        self.compose_readers.fetch_sub(1, Ordering::SeqCst);
+        marker.map(|marker| crate::metal::compose::shows(marker, ticket))
+    }
+
+    /// Clears the compose marker for readers and waits for those reading it.
+    fn forget_compose_marker(&self) {
+        if self
+            .compose_marker
+            .swap(core::ptr::null_mut(), Ordering::SeqCst)
+            .is_null()
+        {
+            return;
+        }
+        while self.compose_readers.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
     }
 
     /// Clears the marker for readers and waits for those reading it.
@@ -780,6 +820,8 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             outside_seen: Spin::new(None),
             marker: AtomicPtr::new(core::ptr::null_mut()),
             marker_readers: AtomicU32::new(0),
+            compose_marker: AtomicPtr::new(core::ptr::null_mut()),
+            compose_readers: AtomicU32::new(0),
             upkeep_asked: AtomicBool::new(false),
             look_budget: AtomicU64::new(0),
             refusals,
@@ -1594,6 +1636,9 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         if !self.marker.load(Ordering::Relaxed).is_null() && turn.device().is_lost() {
             self.forget_marker();
         }
+        if turn.device().is_lost() {
+            self.forget_compose_marker();
+        }
         Some(turn)
     }
 
@@ -1637,6 +1682,37 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             }
         });
         result.expect("the platform runs what it is given")
+    }
+
+    /// Runs `body` on the device in a turn of its own, as a platform's
+    /// work outside the guest's calls (the display's frames composed here,
+    /// [`crate::metal::compose`]), unless the turn stays held for `wait`
+    /// ticks: `None` then, and nothing ran. The wait relaxes as the
+    /// platform's unbounded waits do; a body that waits for the host's
+    /// kernel does so in the turn.
+    pub fn with_device<R>(
+        &self,
+        wait: u64,
+        body: impl FnOnce(&mut crate::metal::device::Device<B, C>) -> R,
+    ) -> Option<R> {
+        let began = (self.host.ticks)();
+        let mut turn = loop {
+            if let Some(turn) = self.try_turn() {
+                break turn;
+            }
+            if (self.host.ticks)().wrapping_sub(began) >= wait {
+                return None;
+            }
+            (self.host.relax)();
+        };
+        turn.catch_up();
+        let (mut body, mut result) = (Some(body), None);
+        (self.host.run)(self.host.stack, &mut || {
+            if let Some(body) = body.take() {
+                result = Some(body(turn.device()));
+            }
+        });
+        result
     }
 
     /// How the device stands after a loss ([`Service::loss`]), unless a

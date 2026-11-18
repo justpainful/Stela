@@ -423,3 +423,49 @@ fn bandwidth_reserved_before_allocation() {
         })
     );
 }
+
+/// An analog playback owner writes a running ring ahead of the controller:
+/// the words it wrote are what the link plays on its next lap.
+#[test]
+fn running_analog_playback_takes_live_writes() {
+    let mut fixture = Fixture::new();
+    let model = Model::new(16);
+    let mut controller = create(&model, &mut fixture, config()).unwrap();
+    let playback = controller
+        .allocate_stream(Direction::Playback, pcm(), 1536, 4, &mut fixture.allocator)
+        .unwrap();
+    let capture = controller
+        .allocate_stream(Direction::Capture, pcm(), 128, 2, &mut fixture.allocator)
+        .unwrap();
+    controller.write_pcm(playback, 0, &[0; 6144]).unwrap();
+    // Only a running playback ring, in whole aligned words.
+    assert_eq!(
+        controller.write_running_pcm(playback, 0, &[1; 4]),
+        Err(Error::StreamStopped)
+    );
+    controller.start(playback).unwrap();
+    controller.start(capture).unwrap();
+    assert_eq!(
+        controller.write_running_pcm(capture, 0, &[1; 4]),
+        Err(Error::InvalidBuffer)
+    );
+    for (offset, bytes) in [(2, 4), (0, 3), (6144, 4), (6140, 8)] {
+        assert_eq!(
+            controller.write_running_pcm(playback, offset, &vec![1; bytes]),
+            Err(Error::InvalidBuffer),
+            "{offset} {bytes}"
+        );
+    }
+    let samples: Vec<u8> = (0..6144).map(|index| (index % 251) as u8 | 1).collect();
+    controller.write_running_pcm(playback, 0, &samples).unwrap();
+    model.borrow_mut().dma_step_bytes = 128;
+    advance(&model, 100);
+    controller.status(playback).unwrap();
+    controller.stop(playback).unwrap();
+    controller.stop(capture).unwrap();
+    let m = model.borrow();
+    assert!(m.playback.len() > 6144);
+    for (index, byte) in m.playback.iter().enumerate() {
+        assert_eq!(*byte, samples[index % samples.len()], "{index}");
+    }
+}

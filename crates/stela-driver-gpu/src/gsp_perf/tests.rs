@@ -39,13 +39,68 @@ const fn lane(speed: u16, width: u16) -> u16 {
 
 #[test]
 fn the_layout_is_nouveaus() {
-    // `struct nvkm_perf_report`: nine 32-bit words.
-    assert_eq!(core::mem::size_of::<Report>(), 36);
+    // `struct nvkm_perf_report`: eleven 32-bit words.
+    assert_eq!(core::mem::size_of::<Report>(), 44);
     assert_eq!(core::mem::offset_of!(Report, pstate_status), 16);
     assert_eq!(core::mem::offset_of!(Report, link_status), 20);
     assert_eq!(core::mem::offset_of!(Report, link_control), 24);
     assert_eq!(core::mem::offset_of!(Report, link_speeds), 28);
     assert_eq!(core::mem::offset_of!(Report, link_cap), 32);
+    assert_eq!(core::mem::offset_of!(Report, boosts), 36);
+    assert_eq!(core::mem::offset_of!(Report, boost_status), 40);
+}
+
+#[test]
+fn an_accepted_boost_shows_for_its_beat_only() {
+    let report = sampled(10, P0, P8);
+    report.boosts.store(10, Ordering::Relaxed);
+    let taken = report.take().unwrap();
+    assert_eq!(
+        taken.boost,
+        Boost {
+            accepted: 10,
+            status: 0
+        }
+    );
+    assert_eq!(
+        taken.to_string(),
+        "pstate=P0 seen=P0+P8 pcie=unknown boost=max rounds=10"
+    );
+    // A take clears the count: a beat with no boost accepted says nothing.
+    report.rounds.store(1, Ordering::Relaxed);
+    assert_eq!(
+        report.take().unwrap().to_string(),
+        "pstate=P0 seen=- pcie=unknown rounds=1"
+    );
+}
+
+#[test]
+fn a_refused_boost_is_named_with_its_errno() {
+    let report = sampled(1, P8, 0);
+    report.boost_status.store(-5, Ordering::Relaxed);
+    assert_eq!(
+        report.take().unwrap().to_string(),
+        "pstate=P8 seen=P8 pcie=unknown boost=refused(error -5) rounds=1"
+    );
+}
+
+#[test]
+fn a_boost_starting_or_stopping_gives_a_line() {
+    let reported = Reported::new();
+    let idle = sampled(10, P8, 0).take().unwrap();
+    assert!(reported.line(&idle).is_some());
+    let boosted = sampled(10, P8, 0);
+    boosted.boosts.store(10, Ordering::Relaxed);
+    assert_eq!(
+        reported.line(&boosted.take().unwrap()).as_deref(),
+        Some("GPU PERF pstate=P8 seen=P8 pcie=unknown boost=max rounds=10")
+    );
+    // The count of boosts is no change.
+    let again = sampled(10, P8, 0);
+    again.boosts.store(7, Ordering::Relaxed);
+    assert_eq!(reported.line(&again.take().unwrap()), None);
+    // A beat with none is.
+    assert!(reported.line(&sampled(10, P8, 0).take().unwrap()).is_some());
 }
 
 #[test]
@@ -68,6 +123,7 @@ fn a_take_clears_the_counts_and_keeps_the_current_pstate() {
             pstates: P5 | P8,
             status: 0,
             link: Link::default(),
+            boost: Boost::default(),
         }
     );
     assert_eq!(

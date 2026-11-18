@@ -15,6 +15,11 @@ pub(crate) struct MemoryStore {
     pub(crate) lookups: usize,
     pub(crate) offers: Vec<Offer>,
     pub(crate) prepared: BTreeMap<(Digest, u64, Digest), Arc<SharedTranslation>>,
+    /// Jobs to translate ahead of execution, when the store takes them.
+    pub(crate) ahead: Option<Vec<super::super::ahead::AheadJob>>,
+    /// Blocks translated ahead first installed, and events noted.
+    pub(crate) used_ahead: usize,
+    pub(crate) events: Vec<StoreEvent>,
 }
 
 impl Translations for MemoryStore {
@@ -34,6 +39,20 @@ impl Translations for MemoryStore {
     }
     fn offer(&mut self, offer: Offer) {
         self.offers.push(offer);
+    }
+    fn note(&mut self, event: StoreEvent) {
+        self.events.push(event);
+    }
+    fn translates_ahead(&mut self) -> bool {
+        self.ahead.is_some()
+    }
+    fn ahead(&mut self, jobs: &mut dyn Iterator<Item = super::super::ahead::AheadJob>) {
+        if let Some(ahead) = &mut self.ahead {
+            ahead.extend(jobs);
+        }
+    }
+    fn used_ahead(&mut self, _shared: &Arc<SharedTranslation>) {
+        self.used_ahead += 1;
     }
 }
 

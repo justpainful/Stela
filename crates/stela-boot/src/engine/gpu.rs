@@ -40,6 +40,8 @@ mod slice;
 mod stack;
 #[cfg(feature = "nvk")]
 mod waiter;
+#[cfg(feature = "nvk")]
+pub(super) mod worker;
 
 use super::{
     host,
@@ -267,6 +269,14 @@ fn call_idle_core() -> bool {
 fn call_for_work() {
     if !TURN.wake_due() {
         PUMPS.wakes_held.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // A compile worker pumps in a PE's place, so no guest loses its core;
+    // the boot PE's own limits still take the work if the worker is held.
+    #[cfg(feature = "nvk")]
+    if may_move() && worker::present() {
+        worker::wake();
+        PUMPS.woken.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if may_move() && call_idle_core() {
@@ -2892,6 +2902,13 @@ pub(super) fn pump_waiting_pe(guest_work: &dyn Fn() -> bool) {
     if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
         pump_as(Taker::Waiting, guest_work);
     }
+}
+
+/// Whether the environment has work ready that a pump would run: a compile
+/// worker that finds some does not sleep.
+#[cfg(feature = "nvk")]
+pub(super) fn linux_ready() -> bool {
+    may_move() && installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some())
 }
 
 /// One pump by `taker` on this processor, under the [`TURN`]: what was

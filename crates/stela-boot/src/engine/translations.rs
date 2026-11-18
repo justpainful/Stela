@@ -38,6 +38,7 @@ use stela_drivers::block::BlockDevice;
 use stela_engine::machine::Offer;
 use stela_engine::machine::Translations;
 use stela_engine::machine::engine::StoreEvent;
+use stela_engine::machine::engine::ahead::{AheadEvent, AheadJob, AheadQueue, Pushed};
 use stela_engine::translations;
 use stela_engine::translations::Digest;
 use stela_engine::translations::pack;
@@ -699,6 +700,83 @@ fn install_parts(translator: Digest, segments: Vec<Pack<'static>>, shared: usize
     }
 }
 
+/// Blocks to translate ahead of execution ([`stela_engine::machine::engine::ahead`]):
+/// the static successors in its page of each block a PE compiles, for the
+/// compile workers to compile and share ([`translate_ahead`]). A job holds
+/// its page's 4 KiB, which the jobs of one page share: 128 hold at most
+/// half a MiB.
+static AHEAD: AheadQueue<128> = AheadQueue::new();
+/// Compile workers run and take [`AHEAD`]'s jobs ([`translate_ahead_with`]).
+static AHEAD_ON: AtomicBool = AtomicBool::new(false);
+
+/// Let the compile workers translate ahead of execution, or not: only
+/// while any runs, so a boot without them compiles as before.
+pub fn translate_ahead_with(workers: bool) {
+    AHEAD_ON.store(workers, Ordering::Release);
+}
+
+/// Whether a job to translate ahead waits: a worker that finds one does not
+/// sleep.
+pub fn ahead_pending() -> bool {
+    AHEAD_ON.load(Ordering::Relaxed) && AHEAD.pending()
+}
+
+/// Translate the oldest job of [`AHEAD`], on a compile worker, and share
+/// its block for the PEs: whether one was taken. The store's part lock is
+/// held only to look and to admit, as a PE's offer holds it; the compile
+/// runs with no lock held. A job whose block the store already shares, or
+/// whose page the store would not take now, is dropped.
+pub fn translate_ahead() -> bool {
+    if !AHEAD_ON.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(job) = AHEAD.take() else {
+        return false;
+    };
+    let lock = part(job.key());
+    let present = AVAILABLE.shed.load(Ordering::Relaxed)
+        || !available(SHARE_BLOCKS)
+        || lock.with(|store| {
+            store
+                .as_ref()
+                .is_none_or(|store| store.holds_shared(job.key(), job.pc(), job.context()))
+        });
+    if present {
+        AHEAD.note(AheadEvent::Present);
+        AHEAD.finish(&job);
+        return true;
+    }
+    let started = output::now();
+    let translated = job.translate();
+    let ticks = output::now().wrapping_sub(started);
+    let Some(offer) = translated else {
+        AHEAD.note(AheadEvent::Refused);
+        AHEAD.finish(&job);
+        return true;
+    };
+    AHEAD.note(AheadEvent::Translated { ticks });
+    let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / PARTS;
+    let published = StagedOffer::new(offer, bound).is_some_and(|mut staged| {
+        // A PE's offer of the block since takes the place it would.
+        let (published, retired) = lock.with(|store| match store.as_mut() {
+            Some(store) if !store.holds_shared(job.key(), job.pc(), job.context()) => {
+                let retired = store.accept_shared(&mut staged);
+                (!staged.pending(), retired)
+            }
+            _ => (false, None),
+        });
+        drop(retired);
+        published
+    });
+    AHEAD.note(if published {
+        AheadEvent::Published
+    } else {
+        AheadEvent::Unpublished
+    });
+    AHEAD.finish(&job);
+    true
+}
+
 /// The engine's view of the boot's store, from any PE's machine.
 pub struct Shared;
 
@@ -828,7 +906,55 @@ impl Translations for Shared {
             StoreEvent::SharedRejected => {
                 COSTS.shared_rejected.fetch_add(1, Ordering::Relaxed);
             }
+            StoreEvent::AheadStale => AHEAD.note(AheadEvent::Stale),
         }
+    }
+
+    fn translates_ahead(&mut self) -> bool {
+        AHEAD_ON.load(Ordering::Relaxed)
+            && !AVAILABLE.shed.load(Ordering::Relaxed)
+            && available(SHARE_BLOCKS)
+    }
+
+    /// Queue `jobs` and wake a sleeping worker for them: a full queue drops
+    /// them, and the PE compiles them when it gets there.
+    fn ahead(&mut self, jobs: &mut dyn Iterator<Item = AheadJob>) {
+        // Every job is offered: one queued does not end the others.
+        let mut queued = false;
+        for job in jobs {
+            queued |= AHEAD.push(job) == Pushed::Queued;
+        }
+        if queued {
+            super::workers::nudge();
+        }
+    }
+
+    /// Keep the stored form of a block translated ahead once a PE ran it,
+    /// as the PE's own offer would have: the pack holds only blocks that
+    /// ran.
+    fn used_ahead(
+        &mut self,
+        shared: &alloc::sync::Arc<stela_engine::machine::engine::SharedTranslation>,
+    ) {
+        AHEAD.note(AheadEvent::Hit);
+        let offer = shared.offer();
+        // Ran: no longer speculation, so it keeps its place as PEs' blocks do.
+        part(&offer.key()).with(|store| {
+            if let Some(store) = store {
+                store.promote_shared(&offer.key(), offer.pc(), &offer.context());
+            }
+        });
+        if AVAILABLE.capabilities.load(Ordering::Acquire) & WRITE_PACK == 0
+            || AVAILABLE.shed.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let entry = offer.entry();
+        part(&offer.key()).with(|store| {
+            if let Some(store) = store {
+                store.keep(&offer, entry);
+            }
+        });
     }
 
     fn kept_pages(&mut self) -> Option<usize> {
@@ -1108,6 +1234,25 @@ fn report(counters: &pack::Counters) {
         counters.shared_other_context,
         counters.shared_evicted,
         counters.shared_in_flight,
+    ));
+    let ahead = AHEAD.counts();
+    output::arguments(format_args!(
+        "TRANSLATIONS ahead on={} queued={} repeated={} dropped={} present={} compiled={}          refused={} published={} unpublished={} hits={} stale={} ns/block={}
+",
+        AHEAD_ON.load(Ordering::Relaxed),
+        ahead.queued,
+        ahead.repeated,
+        ahead.dropped,
+        ahead.present,
+        ahead.translated,
+        ahead.refused,
+        ahead.published,
+        ahead.unpublished,
+        ahead.hits,
+        ahead.stale,
+        (u128::from(ahead.ticks) * 1_000_000_000
+            / u128::from(output::counter_hz().max(1))
+            / u128::from(ahead.translated.max(1))) as u64,
     ));
     let (mut acquired, mut contended, mut spun) = (0, 0, 0);
     for lock in &STORES {

@@ -1911,9 +1911,8 @@ pub unsafe fn open(
             ));
         }
     }
-    // HD Audio controllers stay attached for the boot; no guest audio device
-    // consumes them yet.
-    Vec::leak(core::mem::take(&mut devices.hda_hosts));
+    // HD Audio controllers stay attached for the boot: the guest's headset
+    // plays on one (`audio::HostAudio`), and the rest are kept with it.
     // A USB device can connect, train its link and answer its first
     // commands after its controller's start looked at the ports: the
     // partitions this boot needs are waited for while the USB hosts report
@@ -2386,6 +2385,8 @@ pub unsafe fn open(
             core::mem::take(&mut devices.pcie_bluetooth),
             root,
         ),
+        hda: core::mem::take(&mut devices.hda_hosts),
+        usb_audio: core::mem::take(&mut devices.audio),
         gpus: core::mem::take(&mut devices.gpus),
         gpu_companions: core::mem::take(&mut devices.gpu_companions),
         isa_bridges: core::mem::take(&mut devices.isa_bridges),
@@ -2733,6 +2734,10 @@ pub struct Opened {
     pub network_account: alloc::vec::Vec<alloc::string::String>,
     /// The host's Bluetooth controller, for the guest's.
     pub bluetooth: Option<super::bluetooth::HostBluetooth>,
+    /// The HD Audio controllers probe attached, kept for the boot.
+    pub hda: alloc::vec::Vec<stela_drivers::probe::native::hda::Host>,
+    /// The USB audio functions probe started, for the guest's microphone.
+    pub usb_audio: alloc::vec::Vec<stela_drivers::usb::audio::UsbAudio>,
     /// The display controllers probe left for their own drivers.
     pub gpus: alloc::vec::Vec<stela_drivers::gpu::Adapter>,
     /// Each display controller's ACPI companion path, where probe found one.

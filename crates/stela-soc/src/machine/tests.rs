@@ -2691,6 +2691,244 @@ fn mounted_dcpext_kept_pm_gates_suppress_real_surface_dma_and_scanout() {
     assert_eq!(*frames.borrow(), 2);
 }
 
+/// The second display (`--second-display`): two DCP models on one bus,
+/// `dcpext` and the DCP-role `disp0`, each with its own wrapper, mailbox,
+/// DART stream, link region, scanout, vblank grid and log. A swap on one
+/// presents only on its own scanout, at its own vblank.
+#[test]
+fn two_mounted_displays_swap_vblank_and_log_independently() {
+    use crate::dcp::{link, swap};
+    struct Screen(Rc<RefCell<Vec<Vec<u8>>>>);
+    impl Scanout for Screen {
+        fn mode(&self) -> ScanoutMode {
+            ScanoutMode {
+                width: 1,
+                height: 1,
+                format: ScanoutFormat::Bgra8888,
+            }
+        }
+        fn present(&mut self, rows: &[u8]) -> Result<()> {
+            self.0.borrow_mut().push(rows.to_vec());
+            Ok(())
+        }
+    }
+    struct Pipe {
+        wrapper: u64,
+        dart: u64,
+        /// The link region's DVA the AP announces and the guest PA it
+        /// reaches: through `dcpext`'s truncated window, and whole on
+        /// `disp0`, whose node has no `truncate-dvas`.
+        region: (u64, u64),
+        pixels: u64,
+    }
+    const RAM: u64 = 0x8_0000_0000;
+    const PERIOD: u64 = 400_000;
+    let pipes = [
+        Pipe {
+            wrapper: 0x2_71c0_0000,
+            dart: 0x2_7130_c000,
+            region: (0x4000, RAM + 0x4000),
+            pixels: RAM + 0xd0000,
+        },
+        Pipe {
+            wrapper: 0x2_31c0_0000,
+            dart: 0x2_3130_c000,
+            region: (RAM + 0x40000, RAM + 0x40000),
+            pixels: RAM + 0xe0000,
+        },
+    ];
+    fn send(d: &mut AppleDevices, wrapper: u64, endpoint: u64, payload: u64) {
+        d.write(0, wrapper + 0x8800, 8, payload, 0).unwrap();
+        d.write(0, wrapper + 0x8808, 8, endpoint, 0).unwrap();
+    }
+    fn call(
+        d: &mut AppleDevices,
+        ram: &mut Ram,
+        pipe: &Pipe,
+        tag: &[u8; 4],
+        input: &[u8],
+        output: u32,
+        now: u64,
+    ) {
+        let stream = link::Stream {
+            owner: link::Owner::Ap,
+            index: 1,
+        };
+        let header = link::Header {
+            tag: *tag,
+            input: input.len() as u32,
+            output,
+        };
+        let at = pipe.region.1 + stream.calls();
+        assert!(ram.write(at, &header.bytes()));
+        assert!(ram.write(at + 12, input));
+        send(
+            d,
+            pipe.wrapper,
+            0x37,
+            link::Word::Rpc(link::Rpc {
+                answer: false,
+                stream,
+                opens: true,
+                offset: 0,
+                length: header.length().unwrap(),
+                token: 0,
+            })
+            .encode(),
+        );
+        d.transfer(0, ram, now).unwrap();
+        let reply = mailbox_drain(d, pipe.wrapper);
+        assert!(!reply.is_empty());
+        assert!(reply.iter().all(|&(endpoint, _)| endpoint == 0x37));
+    }
+    let mut d = AppleDevices::new();
+    d.add_aic(0x2_3b0c_0000, 1152, AicLayout::aic2(0x8000, 0))
+        .unwrap();
+    let mut frames = Vec::new();
+    for (pipe, (role, identity, interrupts, window)) in pipes.iter().zip([
+        (
+            "DCPEXT",
+            stela_soc_data::dcp::ExternalIdentity::Unnumbered,
+            [0x243, 0x242, 0x245, 0x244],
+            Some(RAM),
+        ),
+        (
+            "DCP",
+            stela_soc_data::dcp::ExternalIdentity::Disp0,
+            [0x218, 0x217, 0x21a, 0x219],
+            None,
+        ),
+    ]) {
+        let dart = d
+            .add_dart(
+                Range {
+                    physical: pipe.dart,
+                    bytes: 0x4000,
+                },
+                16,
+                None,
+                None,
+            )
+            .unwrap();
+        let shown = Rc::new(RefCell::new(Vec::new()));
+        d.add_dcpext(
+            DcpextNub {
+                wrapper: Range {
+                    physical: pipe.wrapper,
+                    bytes: 0x6c000,
+                },
+                interrupts,
+                quiesced: false,
+                role,
+                identity,
+            },
+            Box::new(Screen(shown.clone())),
+            DcpextDma {
+                link: (dart, 5),
+                window,
+                surface: Some((dart, 5)),
+            },
+            stela_formats::builds::find("26A434").unwrap(),
+        )
+        .unwrap();
+        frames.push(shown);
+        d.write(0, pipe.dart + 0x1014, 4, 6, 0).unwrap();
+        d.write(0, pipe.dart + 0xc00, 4, 1 << 5, 0).unwrap();
+    }
+    assert_eq!(d.dcp_masters.len(), 2);
+    assert_ne!(d.dcp_masters[0].dart, d.dcp_masters[1].dart);
+    let mut ram = Ram::new(RAM, 0x100000);
+    // Each coprocessor greets the AP on its own mailbox.
+    for pipe in &pipes {
+        assert_eq!(mailbox_drain(&mut d, pipe.wrapper).len(), 1);
+    }
+    for pipe in &pipes {
+        for payload in [
+            2 << 52 | 12 | 12 << 16,
+            8 << 52 | 1,
+            8 << 52 | 1 << 51 | 1 << 32,
+            5 << 52 | 0x37 << 32 | 2,
+        ] {
+            send(&mut d, pipe.wrapper, 0, payload);
+            mailbox_drain(&mut d, pipe.wrapper);
+        }
+        assert!(ram.write(pipe.region.1 + 12, &4u32.to_le_bytes()));
+        send(
+            &mut d,
+            pipe.wrapper,
+            0x37,
+            link::Word::Region { dva: pipe.region.0 }.encode(),
+        );
+        d.transfer(0, &mut ram, 0).unwrap();
+        assert_eq!(mailbox_drain(&mut d, pipe.wrapper).len(), 1);
+        // And answers on its own mailbox only.
+        for other in &pipes {
+            if other.wrapper != pipe.wrapper {
+                assert!(mailbox_drain(&mut d, other.wrapper).is_empty());
+            }
+        }
+        // Each display's first look, at 0, starts its own vblank grid.
+        call(&mut d, &mut ram, pipe, b"A406", &[0; 0x10], 8, 0);
+    }
+    // A swap on `dcpext` alone: only its display waits for a vblank, and
+    // only its scanout shows it.
+    assert!(ram.write(pipes[0].pixels, &[1, 2, 3, 255]));
+    call(
+        &mut d,
+        &mut ram,
+        &pipes[0],
+        b"A407",
+        &swap::tests::submission(1, &[(0, 1, 1, pipes[0].pixels)]),
+        0xc,
+        1,
+    );
+    let pending = |d: &AppleDevices, index: usize| {
+        d.bus
+            .device::<Asc>(d.dcp_masters[index].asc)
+            .unwrap()
+            .firmware::<dcp::Coprocessor>()
+            .unwrap()
+            .frame_pending()
+    };
+    assert!(pending(&d, 0) && !pending(&d, 1));
+    d.transfer(0, &mut ram, PERIOD).unwrap();
+    assert_eq!(*frames[0].borrow(), [alloc::vec![1, 2, 3, 255]]);
+    assert!(frames[1].borrow().is_empty());
+    // Then one on `disp0`, at its own vblank; `dcpext` shows nothing new.
+    assert!(ram.write(pipes[1].pixels, &[7, 8, 9, 255]));
+    call(
+        &mut d,
+        &mut ram,
+        &pipes[1],
+        b"A407",
+        &swap::tests::submission(1, &[(0, 1, 1, pipes[1].pixels)]),
+        0xc,
+        PERIOD + 1,
+    );
+    assert!(!pending(&d, 0) && pending(&d, 1));
+    assert!(!d.dcp_due(1, 2 * PERIOD - 1) && d.dcp_due(1, 2 * PERIOD));
+    d.transfer(0, &mut ram, 2 * PERIOD).unwrap();
+    assert_eq!(*frames[1].borrow(), [alloc::vec![7, 8, 9, 255]]);
+    assert_eq!(frames[0].borrow().len(), 1);
+    // Each display's log is its own; the second's names its pipe.
+    let logged: Vec<String> = core::iter::from_fn(|| d.take_display_log())
+        .map(|entry| entry.to_string())
+        .collect();
+    let presented = |prefix: &str| {
+        logged
+            .iter()
+            .filter(|line| line.starts_with(prefix) && line.contains(" presented swap 1 "))
+            .count()
+    };
+    assert_eq!(presented("DCP presented"), 1);
+    assert_eq!(presented("DCP disp0 presented"), 1);
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.starts_with("DCP disp0 call A407"))
+    );
+}
+
 #[test]
 fn dcpext_enumerates_its_rtkit_and_the_display_regions_refuse() {
     struct Screen;
@@ -4414,4 +4652,35 @@ fn nor_access_cost() {
     std::println!(
         "NOR access ns: alone={alone:.1} beside_board_writes={contended:.1} (other PE wrote {writes})"
     );
+}
+
+/// The headset takes the hub port after the Bluetooth controller, ahead of
+/// the disks, and leaves one disk port fewer.
+#[test]
+fn the_usb_headset_sits_on_the_native_hub_before_the_disks() {
+    use crate::usb::control::{
+        GET_DESCRIPTOR,
+        tests::{setup, transfer},
+    };
+    use hub::Ports;
+    assert_eq!(UsbCables::disk_ports(false, false, false), 6);
+    assert_eq!(UsbCables::disk_ports(true, true, false), 4);
+    assert_eq!(UsbCables::disk_ports(true, true, true), 3);
+    let mut ports = Attachments {
+        input: Peripheral::new(),
+        network: None,
+        bluetooth: Some(Hci::new()),
+        audio: Some(Audio::new()),
+        disks: Vec::new(),
+    };
+    assert_eq!(ports.count(), 3);
+    assert_eq!(ports.speed(2), Speed::High);
+    let device = transfer(
+        ports.function(2),
+        setup(0x80, GET_DESCRIPTOR, 0x0100, 0, 18),
+        &[],
+    )
+    .unwrap();
+    // pid.codes' test vendor, the headset's product.
+    assert_eq!(device[8..12], [0x09, 0x12, 0x03, 0x00]);
 }

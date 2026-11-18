@@ -19,6 +19,7 @@ pub use reports::{
     Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
     Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit,
 };
+pub mod ahead;
 mod amx;
 mod apple_maintenance;
 mod budget;

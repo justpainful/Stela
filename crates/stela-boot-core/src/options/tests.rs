@@ -337,6 +337,76 @@ fn guest_pes_bound_the_executors_that_run_them() {
 }
 
 #[test]
+fn audio_is_on_unless_turned_off_once() {
+    for text in [
+        "--system --audio",
+        "--system --audio yes",
+        "--system --audio on --audio on",
+    ] {
+        assert!(System::parse(text).is_err(), "{text}");
+    }
+    let options = System::parse("--system").unwrap();
+    assert_eq!(options.audio, None);
+    assert!(options.audio());
+    assert!(!options.to_string().contains("--audio"));
+    for (word, on) in [("on", true), ("off", false)] {
+        let options = System::parse(&format!("--system --audio {word}")).unwrap();
+        assert_eq!(options.audio, Some(on));
+        assert_eq!(options.audio(), on);
+        let line = options.to_string();
+        assert!(line.contains(&format!("--audio {word}")), "{line}");
+        assert_eq!(System::parse(&line).unwrap().audio, Some(on));
+    }
+}
+
+#[test]
+fn second_display_is_off_unless_given_once() {
+    let options = round_trip("--system");
+    assert!(!options.second_display);
+    assert!(!options.to_string().contains(SECOND_DISPLAY));
+    let options = round_trip(&format!("--system {SECOND_DISPLAY}"));
+    assert!(options.second_display);
+    assert!(options.to_string().contains(SECOND_DISPLAY));
+    assert_eq!(
+        System::parse(&format!("--system {SECOND_DISPLAY} {SECOND_DISPLAY}")),
+        Err(Error::DuplicateSecondDisplay)
+    );
+    // A flag: the next word is an option of its own, not its value.
+    let options = round_trip(&format!("--system {SECOND_DISPLAY} --audio off"));
+    assert!(options.second_display);
+    assert_eq!(options.audio, Some(false));
+}
+
+#[test]
+fn compile_workers_take_a_count_from_none_to_the_most() {
+    for text in [
+        "--system --compile-workers",
+        "--system --compile-workers 5",
+        "--system --compile-workers -1",
+        "--system --compile-workers 1 --compile-workers 1",
+    ] {
+        assert!(System::parse(text).is_err(), "{text}");
+    }
+    assert_eq!(System::parse("--system").unwrap().compile_workers, None);
+    for count in 0..=crate::compile_workers::MOST {
+        let options = System::parse(&format!("--system --compile-workers {count}")).unwrap();
+        assert_eq!(options.compile_workers, Some(count));
+        let line = options.to_string();
+        assert!(
+            line.contains(&format!("--compile-workers {count}")),
+            "{line}"
+        );
+        assert_eq!(System::parse(&line).unwrap().compile_workers, Some(count));
+    }
+    // The executors that run PEs are counted as before.
+    let options = System::parse(&format!(
+        "--system --preboot {DISK} --guest-pes 8 --compile-workers 2"
+    ))
+    .unwrap();
+    assert_eq!(options.assigned_native_cores(64, None), Ok(8));
+}
+
+#[test]
 fn preboot_checks_the_live_count_before_starting_aps() {
     let preboot = format!("--system --preboot {DISK} --guest-pes 8");
     let options = System::parse(&preboot).unwrap();

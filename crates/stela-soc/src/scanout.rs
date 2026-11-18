@@ -252,6 +252,30 @@ pub trait Scanout {
         Ok(false)
     }
 
+    /// Compose a frame's layers on the host GPU instead of the CPU: the
+    /// sink reads each layer's planes from guest RAM itself, at the
+    /// physical addresses the display pipe's DART gave, and writes the
+    /// scanout. Called only for a compose outside the devices' lock
+    /// (`dcp::compose`), with the pages resolved under it; a present in
+    /// place is composed on the CPU. `Some` once the GPU has the work:
+    /// the swaps the frame shows complete only after
+    /// [`Self::gpu_pending_done`] says the GPU finished it, as the guest
+    /// takes their surfaces back at completion. `None` declines (a sink
+    /// without a GPU, a frame it does not compose), and an error refuses:
+    /// either way nothing may have been written to the scanout, and the
+    /// CPU composes the frame as it would have.
+    fn try_present_layers(&mut self, _frame: &GpuFrame<'_>) -> Result<Option<GpuPending>> {
+        Ok(None)
+    }
+
+    /// Whether the GPU finished the frame `pending` names, its reads of
+    /// the guest's surfaces and its writes of the scanout both: polled at
+    /// each look of the display until it is, and spun on by a call that
+    /// drops swaps. A sink that never accepts a frame is never asked.
+    fn gpu_pending_done(&mut self, _pending: &GpuPending) -> bool {
+        true
+    }
+
     /// The refresh rates in millihertz the monitor runs [`Self::mode`] at,
     /// fastest first, [`Self::refresh_millihertz`] among them: what the
     /// model advertises for the mode.
@@ -309,6 +333,68 @@ pub fn union(a: Range<usize>, b: Range<usize>) -> Range<usize> {
         (_, true) => a,
         _ => a.start.min(b.start)..a.end.max(b.end),
     }
+}
+
+/// One plane of a layer's surface as the host GPU reads it: the guest
+/// physical runs of whole pages that hold the layer's source rows, each
+/// run the DART's consecutive pages merged where their physical pages are
+/// consecutive too, in I/O address order. The runs read as one span of
+/// bytes, which starts at the page holding the source rectangle's
+/// top-left pixel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuPlane {
+    pub ranges: Vec<stela_contracts::gate::MemoryRange>,
+    /// Where in the runs' bytes the source rectangle's top-left pixel
+    /// lies: its row `y` (from 0) and pixel `x` are at
+    /// `offset + y * stride + x * size`, `size` 4 for a colour plane and 1
+    /// for an alpha plane ([`PixelFormat::Xr10A8`]).
+    pub offset: u64,
+    /// Bytes between the starts of successive rows.
+    pub stride: u32,
+}
+
+/// One layer of a frame the host GPU composes: as [`Layer`] has it, with
+/// its planes at guest physical addresses. Shown as the CPU shows it:
+/// bottom to top over opaque black, each destination pixel taking the
+/// source pixel under its centre (nearest neighbour), blended source-over
+/// with its colour premultiplied or not, and clipped to the mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuLayer {
+    /// The surface's format. [`PixelFormat::Xr10A8`]'s I/O addresses are
+    /// the DART's; the alpha plane the GPU reads is `planes[1]`.
+    pub format: PixelFormat,
+    /// The colour plane, then the alpha plane of a two-plane format.
+    pub planes: Vec<GpuPlane>,
+    /// The source rectangle in the surface's pixels; the planes' offsets
+    /// already address its top-left pixel.
+    pub source: Rect,
+    pub destination: Rect,
+    pub premultiplied: bool,
+    /// The IOSurface ID the swap that set the layer's slot named for it,
+    /// when one of the swaps the frame shows set it: the same ID is the
+    /// same surface, which a GPU may keep imported between frames.
+    pub surface_id: Option<u32>,
+}
+
+/// A frame the host GPU composes ([`Scanout::try_present_layers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuFrame<'a> {
+    /// The scanout's mode, which the frame fills.
+    pub mode: Mode,
+    /// The rows that may differ from the last frame the sink showed,
+    /// within the mode; `None` for every row. As for
+    /// [`Scanout::try_present_rows`], rows a buffer the sink fills lacks
+    /// are composed too.
+    pub damage: Option<Range<usize>>,
+    /// Bottom to top, the DCP's four slots at most.
+    pub layers: &'a [GpuLayer],
+}
+
+/// A frame the host GPU accepted and may still be composing: the sink's
+/// own ticket for it, which [`Scanout::gpu_pending_done`] is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuPending {
+    pub ticket: u64,
 }
 
 /// A host framebuffer's 32-bit pixel given as one bit mask per channel: the
@@ -762,6 +848,22 @@ pub struct Composed {
     shown: Vec<Shown>,
     /// A source row being compared.
     scratch: Vec<u8>,
+}
+
+impl Composed {
+    /// Forget the frame on screen, which another composer than this one
+    /// (the host GPU) put there: the rows and source rows kept are not
+    /// what it shows, so the next present composes every row.
+    pub(crate) fn forget(&mut self) {
+        self.current = false;
+        self.shown.clear();
+    }
+
+    /// Whether anything of the frame on screen is kept.
+    #[cfg(test)]
+    pub(crate) fn keeps(&self) -> bool {
+        self.current || !self.shown.is_empty()
+    }
 }
 
 /// The most layers whose source rows [`refine`] keeps: the DCP's four

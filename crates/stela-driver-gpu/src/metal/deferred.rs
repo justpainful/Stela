@@ -169,13 +169,16 @@ pub enum Taker {
     /// waits for one. The guest's priority of the thread it interrupts is
     /// not known there, so any user code is as good a place as another.
     Busy,
+    /// A host processor that runs no PE (a compile worker): it takes any job
+    /// at once and resumes it at once, as no guest waits on its core.
+    Worker,
 }
 
 impl Taker {
     /// How long a job waits before this taker takes it, in milliseconds.
     pub const fn after_millis(self) -> u64 {
         match self {
-            Self::Waiting => 0,
+            Self::Waiting | Self::Worker => 0,
             Self::Boot => 100,
             Self::Busy => 20,
         }
@@ -187,11 +190,40 @@ impl Taker {
     /// [`busy_pause_after_slice`].
     pub const fn resume_after_millis(self) -> u64 {
         match self {
-            Self::Waiting | Self::Busy => 0,
+            Self::Waiting | Self::Busy | Self::Worker => 0,
             Self::Boot => 100,
         }
     }
+
+    /// This taker's waits for a new job and for one between slices, in
+    /// milliseconds, while compile workers run: a PE's processor leaves a
+    /// job to the workers for [`WORKER_GRACE_MILLIS`] at least and takes it
+    /// only if none did meanwhile, so the PEs keep their cores for their
+    /// guests and a job still runs when every worker is busy or gone.
+    pub const fn with_workers(self) -> (u64, u64) {
+        let (after, resume) = (self.after_millis(), self.resume_after_millis());
+        if matches!(self, Self::Worker) {
+            return (after, resume);
+        }
+        (
+            if after > WORKER_GRACE_MILLIS {
+                after
+            } else {
+                WORKER_GRACE_MILLIS
+            },
+            if resume > WORKER_GRACE_MILLIS {
+                resume
+            } else {
+                WORKER_GRACE_MILLIS
+            },
+        )
+    }
 }
+
+/// How long a PE's processor leaves a job to the compile workers, in
+/// milliseconds: longer than a worker's wake and one slice, short enough
+/// that a frame waiting for a job loses at most a few.
+pub const WORKER_GRACE_MILLIS: u64 = 50;
 
 /// How long busy processors leave the queue after one of them ran a slice
 /// of `slice` ticks, with `millis` ticks to a millisecond: as long as the
@@ -241,5 +273,28 @@ mod tests {
         );
         assert_eq!(busy_pause_after_slice(2_000, 1_000), 2_000);
         assert_eq!(busy_pause_after_slice(10, 1_000), 1_000);
+    }
+
+    #[test]
+    fn a_worker_takes_and_resumes_a_job_at_once() {
+        assert_eq!(Taker::Worker.after_millis(), 0);
+        assert_eq!(Taker::Worker.resume_after_millis(), 0);
+        assert_eq!(Taker::Worker.with_workers(), (0, 0));
+    }
+
+    #[test]
+    fn with_workers_a_pe_leaves_a_job_to_them_for_the_grace_at_least() {
+        use super::WORKER_GRACE_MILLIS as GRACE;
+        assert_eq!(Taker::Waiting.with_workers(), (GRACE, GRACE));
+        assert_eq!(Taker::Busy.with_workers(), (GRACE, GRACE));
+        // The boot processor already waits longer.
+        assert_eq!(
+            Taker::Boot.with_workers(),
+            (
+                Taker::Boot.after_millis(),
+                Taker::Boot.resume_after_millis()
+            )
+        );
+        assert!(Taker::Boot.after_millis() > GRACE);
     }
 }

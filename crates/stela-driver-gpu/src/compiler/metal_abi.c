@@ -3415,3 +3415,131 @@ nir_shader *stela_metal_decode_astc_kernel(const nir_shader_compiler_options *op
    return store_decoded(&b, &k, stela_metal_decode_astc(&b, k.words, k.x, k.y, k.block_width,
                                                         k.block_height, srgb, hdr));
 }
+
+/* (value * weight + 127) / 255, the CPU compose's rounding. */
+static nir_def *compose_scale(nir_builder *b, nir_def *value, nir_def *weight)
+{
+   return nir_udiv_imm(b, nir_iadd_imm(b, nir_imul(b, value, weight), 127), 255);
+}
+
+/* The source column or row a destination one `at` pixels into `to` takes
+ * from `from`: the one under its centre. The sizes stay below 2^15, which
+ * ComposeArguments checks, so the product fits 32 bits. */
+static nir_def *compose_nearest(nir_builder *b, nir_def *at, nir_def *from, nir_def *to)
+{
+   return nir_udiv(b, nir_imul(b, nir_iadd_imm(b, nir_ishl_imm(b, at, 1), 1), from),
+                   nir_ishl_imm(b, to, 1));
+}
+
+/* An extended-range code's 8-bit display value, (code - 383) / 2 clamped
+ * to [0, 255]: the DCP's XR10_DISPLAY. */
+static nir_def *compose_xr10(nir_builder *b, nir_def *word, unsigned shift)
+{
+   nir_def *code = nir_iand_imm(b, nir_ushr_imm(b, word, shift), 0x3ff);
+   nir_def *value = nir_umin(b, nir_ushr_imm(b, nir_iadd_imm(b, code, -383), 1), nir_imm_int(b, 255));
+   return nir_bcsel(b, nir_uge_imm(b, code, 385), value, nir_imm_int(b, 0));
+}
+
+/* The byte at `address`, read as the aligned word holding it: an alpha
+ * plane's rows need not be word aligned, and the word stays within the
+ * page the byte is in. */
+static nir_def *compose_byte(nir_builder *b, nir_def *address)
+{
+   nir_def *word = nir_load_global(b, 1, 32, nir_iand_imm(b, address, ~(uint64_t)3),
+                                   .access = ACCESS_NON_WRITEABLE, .align_mul = 4);
+   nir_def *shift = nir_ishl_imm(b, nir_u2u32(b, nir_iand_imm(b, address, 3)), 3);
+   return nir_iand_imm(b, nir_ushr(b, word, shift), 0xff);
+}
+
+nir_shader *stela_metal_compose_kernel(const nir_shader_compiler_options *options)
+{
+   nir_def *arguments, *thread;
+   nir_builder b = kernel(options, "stela_metal_compose", STELA_METAL_COMPOSE_COUNT, &arguments,
+                          &thread);
+   nir_def *width = load(&b, arguments, STELA_METAL_COMPOSE_WIDTH, 32);
+   nir_def *x = nir_umod(&b, thread, width);
+   nir_def *y = nir_iadd(&b, load(&b, arguments, STELA_METAL_COMPOSE_FIRST_ROW, 32),
+                         nir_udiv(&b, thread, width));
+   nir_def *layers = load(&b, arguments, STELA_METAL_COMPOSE_LAYER_COUNT, 32);
+   /* Blue, green and red composed so far, over black. */
+   nir_variable *out[3];
+   nir_variable *in[4];
+   for (unsigned c = 0; c < 4; c++) {
+      if (c < 3) {
+         out[c] = nir_local_variable_create(b.impl, glsl_uint_type(), "out");
+         nir_store_var(&b, out[c], nir_imm_int(&b, 0), 1);
+      }
+      in[c] = nir_local_variable_create(b.impl, glsl_uint_type(), "in");
+   }
+   for (unsigned i = 0; i < STELA_METAL_COMPOSE_LAYERS_MAX; i++) {
+      nir_def *layer = nir_iadd_imm(&b, arguments,
+                                    STELA_METAL_COMPOSE_LAYERS + i * STELA_METAL_COMPOSE_LAYER_BYTES);
+      nir_def *dx = load(&b, layer, STELA_METAL_COMPOSE_X, 32);
+      nir_def *dy = load(&b, layer, STELA_METAL_COMPOSE_Y, 32);
+      nir_def *inside = nir_iand(&b, nir_ult(&b, nir_imm_int(&b, (int)i), layers),
+                                 nir_iand(&b, nir_uge(&b, x, dx), nir_uge(&b, y, dy)));
+      inside = nir_iand(&b, inside,
+                        nir_iand(&b, nir_ult(&b, x, load(&b, layer, STELA_METAL_COMPOSE_COLUMNS_END, 32)),
+                                 nir_ult(&b, y, load(&b, layer, STELA_METAL_COMPOSE_ROWS_END, 32))));
+      nir_push_if(&b, inside);
+      {
+         nir_def *column = compose_nearest(&b, nir_isub(&b, x, dx),
+                                           load(&b, layer, STELA_METAL_COMPOSE_SOURCE_WIDTH, 32),
+                                           load(&b, layer, STELA_METAL_COMPOSE_WIDTH_SHOWN, 32));
+         nir_def *row = compose_nearest(&b, nir_isub(&b, y, dy),
+                                        load(&b, layer, STELA_METAL_COMPOSE_SOURCE_HEIGHT, 32),
+                                        load(&b, layer, STELA_METAL_COMPOSE_HEIGHT_SHOWN, 32));
+         nir_def *stride = load(&b, layer, STELA_METAL_COMPOSE_STRIDE, 32);
+         nir_def *address = nir_iadd(&b, load(&b, layer, STELA_METAL_COMPOSE_SOURCE, 64),
+                                     nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, row), nir_u2u64(&b, stride)),
+                                              nir_u2u64(&b, nir_ishl_imm(&b, column, 2))));
+         nir_def *word = nir_load_global(&b, 1, 32, address, .access = ACCESS_NON_WRITEABLE,
+                                         .align_mul = 4);
+         nir_def *flags = load(&b, layer, STELA_METAL_COMPOSE_FLAGS, 32);
+         nir_push_if(&b, nir_test_mask(&b, flags, STELA_METAL_COMPOSE_XR10));
+         {
+            nir_def *alpha = nir_iadd(&b, load(&b, layer, STELA_METAL_COMPOSE_ALPHA, 64),
+                                      nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, row),
+                                                            nir_u2u64(&b, load(&b, layer,
+                                                                               STELA_METAL_COMPOSE_ALPHA_STRIDE, 32))),
+                                               nir_u2u64(&b, column)));
+            nir_store_var(&b, in[0], compose_xr10(&b, word, 0), 1);
+            nir_store_var(&b, in[1], compose_xr10(&b, word, 10), 1);
+            nir_store_var(&b, in[2], compose_xr10(&b, word, 20), 1);
+            nir_store_var(&b, in[3], compose_byte(&b, alpha), 1);
+         }
+         nir_push_else(&b, NULL);
+         {
+            nir_def *low = nir_iand_imm(&b, word, 0xff);
+            nir_def *high = nir_iand_imm(&b, nir_ushr_imm(&b, word, 16), 0xff);
+            nir_def *rgba = nir_test_mask(&b, flags, STELA_METAL_COMPOSE_RGBA);
+            nir_store_var(&b, in[0], nir_bcsel(&b, rgba, high, low), 1);
+            nir_store_var(&b, in[1], nir_iand_imm(&b, nir_ushr_imm(&b, word, 8), 0xff), 1);
+            nir_store_var(&b, in[2], nir_bcsel(&b, rgba, low, high), 1);
+            nir_store_var(&b, in[3], nir_ushr_imm(&b, word, 24), 1);
+         }
+         nir_pop_if(&b, NULL);
+         nir_def *alpha = nir_load_var(&b, in[3]);
+         nir_def *premultiplied = nir_test_mask(&b, flags, STELA_METAL_COMPOSE_PREMULTIPLIED);
+         nir_def *below = nir_isub(&b, nir_imm_int(&b, 255), alpha);
+         for (unsigned c = 0; c < 3; c++) {
+            nir_def *value = nir_load_var(&b, in[c]);
+            value = nir_bcsel(&b, premultiplied, value, compose_scale(&b, value, alpha));
+            value = nir_iadd(&b, value, compose_scale(&b, nir_load_var(&b, out[c]), below));
+            nir_store_var(&b, out[c], nir_umin(&b, value, nir_imm_int(&b, 255)), 1);
+         }
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_def *pixel = nir_ior(&b, nir_load_var(&b, out[0]),
+                            nir_ior(&b, nir_ishl_imm(&b, nir_load_var(&b, out[1]), 8),
+                                    nir_ishl_imm(&b, nir_load_var(&b, out[2]), 16)));
+   pixel = nir_ior_imm(&b, pixel, 0xff000000u);
+   nir_def *destination = nir_iadd(
+      &b, load(&b, arguments, STELA_METAL_COMPOSE_DESTINATION, 64),
+      nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, y),
+                            nir_u2u64(&b, load(&b, arguments, STELA_METAL_COMPOSE_PITCH, 32))),
+               nir_u2u64(&b, nir_ishl_imm(&b, x, 2))));
+   nir_store_global(&b, pixel, destination, .align_mul = 4);
+   return finish(&b);
+}

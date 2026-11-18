@@ -12,6 +12,27 @@
 //! presents, or by the display's flush at the next vblank, which the home
 //! machine's device deadline brings there.
 //!
+//! The DCP offers each frame it composes outside the devices' lock to the
+//! GPU first ([`Scanout::try_present_layers`]): the Metal device of the GPU
+//! showing the display composes it into the hidden buffer
+//! ([`stela_drivers::gpu::metal::compose`]), in a turn of the Metal
+//! service, and the buffer is flipped only once the GPU's marker shows the
+//! frame done. What needs the host's kernel (exporting the scanout
+//! buffers, importing guest RAM) is done only on the boot CPU, where it
+//! completes at once; elsewhere a frame needing it is left to the CPU. A
+//! frame the GPU does not compose exactly is the CPU's, as before.
+//!
+//! A second display: where the guest has two ([`want_second_display`]),
+//! [`take`] splits the GPU's outputs between them ([`Display::take_split`]):
+//! the main display keeps the output it would take alone, in its own size,
+//! and the guest's second display runs the next connected output in that
+//! monitor's own mode, each its own scanout ([`scanouts`]) with its own
+//! buffers, refresh, vertical blanks, flips and hot-plug. Both share the
+//! node and the GPU's Metal device, whose compose marker and timeline run
+//! one frame at a time across both: the tickets are the device's
+//! ([`COMPOSE_TICKET`]), so a frame of one display the GPU is still
+//! composing leaves the other's next frame to the CPU.
+//!
 //! Hot-plug: once a second the same flush on the boot CPU reads the
 //! connectors as the driver last detected them, which its hot-plug
 //! interrupts keep current. A display taken at start is set again when it
@@ -27,11 +48,13 @@ use crate::engine::host;
 use crate::{Result, output};
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
+use stela_drivers::gpu::metal::compose;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
 use stela_soc::machine::{MonitorId, Scanout, ScanoutFormat, ScanoutMode};
+use stela_soc::scanout::{GpuFrame, GpuPending};
 
 /// A GPU's primary node, the DRM master.
 struct Node(c_int);
@@ -101,6 +124,18 @@ struct KmsScanout {
     /// The counter at the display's last vertical blank as the last look
     /// read it, when it could ([`Display::last_vblank_ns`]).
     vblank_tsc: Option<u64>,
+    /// Why the GPU does not compose the guest's frames was reported.
+    gpu_reported: bool,
+    /// That frames are composed on the GPU was reported.
+    gpu_announced: bool,
+    /// The bound GPU, by its index, whose output shows the display, when
+    /// it was taken at start: the one whose Metal device composes.
+    gpu_index: Option<usize>,
+    /// The frame the GPU is composing; its ticket is the device's
+    /// ([`COMPOSE_TICKET`]).
+    gpu: Option<GpuInFlight>,
+    /// A frame the GPU composed was given up: the CPU composes every frame.
+    gpu_failed: bool,
 }
 
 impl Scanout for KmsScanout {
@@ -152,6 +187,93 @@ impl Scanout for KmsScanout {
         self.blank &= presented.is_err();
         finish_present(display, presented)?;
         Ok(true)
+    }
+
+    /// The DCP offers each frame it composes outside the devices' lock.
+    /// Every check runs, and the GPU has the frame, before the display is
+    /// touched: a frame declined or refused leaves it as it was, and the
+    /// CPU composes it. The first reason a frame is declined is reported
+    /// once; a frame the GPU took is flipped only once it is done
+    /// ([`Self::gpu_pending_done`]).
+    fn try_present_layers(&mut self, frame: &GpuFrame<'_>) -> Result<Option<GpuPending>> {
+        match self.compose_on_gpu(frame) {
+            Ok(GpuTake::Pending(pending)) => Ok(Some(pending)),
+            Ok(GpuTake::Declined) => Ok(None),
+            Ok(GpuTake::Unfit(reason)) => {
+                if let Some((name, _)) = &self.display
+                    && !core::mem::replace(&mut self.gpu_reported, true)
+                {
+                    output::arguments(format_args!(
+                        "GPU {name}: display frames are composed on the CPU: {reason}\n"
+                    ));
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                // A refusal is not retried each frame (an export and an
+                // import on the boot CPU per frame): the CPU composes the
+                // rest of the boot's frames.
+                self.gpu_failed = true;
+                if let Some((name, _)) = &self.display {
+                    output::arguments(format_args!(
+                        "GPU {name}: display frames are composed on the CPU from now: {error}\n"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Polled at each look of the display: the marker the GPU writes after
+    /// the frame is read with no driver call, and once it shows the frame
+    /// its flip is queued, requested at once on the boot CPU. A frame not
+    /// done within [`GPU_PATIENCE_SECONDS`], or whose device was lost, is
+    /// given up: nothing of it shows, the GPU composes no more frames, and
+    /// the DCP shows the frame on screen again whole ([`Self::wants_frame`]).
+    fn gpu_pending_done(&mut self, pending: &GpuPending) -> bool {
+        let Some(inflight) = self.gpu else {
+            return true;
+        };
+        if inflight.ticket != pending.ticket {
+            return true;
+        }
+        let shown = self
+            .gpu_index
+            .and_then(metal_service)
+            .and_then(|service| service.compose_shows(inflight.ticket));
+        let patience = self.tsc_hz.saturating_mul(GPU_PATIENCE_SECONDS);
+        let Some((name, display)) = &mut self.display else {
+            self.gpu = None;
+            return true;
+        };
+        match shown {
+            Some(true) => {
+                self.gpu = None;
+                let finished = display.finish_gpu_frame();
+                if let Err(error) = finish_present(display, finished)
+                    && !core::mem::replace(&mut self.reported, true)
+                {
+                    output::arguments(format_args!("GPU {name}: {error}\n"));
+                }
+                true
+            }
+            Some(false) if host::rdtsc().wrapping_sub(inflight.began) < patience => false,
+            _ => {
+                self.gpu = None;
+                display.abandon_gpu_frame();
+                self.blank = true;
+                self.gpu_failed = true;
+                output::arguments(format_args!(
+                    "GPU {name}: a display frame composed on the GPU was {}; the CPU composes \
+                     every frame from now on\n",
+                    match shown {
+                        None => "lost with its Metal device",
+                        _ => "not done in time",
+                    }
+                ));
+                true
+            }
+        }
     }
 
     fn refresh_rates(&self) -> Vec<u32> {
@@ -248,6 +370,11 @@ impl KmsScanout {
             tsc_hz,
             reported: false,
             vblank_tsc: None,
+            gpu_reported: false,
+            gpu_announced: false,
+            gpu_index: None,
+            gpu: None,
+            gpu_failed: false,
         }
     }
 
@@ -475,6 +602,232 @@ fn finish_present(display: &Display<Node>, presented: Result<(), DisplayError>) 
     })
 }
 
+/// Whether the guest's frames are offered to the GPU at all
+/// ([`Scanout::try_present_layers`]); off, the CPU composes every frame.
+const GPU_COMPOSE: bool = true;
+
+/// How long a frame the GPU composes may take before it is given up
+/// ([`Scanout::gpu_pending_done`]): it waits behind the Metal work already
+/// on the queue, which a busy guest can make long.
+const GPU_PATIENCE_SECONDS: u64 = 2;
+
+/// How long a compose waits for the Metal service's turn, which a guest's
+/// call may hold, before the CPU composes the frame instead: a fraction of
+/// the CPU's own compose of a large frame.
+const GPU_TURN_MICROS: u64 = 2000;
+
+/// The ticket of the last display frame queued on the GPU's Metal device,
+/// whichever display it was for. The device keeps one compose marker and
+/// one timeline, whose values only rise, one frame at a time: the main and
+/// the second display's frames take their tickets from this one count,
+/// under the Metal service's turn, so neither's ticket repeats or falls
+/// behind the other's.
+static COMPOSE_TICKET: AtomicU64 = AtomicU64::new(0);
+
+/// A frame the GPU is composing: its ticket and the counter at its
+/// submission.
+#[derive(Clone, Copy)]
+struct GpuInFlight {
+    ticket: u64,
+    began: u64,
+}
+
+/// What [`KmsScanout::compose_on_gpu`] did with a frame.
+enum GpuTake {
+    /// The GPU has it.
+    Pending(GpuPending),
+    /// Not now (the service busy, a plane or buffer not imported off the
+    /// boot CPU): the CPU composes it, and nothing is reported.
+    Declined,
+    /// Not one the GPU composes, reported once.
+    Unfit(String),
+}
+
+/// The Metal service of the bound GPU `index`, when it serves one.
+fn metal_service(index: usize) -> Option<&'static super::gate::SharedDevice> {
+    super::gate::shared()
+        .iter()
+        .enumerate()
+        .find(|&(service, _)| super::gate::served_gpu(service) == Some(index))
+        .map(|(_, service)| &**service)
+}
+
+impl KmsScanout {
+    /// Hands `frame` to the Metal device of the GPU showing the display,
+    /// when it can compose it: the planes and the scanout buffer imported
+    /// (imported here only on the boot CPU, where the host kernel calls
+    /// they make complete at once, so a PE never waits for the boot CPU
+    /// while the DCP may wait for it), the frame's arguments written and
+    /// its work queued; only then is the hidden buffer the GPU's.
+    fn compose_on_gpu(&mut self, frame: &GpuFrame<'_>) -> Result<GpuTake> {
+        if !GPU_COMPOSE {
+            return Ok(GpuTake::Unfit(String::from("GPU compose is turned off")));
+        }
+        if self.gpu_failed || self.gpu.is_some() {
+            return Ok(GpuTake::Declined);
+        }
+        let Some((_, display)) = &mut self.display else {
+            return Ok(GpuTake::Declined);
+        };
+        let Some(index) = self.gpu_index else {
+            return Ok(GpuTake::Unfit(String::from(
+                "the display was taken after start, on a GPU not matched to a Metal device",
+            )));
+        };
+        let Some(service) = metal_service(index) else {
+            return Ok(GpuTake::Unfit(String::from(
+                "the GPU showing the display serves no Metal device",
+            )));
+        };
+        let target = display.gpu_target(frame.damage.clone());
+        let rows = target.rows.start as u32..target.rows.end as u32;
+        let plan = match gpu_plan(self.mode, frame, rows) {
+            Ok(plan) => plan,
+            Err(reason) => return Ok(GpuTake::Unfit(reason)),
+        };
+        let Ok(pitch) = u32::try_from(target.pitch) else {
+            return Ok(GpuTake::Unfit(String::from(
+                "the scanout pitch is too large",
+            )));
+        };
+        let boot = on_boot_cpu();
+        let wait = self.tsc_hz / 1_000_000 * GPU_TURN_MICROS;
+        let submitted = service.with_device(wait, |device| {
+            // The turn holds the device: the ticket is the next of every
+            // display's, taken only once the frame is queued.
+            let ticket = COMPOSE_TICKET.load(Ordering::Relaxed) + 1;
+            let job = compose::Job {
+                target: target.handle,
+                pitch,
+                plan: &plan,
+                ticket,
+                import: boot,
+            };
+            let submitted = match device.compose(&job) {
+                Ok(compose::Submitted::NoTarget) if boot => {
+                    let fd = display.export_buffer(target.handle).map_err(|error| {
+                        refuse!(
+                            "the display refused to export its scanout buffer: {error}",
+                            error = format!("{error:?}")
+                        )
+                    })?;
+                    if let Err(error) =
+                        device.import_compose_target(target.handle, fd, target.bytes as u64)
+                    {
+                        client::close_descriptor(fd);
+                        return Err(refuse!(
+                            "the Metal device refused the scanout buffer: {error}",
+                            error = format!("{error:?}")
+                        ));
+                    }
+                    device.compose(&job).map_err(metal_refusal)
+                }
+                result => result.map_err(metal_refusal),
+            };
+            if let Ok(compose::Submitted::Queued) = submitted {
+                COMPOSE_TICKET.store(ticket, Ordering::Relaxed);
+            }
+            submitted.map(|submitted| (submitted, ticket))
+        });
+        match submitted {
+            None | Some(Ok((compose::Submitted::NoTarget | compose::Submitted::NotReady, _))) => {
+                Ok(GpuTake::Declined)
+            }
+            Some(Err(error)) => Err(error),
+            Some(Ok((compose::Submitted::Queued, ticket))) => {
+                console::release();
+                // The GPU writes the hidden buffer from now: no flip shows
+                // it until the frame is done.
+                if let Err(error) = display.begin_gpu_frame(frame.damage.clone()) {
+                    // Nothing else writes it while a GPU frame is pending,
+                    // which the check above ruled out.
+                    return Err(refuse!(
+                        "the display refused the GPU's frame: {error}",
+                        error = format!("{error:?}")
+                    ));
+                }
+                self.presented = true;
+                self.blank = false;
+                self.gpu = Some(GpuInFlight {
+                    ticket,
+                    began: host::rdtsc(),
+                });
+                if !core::mem::replace(&mut self.gpu_announced, true)
+                    && let Some((name, _)) = &self.display
+                {
+                    output::arguments(format_args!(
+                        "GPU {name}: the guest's display frames are composed on this GPU\n"
+                    ));
+                }
+                Ok(GpuTake::Pending(GpuPending { ticket }))
+            }
+        }
+    }
+}
+
+fn metal_refusal(error: stela_drivers::gpu::metal::error::Error) -> stela_contracts::Refusal {
+    refuse!(
+        "the Metal device refused to compose a frame: {error}",
+        error = format!("{error:?}")
+    )
+}
+
+/// The GPU compose of `frame` on a display in `mode`, writing `rows`, or
+/// why it is the CPU's: only 8:8:8:8 colour layers and two-plane
+/// extended-range ones whose planes the GPU reads whole are composed
+/// exactly ([`compose::plan`]); a 10-bit layer is the CPU's.
+fn gpu_plan(
+    mode: ScanoutMode,
+    frame: &GpuFrame<'_>,
+    rows: Range<u32>,
+) -> core::result::Result<compose::Plan, String> {
+    if frame.mode != mode || mode.format != ScanoutFormat::Bgra8888 {
+        return Err(format!(
+            "the frame's mode {:?} is not the display's",
+            frame.mode
+        ));
+    }
+    let mut layers = Vec::with_capacity(frame.layers.len());
+    for layer in frame.layers {
+        let format = match layer.format {
+            ScanoutFormat::Bgra8888 => compose::Format::Bgra8888,
+            ScanoutFormat::Rgba8888 => compose::Format::Rgba8888,
+            ScanoutFormat::Xr10A8 { .. } => compose::Format::Xr10A8,
+            other => {
+                return Err(format!(
+                    "a layer's pixel format ({other:?}) is composed on the CPU"
+                ));
+            }
+        };
+        let plane = |index: usize| {
+            layer.planes.get(index).map(|plane| compose::Plane {
+                ranges: plane.ranges.clone(),
+                offset: plane.offset,
+                stride: plane.stride,
+            })
+        };
+        let Some(color) = plane(0) else {
+            return Err(String::from("a layer has no colour plane"));
+        };
+        let rect = |rect: stela_soc::scanout::Rect| compose::Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        };
+        layers.push(compose::Layer {
+            format,
+            color,
+            alpha: plane(1),
+            source: rect(layer.source),
+            destination: rect(layer.destination),
+            premultiplied: layer.premultiplied,
+        });
+    }
+    compose::plan(mode.width, mode.height, rows, &layers)
+        .map_err(|decline| format!("the frame is not one the GPU composes exactly ({decline:?})"))
+}
+
 /// `display`'s front buffer as a screen.
 fn screen(display: &Display<Node>) -> Framebuffer {
     let (width, height) = display.size();
@@ -487,18 +840,64 @@ fn screen(display: &Display<Node>) -> Framebuffer {
     )
 }
 
-/// What [`take`] left, until the board's DCP takes it: the display taken,
+/// What [`take`] left, until the board's DCPs take it: the displays taken,
 /// else the nodes of the GPUs that had none.
 struct Taken(UnsafeCell<Displays>);
 
-/// The display a GPU took with that GPU's name, and the named nodes of the
-/// GPUs still without one.
-type Displays = (Option<(String, Display<Node>)>, Vec<(String, c_int)>);
+/// The displays a GPU took, each with the name its lines carry, by the
+/// guest display they show ([`MAIN`] and [`SECOND`]), and the named nodes
+/// of the GPUs still without one. The second display is the main's GPU's,
+/// on the same node.
+type Displays = ([Option<(String, Display<Node>)>; 2], Vec<(String, c_int)>);
+
+/// The guest's main display and its second, as [`Displays`] holds them.
+const MAIN: usize = 0;
+const SECOND: usize = 1;
 
 // SAFETY: only the boot CPU's start reaches it, once each way.
 unsafe impl Sync for Taken {}
 
-static TAKEN: Taken = Taken(UnsafeCell::new((None, Vec::new())));
+static TAKEN: Taken = Taken(UnsafeCell::new(([None, None], Vec::new())));
+
+/// The guest has a second display ([`want_second_display`]).
+static SECOND_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`take`] gives the guest's second display an output of its own:
+/// set before [`take`] (that is, before `gpu::serve`) when the guest has a
+/// second display. The main display then keeps the output it would take
+/// alone, in its own size, no longer mirrored to the others, and the next
+/// connected output of the same GPU shows the second display in its own
+/// monitor's mode ([`Display::take_split`]); the GPU awaited after its
+/// reset is also awaited, as long, for a second monitor.
+pub(in crate::engine) fn want_second_display(wanted: bool) {
+    SECOND_WANTED.store(wanted, Ordering::Relaxed);
+}
+
+/// The main display and, where one was asked for and an output can show
+/// it, the second, on `fd`, for `wanted`.
+type Took = (
+    Display<Node>,
+    Option<core::result::Result<Display<Node>, DisplayError>>,
+);
+
+fn take_on(
+    fd: c_int,
+    wanted: kms::Wanted,
+    second: bool,
+) -> core::result::Result<Took, DisplayError> {
+    let fits = &stela_soc::dcp::modes::advertisable;
+    match second {
+        true => Display::take_split(
+            Node(fd),
+            Node(fd),
+            wanted,
+            kms::Wanted::Native((0, 0)),
+            fits,
+        )
+        .map(|kms::Split { main, second }| (main, Some(second))),
+        false => Display::take_fitting(Node(fd), wanted, fits).map(|display| (display, None)),
+    }
+}
 /// The bound GPU whose output [`take`] took, or `usize::MAX`.
 static TAKEN_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -550,6 +949,7 @@ pub(in crate::engine) fn take(
         return;
     };
     let wanted = (wanted.0 as u32, wanted.1 as u32);
+    let split = SECOND_WANTED.load(Ordering::Relaxed);
     let bound = &gpu.start.bound;
     // SAFETY: the one boot CPU, before any reader.
     let (taken, waiting) = unsafe { &mut *TAKEN.0.get() };
@@ -587,21 +987,29 @@ pub(in crate::engine) fn take(
                 pause();
                 continue;
             }
-            match Display::take_fitting(
-                Node(fd),
-                match size {
-                    Some(size) => kms::Wanted::Size(size),
-                    None => kms::Wanted::Native(wanted),
-                },
-                &stela_soc::dcp::modes::advertisable,
-            ) {
+            // A second display's monitor searches its inputs after the
+            // reset as the firmware's does, often detected after it: the
+            // split waits as long for it, so the second display is not
+            // left without an output for the boot.
+            let alone = split
+                && patient
+                && matches!(kms::connected_outputs(&mut Node(fd)), Ok(count) if count < 2);
+            if alone {
+                pause();
+                continue;
+            }
+            let wanted = match size {
+                Some(size) => kms::Wanted::Size(size),
+                None => kms::Wanted::Native(wanted),
+            };
+            match take_on(fd, wanted, split) {
                 Err(DisplayError::NoOutput) if patient => pause(),
                 result => break (result, absent),
             }
         };
         let waited_ms = host::rdtsc().wrapping_sub(began) / (gpu.tsc_hz / 1000).max(1);
         match result {
-            Ok(mut display) => {
+            Ok((mut display, second)) => {
                 if absent {
                     output::arguments(format_args!(
                         "GPU {name}: an output the firmware lit detected no display in \
@@ -653,7 +1061,8 @@ pub(in crate::engine) fn take(
                 for (_, fd) in waiting.drain(..) {
                     client::close_descriptor(fd);
                 }
-                *taken = Some((name.clone(), display));
+                taken[MAIN] = Some((name.clone(), display));
+                taken[SECOND] = second.and_then(|second| take_second(name, second, waited_ms));
                 return;
             }
             Err(error) => {
@@ -676,10 +1085,61 @@ pub(in crate::engine) fn take(
     }
 }
 
+/// The second display [`take`] split off GPU `name`'s outputs, reported,
+/// with the name its lines carry; `None`, reported, when no output could
+/// show it: the guest's second display then shows nowhere.
+fn take_second(
+    name: &str,
+    second: core::result::Result<Display<Node>, DisplayError>,
+    waited_ms: u64,
+) -> Option<(String, Display<Node>)> {
+    let mut display = match second {
+        Ok(display) => display,
+        Err(error) => {
+            let why = match error {
+                DisplayError::NoOutput => {
+                    format!("no other connected output with a free controller after {waited_ms} ms")
+                }
+                error => format!("the driver refused it: {error:?}"),
+            };
+            output::arguments(format_args!(
+                "GPU {name}: no second display: {why}; the guest's second display shows nowhere\n"
+            ));
+            return None;
+        }
+    };
+    let (width, height) = display.size();
+    let mut ports = String::new();
+    for port in display.ports() {
+        if !ports.is_empty() {
+            ports.push_str(", ");
+        }
+        let _ = core::fmt::write(&mut ports, format_args!("{port}"));
+    }
+    output::arguments(format_args!(
+        "GPU {name}: second display runs {width}x{height} at {} mHz on {ports}\n",
+        display.refresh_millihertz()
+    ));
+    let name = format!("{name} (second display)");
+    report_outputs(&name, &display);
+    report_listings(&name, &mut display);
+    Some((name, display))
+}
+
 /// The mode of the display [`take`] took, before the board's DCP takes it.
 pub(in crate::engine) fn taken_size() -> Option<(usize, usize)> {
+    taken_size_of(MAIN)
+}
+
+/// The mode of the guest's second display [`take`] took, before the
+/// board's DCP takes it: its monitor's own ([`want_second_display`]).
+pub(in crate::engine) fn second_taken_size() -> Option<(usize, usize)> {
+    taken_size_of(SECOND)
+}
+
+fn taken_size_of(slot: usize) -> Option<(usize, usize)> {
     // SAFETY: the one boot CPU, after `take` and before `scanout`.
-    let taken = unsafe { &(*TAKEN.0.get()).0 };
+    let taken = unsafe { &(*TAKEN.0.get()).0[slot] };
     taken.as_ref().map(|(_, display)| {
         let (width, height) = display.size();
         (width as usize, height as usize)
@@ -694,9 +1154,11 @@ pub(in crate::engine) fn taken_size() -> Option<(usize, usize)> {
 pub(in crate::engine) fn abandon() {
     // SAFETY: the one boot CPU, after `take`.
     let (taken, waiting) = unsafe { &mut *TAKEN.0.get() };
-    let had = taken.is_some();
-    if let Some(display) = taken.take() {
-        core::mem::forget(display);
+    let had = taken[MAIN].is_some();
+    for slot in taken.iter_mut() {
+        if let Some(display) = slot.take() {
+            core::mem::forget(display);
+        }
     }
     let nodes = waiting.len();
     core::mem::forget(core::mem::take(waiting));
@@ -711,11 +1173,35 @@ pub(in crate::engine) fn abandon() {
 }
 
 /// The scanout of the display [`take`] took, in its own mode, for the
-/// board's DCP.
+/// board's DCP: the guest's main display.
 pub(in crate::engine) fn scanout() -> Option<Box<dyn Scanout>> {
+    scanout_of(MAIN)
+}
+
+/// The scanout of the guest's second display [`take`] took, in its own
+/// monitor's mode, refresh and identity (its EDID), for the board's second
+/// DCP; `None` when no second display was asked for or no output could
+/// show it. It shares the main display's GPU and Metal device, and has its
+/// own buffers, vertical blanks, flips, hot-plug and frames composed on the
+/// GPU.
+pub(in crate::engine) fn second_scanout() -> Option<Box<dyn Scanout>> {
+    scanout_of(SECOND)
+}
+
+/// The scanouts of the displays [`take`] took, the main display's first,
+/// then the second's where there is one: index 0 and 1 of the board's
+/// scanouts. Empty when no display was taken.
+pub(in crate::engine) fn scanouts() -> Vec<Box<dyn Scanout>> {
+    [scanout(), second_scanout()]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn scanout_of(slot: usize) -> Option<Box<dyn Scanout>> {
     let gpu = super::installed()?;
     // SAFETY: the one boot CPU, after `take`.
-    let (name, display) = unsafe { (*TAKEN.0.get()).0.take() }?;
+    let (name, display) = unsafe { (*TAKEN.0.get()).0[slot].take() }?;
     let (width, height) = display.size();
     let mut scanout = KmsScanout::new(
         ScanoutMode {
@@ -728,6 +1214,7 @@ pub(in crate::engine) fn scanout() -> Option<Box<dyn Scanout>> {
         display.edid().and_then(MonitorId::from_edid),
         gpu.tsc_hz,
     );
+    scanout.gpu_index = taken_index();
     scanout.display = Some((name, display));
     Some(Box::new(scanout))
 }

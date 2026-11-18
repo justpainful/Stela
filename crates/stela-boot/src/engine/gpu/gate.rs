@@ -46,6 +46,8 @@ use stela_linux::{
 use stela_loader::{apple_device_tree::DeviceTree, stela_gpu};
 
 type Shared = SharedService<NativeBackend, AirCompiler>;
+/// A GPU's Metal service, as the display composing on it reaches it.
+pub(super) type SharedDevice = Shared;
 
 /// A process's main stack, as big as the deepest compile LLVM bounds.
 pub(super) const STACK_BYTES: usize = 16 << 20;
@@ -221,8 +223,14 @@ pub(in crate::engine) fn run_job(taker: Taker) -> bool {
     if taker == Taker::Busy && now < NEXT_BUSY_JOB.load(Ordering::Relaxed) {
         return false;
     }
-    let older = millis * taker.after_millis();
-    let resume_after = millis * taker.resume_after_millis();
+    // With compile workers, a PE's processor leaves a job to them first.
+    let (after, resume) = if super::worker::present() {
+        taker.with_workers()
+    } else {
+        (taker.after_millis(), taker.resume_after_millis())
+    };
+    let older = millis * after;
+    let resume_after = millis * resume;
     let mut ran = None;
     for service in shared().iter() {
         if !service.jobs_waiting() {
@@ -552,7 +560,19 @@ fn report_peaks() {
 /// for the next PE that stopped to wait, or 20 ms for a busy one
 /// (`Taker::Busy`), while the guest's call slept and asked again.
 fn job_waiting() {
-    super::call_idle_core();
+    // A compile worker takes it at once; a sleeping PE would leave it to
+    // one for the grace (`Taker::with_workers`).
+    if super::worker::present() {
+        super::worker::wake();
+    } else {
+        super::call_idle_core();
+    }
+}
+
+/// Whether a job of any GPU's service waits, queued or between slices: a
+/// compile worker that found it held by another processor looks again.
+pub(in crate::engine) fn jobs_pending() -> bool {
+    shared().iter().any(|service| service.jobs_waiting())
 }
 
 /// What the kext found of the Metal plugin, the bundle whose code this boot's

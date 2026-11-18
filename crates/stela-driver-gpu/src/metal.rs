@@ -19,6 +19,7 @@ pub mod argument;
 pub mod binding;
 pub mod capabilities;
 pub mod command_buffer;
+pub mod compose;
 pub mod compiler;
 pub mod deferred;
 pub mod device;

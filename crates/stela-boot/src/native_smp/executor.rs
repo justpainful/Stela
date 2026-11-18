@@ -188,6 +188,16 @@ impl Executors {
     pub(crate) fn failure(&self) -> Option<&StartupFailure> {
         self.failure.as_ref()
     }
+    /// Takes the started executors from slot `runners` on, which run no PE
+    /// (`stela_boot_core::compile_workers`); the PEs' stay, so that
+    /// [`Self::started`] and [`Self::processors`] count only them.
+    pub(crate) fn take_workers(&mut self, runners: usize) -> Vec<Processor> {
+        let (workers, pes) = core::mem::take(&mut self.processors)
+            .into_iter()
+            .partition(|processor| processor.slot >= runners);
+        self.processors = pes;
+        workers
+    }
 }
 
 unsafe extern "sysv64" fn enter(argument: u64) -> ! {
@@ -440,6 +450,7 @@ pub(crate) unsafe fn start(
     _fp_qualification: bool,
 ) -> Result<Executors, StartupFailure> {
     let cores = handoff.native_resources.cores as usize;
+    let runners = handoff.native_resources.runners as usize;
     if cores == 0 || cores > capture.core_count as usize {
         return Err(StartupFailure::Resources(
             "the reserved cores are none or more than the processor capture selects",
@@ -536,7 +547,7 @@ pub(crate) unsafe fn start(
         }
         let attempt = (|| -> Result<(), StartupFailure> {
             let part =
-                resources::partition(cores, cores, slot, handoff.code.bytes, handoff.pool.bytes)
+                resources::partition(cores, runners, slot, handoff.code.bytes, handoff.pool.bytes)
                     .map_err(|_| {
                         StartupFailure::Resources("the code and pool do not divide into its part")
                     })?;

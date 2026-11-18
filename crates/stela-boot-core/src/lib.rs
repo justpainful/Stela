@@ -26,6 +26,7 @@ pub mod bundle_repair;
 pub mod chain_check;
 pub mod chosen_disk;
 pub mod client_fault;
+pub mod compile_workers;
 pub mod console_lines;
 #[cfg(feature = "native-acpi")]
 pub mod crs;
@@ -56,6 +57,7 @@ pub mod guest_timeouts;
 pub mod handoff_records;
 pub mod heap;
 #[cfg(target_arch = "x86_64")]
+pub mod host_audio;
 pub mod host_clock;
 pub mod host_identity;
 pub mod host_memory;

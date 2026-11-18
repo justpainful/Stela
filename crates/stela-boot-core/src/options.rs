@@ -34,6 +34,16 @@ pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const NATIVE_CORES: &str = "--native-cores";
 pub const GUEST_PES: &str = "--guest-pes";
+pub const COMPILE_WORKERS: &str = "--compile-workers";
+/// Whether the guest has a USB headset whose sound plays on the host's
+/// analog output (`--audio on|off`, on by default).
+pub const AUDIO: &str = "--audio";
+/// Gives the guest a second, independent external display: the J473AP's
+/// DCP-role pipe (`/arm-io/dcp`, `dcp0-expert`, `disp0`), which a real Mac
+/// mini drives through its USB-C DisplayPort, as a second instance of the
+/// display model beside `dcpext`'s HDMI (`--second-display`, off by
+/// default). The host supplies its scanout; without one the mount refuses.
+pub const SECOND_DISPLAY: &str = "--second-display";
 /// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
 /// place of the monitor's preferred mode: for a capture device that cannot
 /// take the mode its EDID prefers.
@@ -280,6 +290,14 @@ pub struct System {
     /// The source PE count (`--guest-pes N`) recorded by setup for disk
     /// boots whose verified DeviceTree is loaded after firmware exit.
     pub guest_pes: Option<usize>,
+    /// Efficiency cores started to run the GPUs' deferred compile jobs and
+    /// no PE (`--compile-workers N`, 0 for none): by default
+    /// [`crate::compile_workers::AUTO`] where the host has them.
+    pub compile_workers: Option<usize>,
+    /// `--audio on|off`; `None` is the default, on ([`Self::audio`]).
+    pub audio: Option<bool>,
+    /// The guest's second display pipe, `disp0` ([`SECOND_DISPLAY`]).
+    pub second_display: bool,
     /// The size a GPU's display is taken in ([`DISPLAY_SIZE`]).
     pub display_size: Option<(u32, u32)>,
     /// Check owned AP startup/host resources, then stop before guest entry.
@@ -396,6 +414,9 @@ impl Default for System {
             input: false,
             native_cores: None,
             guest_pes: None,
+            compile_workers: None,
+            audio: None,
+            second_display: false,
             display_size: None,
             native_bootstrap_check: false,
             native_shared_check: false,
@@ -591,6 +612,12 @@ impl System {
     /// start is all they have of a GPU.
     pub fn hides_agx(&self, metal_device: bool) -> bool {
         metal_device || self.starts_metal_clients()
+    }
+
+    /// Whether the guest gets its USB headset, played on the host's analog
+    /// output and fed from its USB microphone: unless `--audio off`.
+    pub fn audio(&self) -> bool {
+        self.audio != Some(false)
     }
 
     /// Select the exact number of host processors the loader reserves.
@@ -846,6 +873,9 @@ impl fmt::Display for System {
         line.flag("--sep-observe", self.sep_observe)?;
         line.value(NATIVE_CORES, self.native_cores)?;
         line.value(GUEST_PES, self.guest_pes)?;
+        line.value(COMPILE_WORKERS, self.compile_workers)?;
+        line.value(AUDIO, self.audio.map(|on| if on { "on" } else { "off" }))?;
+        line.flag(SECOND_DISPLAY, self.second_display)?;
         line.value(
             DISPLAY_SIZE,
             self.display_size

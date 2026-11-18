@@ -87,8 +87,8 @@ mod sep_topology;
 pub use sep_topology::SepDevice;
 use sep_topology::sep_device;
 mod display_topology;
-use display_topology::dcp_device;
 pub use display_topology::{DcpController, DcpMapperRoute};
+use display_topology::{dcp_device, second_display_device};
 mod dart_topology;
 mod dma_routes;
 #[cfg(test)]
@@ -136,7 +136,10 @@ use stela_contracts::{Chip, caches::Caches};
 mod models;
 #[cfg(test)]
 use models::ROLE_MODELS;
-pub use models::{ChildModel, GPU_ADMITTED, model_boot_properties, model_children, models};
+pub use models::{
+    ChildModel, GPU_ADMITTED, model_boot_properties, model_boot_properties_under, model_children,
+    model_children_under, models, models_under,
+};
 
 /// A device's first `reg` range in guest PA and its AIC input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +340,40 @@ pub const SEP_NUB: &str = "iop-nub,sep";
 pub const DCPEXT_ROLE: &[u8] = b"DCPEXT\0";
 pub const DISPEXT: &str = "dispext0,t8112";
 pub const DISPEXT_T6000: &str = "dispext0,t600x";
+
+/// The J473AP's second display pipeline, the one a real Mac mini drives
+/// through its USB-C DisplayPort: the coprocessor `/arm-io/dcp` (the shared
+/// ASC [`ASC`] with `role` `DCP`, nub `iop-dcp-nub`), its power expert
+/// `dcp0-expert` (`role` `DCP`, [`DCP_EXPERT`]) and the pipe `disp0`
+/// ([`DISP0`], `device_type` `display-subsystem` and, on J473AP, `external`
+/// = 1), whose DARTs are `dart-dcp` (`mapper-dcp`, stream 5) and
+/// `dart-disp0` (`mapper-disp0` 0 and `mapper-disp0-piodma` 4), both
+/// `dart,t8110`. The J473AP DeviceTree gives the same graph as
+/// `dcpext`'s, except that the coprocessor has no `truncate-dvas`, its
+/// `hdcp-channels` are 5 and 6 (7 and 8 on `dcpext`), its
+/// `dp-switch-ufp-endpoint` is 0 (1) and the pipe has `power-gates`,
+/// `clock-gates` and `function-mcc_dataset`; those stay DeviceTree data the
+/// AP's drivers read, which the model neither answers nor changes.
+///
+/// It is the same display model as `dcpext`'s, a second instance with its
+/// own identity ([`dcp::ExternalIdentity::Disp0`]), and is admitted only for
+/// a boot that asks for a second display ([`Admission::second_display`]):
+/// by default it stays hidden, as it always was, and `dcpext` is the only
+/// display. The `display-crossbar0` route and the `dptx-phy` stay hidden as
+/// they do for `dcpext`, and the ATC PHYs are admitted or not as without it:
+/// the model's monitor is connected by the coprocessor itself, and it
+/// offers no DPTX-port service, so nothing configures a physical link.
+pub const DCP_ROLE: &[u8] = b"DCP\0";
+pub const DISP0: &str = "disp0,t8112";
+
+/// The modeled devices a boot admits beyond those [`models`] always admits,
+/// as its options choose them. The default admits none of them, so a boot
+/// that asks for nothing presents the board it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Admission {
+    /// The second display pipeline ([`DCP_ROLE`], [`DISP0`]).
+    pub second_display: bool,
+}
 /// One native GOP-backed external graph with checked TRAD/UMMS ownership.
 /// This admits its resource contract; visible Recovery output still requires
 /// original firmware/kernel execution through that graph.
@@ -354,6 +391,17 @@ pub struct ExternalOutput {
     pub external_index: Option<u32>,
     pub identity: dcp::ExternalIdentity,
     pub admitted: bool,
+    /// The pipeline is a second display: admitted only under
+    /// [`Admission::second_display`], and never in place of the board's one
+    /// external output ([`external_output`]).
+    pub second_display: bool,
+}
+
+impl ExternalOutput {
+    /// Whether a boot with `admission` presents this pipeline.
+    pub fn admitted_under(&self, admission: Admission) -> bool {
+        self.admitted || self.second_display && admission.second_display
+    }
 }
 
 pub const EXTERNAL_OUTPUTS: &[ExternalOutput] = &[
@@ -367,6 +415,7 @@ pub const EXTERNAL_OUTPUTS: &[ExternalOutput] = &[
         external_index: None,
         identity: dcp::ExternalIdentity::Unnumbered,
         admitted: true,
+        second_display: false,
     },
     ExternalOutput {
         controller: "dcpext0",
@@ -378,13 +427,39 @@ pub const EXTERNAL_OUTPUTS: &[ExternalOutput] = &[
         external_index: Some(1),
         identity: dcp::ExternalIdentity::Numbered(0),
         admitted: T6000_EXTERNAL_OUTPUT_ADMITTED,
+        second_display: false,
+    },
+    // `disp0` carries `external` = 1, but the J473AP DeviceTree gives its
+    // nub no `external-index`, as it gives `dcpext`'s none: the graph is
+    // checked as the unnumbered one's is.
+    ExternalOutput {
+        controller: "dcp",
+        role: "DCP",
+        role_property: DCP_ROLE,
+        expert: "dcp0-expert",
+        pipe: "disp0",
+        compatible: DISP0,
+        external_index: None,
+        identity: dcp::ExternalIdentity::Disp0,
+        admitted: false,
+        second_display: true,
     },
 ];
 
+/// The board's one external output whose controller has `role`, the
+/// pipeline the guest's main display is; never a second display.
 pub fn external_output(role: &[u8]) -> Option<&'static ExternalOutput> {
     EXTERNAL_OUTPUTS
         .iter()
         .find(|p| p.admitted && p.role_property == role)
+}
+
+/// The second display pipeline whose controller has `role`, when a boot
+/// admits it ([`Admission::second_display`]).
+pub fn second_display_output(role: &[u8]) -> Option<&'static ExternalOutput> {
+    EXTERNAL_OUTPUTS
+        .iter()
+        .find(|p| p.second_display && p.role_property == role)
 }
 
 /// These features require native expert operations beyond RTKit power.
@@ -412,8 +487,8 @@ pub const DCP_EXPERT_HARDWARE_FEATURES: &[&str] = &[
 ///   (`_changeDCPPowerStateInternal`, 0x22f8928), whose RTKit power messages
 ///   the coprocessor model answers.
 ///
-/// The primary display pipe's `dcp0-expert` (`role` `DCP`) stays hidden with its
-/// unmodeled coprocessor.
+/// The DCP-role pipe's `dcp0-expert` (`role` `DCP`) stays hidden with its
+/// coprocessor unless a boot admits the second display ([`DCP_ROLE`]).
 pub const DCP_EXPERT: &str = "dcp-expert-v1";
 pub const DPTX_PHY: &str = "dptx-phy,t8112";
 pub const DISPLAY_CROSSBAR: &str = "display-crossbar,t8112";
@@ -517,9 +592,21 @@ pub struct Board {
     /// The `dcpext` display coprocessor and its register apertures, when the
     /// DeviceTree shows them (admission is closed; see [`DcpController`]).
     pub dcp: Option<DcpController>,
+    /// The second display pipeline (`dcp`, `disp0`; [`DCP_ROLE`]), when the
+    /// DeviceTree shows it admitted: a boot asked for it
+    /// ([`Admission::second_display`]) and the boot chain kept its nub a
+    /// running native RTKit. `None` on every other tree, a board template's
+    /// included.
+    pub second_display: Option<DcpController>,
 }
 
 impl Board {
+    /// The display pipelines in scanout order: the main one ([`Self::dcp`])
+    /// first, then the second display ([`Self::second_display`]).
+    pub fn displays(&self) -> impl Iterator<Item = &DcpController> {
+        self.dcp.iter().chain(self.second_display.iter())
+    }
+
     /// The board firmware images its devices run, by guest file name, each
     /// once: what a boot bundle must carry for the board's devices.
     pub fn firmware_files(&self) -> Vec<String> {
@@ -935,9 +1022,11 @@ pub fn board(tree: &[u8]) -> Result<Board> {
     let spi_nor = spi_nor(&root, &io, &extent, phandle, gpio.as_ref())?;
     let spmis = spmi_controllers(&io, &extent, phandle)?;
     let dcp = dcp_device(&io, &translate, &darts)?;
+    let second_display = second_display_device(&io, &translate, &darts)?;
     Ok(Board {
         spmis,
         dcp,
+        second_display,
         gpio,
         aux_gpios,
         i2cs,

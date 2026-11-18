@@ -79,6 +79,7 @@ unsafe extern "C" {
     fn stela_metal_decode_pvrtc_kernel(options: *const c_void) -> *mut c_void;
     fn stela_metal_reorder_blocks_kernel(options: *const c_void) -> *mut c_void;
     fn stela_metal_decode_astc_kernel(options: *const c_void) -> *mut c_void;
+    fn stela_metal_compose_kernel(options: *const c_void) -> *mut c_void;
     fn stela_metal_release(shader: *mut c_void);
     fn stela_metal_buffer_reads(shader: *const c_void) -> u32;
 }
@@ -121,6 +122,7 @@ impl Service {
             decode_pvrtc_kernel: stela_metal_decode_pvrtc_kernel,
             reorder_blocks_kernel: stela_metal_reorder_blocks_kernel,
             decode_astc_kernel: stela_metal_decode_astc_kernel,
+            compose_kernel: stela_metal_compose_kernel,
             release: stela_metal_release,
             buffer_reads: stela_metal_buffer_reads,
             nir_options,

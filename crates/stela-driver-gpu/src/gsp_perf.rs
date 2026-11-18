@@ -8,6 +8,13 @@
 //! P-state, so the line shows whether the link follows load too. Clocks are
 //! not read: GSP-RM 570.144's headers define no clock control, and RM refused
 //! the 615.78.08 one.
+//!
+//! Each round also asks RM to boost the GPU to its highest P-state for a few
+//! seconds, as NVIDIA's kernel RM forwards a client's `PERF_BOOST`: left to
+//! its own policy RM drops to P8 between the desktop's short bursts of work,
+//! so each burst ran at idle clocks. The line says `boost=max` for a beat
+//! whose rounds RM accepted a boost in, and names the errno once RM refused
+//! it, after which nouveau asks no more.
 use alloc::{format, string::String};
 use core::{
     fmt,
@@ -27,6 +34,8 @@ pub struct Report {
     link_control: AtomicU32,
     link_speeds: AtomicU32,
     link_cap: AtomicU32,
+    boosts: AtomicU32,
+    boost_status: AtomicI32,
 }
 
 impl Report {
@@ -42,6 +51,8 @@ impl Report {
             link_control: AtomicU32::new(0),
             link_speeds: AtomicU32::new(0),
             link_cap: AtomicU32::new(0),
+            boosts: AtomicU32::new(0),
+            boost_status: AtomicI32::new(0),
         }
     }
 
@@ -54,6 +65,7 @@ impl Report {
         let rounds = self.rounds.swap(0, Ordering::Relaxed);
         let pstates = self.pstates.swap(0, Ordering::Relaxed);
         let link_speeds = self.link_speeds.swap(0, Ordering::Relaxed);
+        let boosts = self.boosts.swap(0, Ordering::Relaxed);
         (rounds != 0).then(|| Taken {
             rounds,
             pstate: self.pstate.load(Ordering::Relaxed),
@@ -64,6 +76,10 @@ impl Report {
                 control: self.link_control.load(Ordering::Relaxed) as u16,
                 speeds: link_speeds,
                 cap: self.link_cap.load(Ordering::Relaxed) as u16,
+            },
+            boost: Boost {
+                accepted: boosts,
+                status: self.boost_status.load(Ordering::Relaxed),
             },
         })
     }
@@ -89,12 +105,14 @@ pub struct Taken {
     pub status: i32,
     /// The GPU's PCIe link.
     pub link: Link,
+    /// The boosts RM was asked for.
+    pub boost: Boost,
 }
 
 impl Taken {
-    /// What a change is judged by: the P-states, the status and the link,
-    /// not the count of rounds.
-    fn state(&self) -> [u64; 2] {
+    /// What a change is judged by: the P-states, the status, the link and
+    /// whether a boost held, not the count of rounds or of boosts.
+    fn state(&self) -> [u64; 3] {
         let link = &self.link;
         [
             u64::from(self.pstate) << 32 | u64::from(self.pstates),
@@ -103,7 +121,30 @@ impl Taken {
                 | u64::from(link.width()) << 16
                 | u64::from(link.aspm()) << 14
                 | u64::from(link.speeds & 0x3ff),
+            u64::from(self.boost.status as u32) << 32 | u64::from(self.boost.accepted != 0),
         ]
+    }
+}
+
+/// The boosts to the highest P-state RM accepted in a beat's rounds, and
+/// the errno of the boost control once RM refused it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Boost {
+    /// Boosts RM accepted.
+    pub accepted: u32,
+    /// The errno of the refused control, else zero.
+    pub status: i32,
+}
+
+/// ` boost=max` for a beat RM accepted a boost in, ` boost=refused(error E)`
+/// once it refused one, and nothing before nouveau asked for any.
+impl fmt::Display for Boost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.status, self.accepted) {
+            (0, 0) => Ok(()),
+            (0, _) => f.write_str(" boost=max"),
+            (error, _) => write!(f, " boost=refused(error {error})"),
+        }
     }
 }
 
@@ -199,8 +240,8 @@ impl fmt::Display for Pstates {
     }
 }
 
-/// `pstate=P8 seen=P5+P8 <link> rounds=N`, or
-/// `pstate=unknown(error E) <link> rounds=N`.
+/// `pstate=P8 seen=P5+P8 <link><boost> rounds=N`, or
+/// `pstate=unknown(error E) <link><boost> rounds=N`.
 impl fmt::Display for Taken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.status {
@@ -212,7 +253,7 @@ impl fmt::Display for Taken {
             )?,
             error => write!(f, "pstate=unknown(error {error})")?,
         }
-        write!(f, " {} rounds={}", self.link, self.rounds)
+        write!(f, " {}{} rounds={}", self.link, self.boost, self.rounds)
     }
 }
 
@@ -254,7 +295,7 @@ mod spin_cell {
 
     pub struct Cell {
         held: AtomicBool,
-        value: UnsafeCell<Option<[u64; 2]>>,
+        value: UnsafeCell<Option<[u64; 3]>>,
     }
 
     // SAFETY: `replace` holds `held` for every access to the value.
@@ -269,7 +310,7 @@ mod spin_cell {
         }
 
         /// Stores `value`, giving the one before.
-        pub fn replace(&self, value: [u64; 2]) -> Option<[u64; 2]> {
+        pub fn replace(&self, value: [u64; 3]) -> Option<[u64; 3]> {
             while self
                 .held
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)

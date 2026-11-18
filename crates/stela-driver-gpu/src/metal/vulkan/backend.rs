@@ -444,6 +444,29 @@ pub trait Backend {
     /// `vkGetCalibratedTimestampsKHR`: (host nanoseconds, GPU ticks).
     fn calibrated_timestamps(&mut self) -> Result<(u64, u64)>;
 
+    /// Imports the display's scanout buffer `handle`, the dma-buf `fd` of
+    /// `bytes`, for [`Self::compose`] to write: the driver takes the
+    /// descriptor on success, and the caller keeps it on failure. A backend
+    /// that composes no display frames refuses.
+    fn import_compose_target(&mut self, _handle: u32, _fd: i32, _bytes: u64) -> Result<()> {
+        Err(Error::Unsupported("display compose"))
+    }
+    /// Composes a display frame ([`crate::metal::compose`]) on the queue,
+    /// after the work submitted before it.
+    fn compose(
+        &mut self,
+        _job: &crate::metal::compose::Job<'_>,
+    ) -> Result<crate::metal::compose::Submitted> {
+        Err(Error::Unsupported("display compose"))
+    }
+    /// The host's view of the compose marker, which holds the low 32 bits
+    /// of the last composed frame's ticket once the GPU finished it,
+    /// readable from any processor while the backend lives; `None` before
+    /// the first scanout buffer was imported.
+    fn compose_marker(&self) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
+        None
+    }
+
     /// Gives the backend the platform's tick counter, which times the
     /// phases of its own calls that [`Self::take_split`] answers.
     fn set_clock(&mut self, _ticks: fn() -> u64) {}

@@ -7,6 +7,14 @@
 //! each submitted swap to a host [`scanout::Scanout`]. It never runs
 //! `ipad14dcp` firmware.
 //!
+//! Each coprocessor is one display pipe. A boot asking for a second display
+//! (`--second-display`) places a second, independent instance for the
+//! J473AP's DCP-role pipe `disp0` (`/arm-io/dcp`, its own DARTs, mailbox
+//! IRQs, scanout, vblank and log): [`ExternalIdentity::Disp0`] answers
+//! IOMFB as a display that is not the main one, with its own framebuffer ID,
+//! a DisplayPort monitor ([`modes::Advertised::transport`]) and its own
+//! AVIPC interface name, and its log lines read `DCP disp0 ...` ([`Log::Pipe`]).
+//!
 //! The public sources are Asahi Linux `drivers/gpu/drm/apple/` and m1n1
 //! `proxyclient/m1n1/fw/dcp/` and `src/dcp/`. The DCPEXT nub is
 //! `quiesced` and `user-power-managed`, so (like the SMC) the coprocessor
@@ -178,6 +186,10 @@ pub enum Log {
     },
     /// Entries dropped while the log was full.
     Dropped(u64),
+    /// An entry of the second display's coprocessor (`disp0`), whose lines
+    /// read `DCP disp0 ...` so that a boot log tells the two displays apart;
+    /// the main display's entries stay as they always were.
+    Pipe { pipe: &'static str, entry: Box<Log> },
 }
 
 /// A callback tag and its name, which every interface shares.
@@ -376,6 +388,19 @@ impl core::fmt::Display for Log {
                 "DCP AFK ep={endpoint:#x} {name} sent interface={interface:#x} bytes={bytes:#x} type={packet_type:#x} category={category} command_sequence={command_sequence:x?} status={status:x?}"
             ),
             Log::Dropped(count) => write!(f, "DCP log dropped {count} entries"),
+            Log::Pipe { pipe, entry } => {
+                let text = alloc::format!("{entry}");
+                for (index, line) in text.split('\n').enumerate() {
+                    if index > 0 {
+                        f.write_str("\n")?;
+                    }
+                    match line.strip_prefix("DCP ") {
+                        Some(rest) => write!(f, "DCP {pipe} {rest}")?,
+                        None => write!(f, "DCP {pipe} {line}")?,
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -458,6 +483,9 @@ pub struct Coprocessor {
     rtkit: RtKit,
     link: Shared,
     afk: Vec<Rc<RefCell<afk::Afk>>>,
+    /// The pipe the log names this coprocessor's entries with: the second
+    /// display's ([`Log::Pipe`]); none for the main display.
+    pipe: Option<&'static str>,
 }
 
 impl Coprocessor {
@@ -482,7 +510,7 @@ impl Coprocessor {
     ) -> Result<Self> {
         let interface = abi::interface(build.dcp_link_version)?;
         Self::with_identity(
-            iomfb::Methods::new(scanout, interface),
+            iomfb::Methods::new(scanout, interface).identified(identity),
             window,
             identity,
             build,
@@ -523,7 +551,13 @@ impl Coprocessor {
             .collect();
         endpoints.push((IOMFB_ENDPOINT, Box::new(Iomfb(link.clone()))));
         let rtkit = RtKit::new(endpoints, build.rtkit_version)?;
-        Ok(Self { rtkit, link, afk })
+        let pipe = (identity == ExternalIdentity::Disp0).then_some("disp0");
+        Ok(Self {
+            rtkit,
+            link,
+            afk,
+            pipe,
+        })
     }
 
     /// The coprocessor was used and quiesced by the boot chain.
@@ -552,8 +586,20 @@ impl Coprocessor {
             .set_swap_tracing(enabled);
     }
 
-    /// The next display-log entry.
+    /// The next display-log entry, named with its pipe on the second
+    /// display ([`Log::Pipe`]).
     pub fn take_log(&mut self) -> Option<Log> {
+        let entry = self.take_entry()?;
+        Some(match self.pipe {
+            Some(pipe) => Log::Pipe {
+                pipe,
+                entry: Box::new(entry),
+            },
+            None => entry,
+        })
+    }
+
+    fn take_entry(&mut self) -> Option<Log> {
         if let Some(entry) = self.link.borrow_mut().service_mut().take_log() {
             return Some(entry);
         }
@@ -615,10 +661,14 @@ impl Coprocessor {
             .compose(now, page, resolve)
     }
 
-    /// Finish the present a compose left once it ended
+    /// Finish at counter `now` the present a compose left once it ended,
+    /// or once the host GPU it handed the frame to is done
     /// ([`iomfb::Methods::finish_compose`]).
-    pub fn finish_compose(&mut self) -> Result<bool> {
-        self.link.borrow_mut().service_mut().finish_compose(0)
+    pub fn finish_compose(&mut self, now: u64) -> Result<bool> {
+        let mut link = self.link.borrow_mut();
+        let methods = link.service_mut();
+        methods.observe(now);
+        methods.finish_compose(0)
     }
 
     pub fn present(&mut self, now: u64, port: &mut Port<'_, '_>) -> Result<()> {

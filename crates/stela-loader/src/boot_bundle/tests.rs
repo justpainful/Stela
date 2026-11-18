@@ -772,6 +772,7 @@ fn lays_out_sptm_regions_and_patch_slots() -> Result<()> {
             property: "aperture-count".into(),
             value: 1u32.to_le_bytes().to_vec(),
         }],
+        second_display: false,
     };
     // DRAM must sit at the target board's base: an M2 Pro's placement is
     // refused for the M2, whose own base `placed_at` restores.

@@ -65,6 +65,42 @@ impl Host {
     pub fn shutdown(&mut self) -> Result<(), RetirementError> {
         self.owner.close()
     }
+
+    /// Start a cyclic analog playback stream on `route` of `graph`, one of
+    /// this controller's codecs (`lifetime::Native::start_output`).
+    pub fn start_output(
+        &mut self,
+        graph: &CodecGraph,
+        route: &hda::AnalogRoute,
+        format: audio::PcmFormat,
+        period_bytes: usize,
+        periods: usize,
+        options: hda::PinOptions,
+    ) -> Result<hda::StreamId, RetirementError> {
+        self.owner
+            .start_output(graph, route, format, period_bytes, periods, options)
+    }
+
+    /// A running output's link position in bytes.
+    pub fn output_position(&mut self, id: hda::StreamId) -> Result<u32, RetirementError> {
+        self.owner.output_position(id)
+    }
+
+    /// PCM for a running output at `offset`, in whole aligned words, kept
+    /// clear of its position and FIFO by the caller.
+    pub fn write_output(
+        &mut self,
+        id: hda::StreamId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), RetirementError> {
+        self.owner.write_output(id, offset, bytes)
+    }
+
+    /// How far past its position the output's controller may have fetched.
+    pub fn output_fifo_bytes(&mut self, id: hda::StreamId) -> Result<u16, RetirementError> {
+        self.owner.output_fifo_bytes(id)
+    }
 }
 struct ColdOwner {
     requester: Option<crate::bus::pci::requester::preparation::PreparingRequester>,
@@ -139,6 +175,42 @@ pub(in crate::probe) unsafe fn attach(
             ));
         }
     };
+    // Linux azx_probe's pci_enable_device: the mapped preflight reads the
+    // function in D0 with memory decode on, which firmware or the native
+    // mount may have left off (a parked PCH controller in D3hot).
+    let timing = audio::Timing::new(clock, cold.minimum.as_ref().unwrap().clone());
+    // SAFETY: this attach's exclusive original owner of the function, its
+    // reserved BAR0 just mapped; the identity check inside refuses a DSP.
+    if let Err(error) = unsafe {
+        hda::pci::enable_for_mapped_preflight(
+            cold.requester.as_mut().unwrap().function_mut(),
+            bar,
+            &timing,
+        )
+    } {
+        return Err((
+            Error::HdaNative(RetirementError::Pci(error)),
+            Some(Box::new(cold)),
+        ));
+    }
+    // The configuration epoch the cold grant is bound to, read before any
+    // later device write; `Native` checks it again before binding.
+    let retained = match cold
+        .requester
+        .as_mut()
+        .unwrap()
+        .function_mut()
+        .config()
+        .retain_epoch()
+    {
+        Ok(retained) => retained,
+        Err(e) => {
+            return Err((
+                Error::Native(ServiceError::Mapping(e)),
+                Some(Box::new(cold)),
+            ));
+        }
+    };
     let registers = Bar0 {
         // SAFETY: exactly this original owned UC BAR0; Native outer owner
         // keeps actual mapping across constructor error and callback unwind.
@@ -152,10 +224,10 @@ pub(in crate::probe) unsafe fn attach(
         clock: audio::Timing::new(clock, cold.minimum.take().unwrap()),
         pages: services.pages(),
         bar,
-        // No native original-owner IRQ/CPU/EOI/service/work completion producer
-        // exists. Post-EBS serialization, source masks or polled operation do
-        // not construct one; Native retains/refuses before root drain/bind.
-        original_users: None,
+        // SAFETY: the caller attaches after ExitBootServices to a function
+        // the native mount parked (the cold grant, as VMD's); `retained` is
+        // this attach's own epoch, which Native checks before root drain/bind.
+        original_users: Some(unsafe { lifetime::OriginalUsers::cold_grant(retained) }),
     };
     let mut owner = match Native::new(inputs) {
         Ok(owner) => owner,

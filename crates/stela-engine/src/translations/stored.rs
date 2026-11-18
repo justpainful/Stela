@@ -131,6 +131,14 @@ impl StoredRecord {
         Reader(body.get(start as usize..)?).entry().ok()
     }
 
+    /// Whether it holds an entry at `offset` in `context`, without decoding
+    /// it: a block translated ahead would only repeat it.
+    pub fn holds(&self, offset: u16, context: &Digest) -> bool {
+        self.index
+            .binary_search_by(|entry| (entry.offset, &entry.context).cmp(&(offset, context)))
+            .is_ok()
+    }
+
     /// The entries it holds.
     pub fn len(&self) -> usize {
         self.index.len()

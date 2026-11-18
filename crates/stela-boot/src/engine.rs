@@ -16,6 +16,7 @@ use stela_contracts::refuse;
 mod start;
 pub(crate) use start::entry;
 mod aml;
+mod audio;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
@@ -55,6 +56,7 @@ mod store_file;
 mod topology;
 pub(crate) mod translations;
 mod usb;
+mod workers;
 pub(crate) mod xstate;
 
 use crate::{
@@ -724,13 +726,17 @@ fn devices(
     board: Option<&board::Board>,
     inputs: mount::Inputs<'_>,
     memory: Option<MemoryResources>,
+    more_scanouts: Vec<alloc::boxed::Box<dyn stela_soc::machine::Scanout>>,
 ) -> Result<(AppleDevices, Option<stela_soc::machine::UsbId>)> {
     if let Some(board) = board {
-        return mount::devices_with_memory(
+        // `inputs.scanout` shows the main pipe; `more_scanouts` the board's
+        // further display pipes in order (`--second-display`'s `disp0`).
+        return mount::devices_with_displays(
             board,
             GuestConsole::default(),
             inputs,
             memory,
+            more_scanouts,
             &mut |arguments| output::arguments(arguments),
         );
     }
@@ -1171,6 +1177,7 @@ struct RunIo {
     host_input: Option<input::HostInput>,
     host_usb: Option<usb::HostUsb>,
     host_bluetooth: Option<bluetooth::HostBluetooth>,
+    host_audio: Option<audio::HostAudio>,
     guest_network: Option<network::GuestNetwork>,
     host_nor: Option<nor::HostNor>,
     host_disks: storage::HostDisks,
@@ -1247,6 +1254,7 @@ fn run_machine<H: Host>(
         host_input,
         host_usb,
         host_bluetooth,
+        host_audio,
         guest_network,
         host_nor,
         host_disks,
@@ -1265,6 +1273,7 @@ fn run_machine<H: Host>(
             input: host_input,
             usb: host_usb,
             bluetooth: host_bluetooth,
+            audio: host_audio,
         },
         guest_network,
         host_nor,

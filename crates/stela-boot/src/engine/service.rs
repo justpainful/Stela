@@ -30,7 +30,7 @@
 //! [`LATE_MILLIS`] is named in the `HOST SERVICE SLOW` line with what
 //! waited; a wait that began before the part is the turn's, in one
 //! `HOST SERVICE LATE` line.
-use super::{bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
+use super::{audio, bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
 use alloc::{format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
@@ -95,14 +95,16 @@ const ANCHOR_SECONDS: u64 = 600;
 const DEFERRED_MILLIS: u64 = 20;
 
 /// The parts a turn runs, in order: the inputs first, as a pointer's motion
-/// is what the guest's user waits on.
+/// is what the guest's user waits on, then the guest's sound, whose fill
+/// ahead of the host's controller lasts tens of milliseconds.
 const INPUTS: usize = 0;
-const LOGS: usize = 1;
-const NETWORK: usize = 2;
-const BLUETOOTH: usize = 3;
-const NOR: usize = 4;
-const RESTORE: usize = 5;
-const TURN_PARTS: usize = 6;
+const AUDIO: usize = 1;
+const LOGS: usize = 2;
+const NETWORK: usize = 3;
+const BLUETOOTH: usize = 4;
+const NOR: usize = 5;
+const RESTORE: usize = 6;
+const TURN_PARTS: usize = 7;
 
 /// The host interfaces the service owns for the whole run.
 pub(super) struct Service {
@@ -111,6 +113,7 @@ pub(super) struct Service {
     input: Option<input::HostInput>,
     usb: Option<usb::HostUsb>,
     bluetooth: Option<bluetooth::HostBluetooth>,
+    audio: Option<audio::HostAudio>,
     network: Option<network::GuestNetwork>,
     nor: Option<nor::HostNor>,
     power: power::HostPowerControl,
@@ -129,11 +132,13 @@ pub(super) struct Service {
 }
 
 /// The host's keyboards and pointers, the USB controllers new ones arrive
-/// on, and the Bluetooth controller behind the guest's.
+/// on, the Bluetooth controller behind the guest's, and the sound behind
+/// the guest's headset.
 pub(super) struct Peripherals {
     pub input: Option<input::HostInput>,
     pub usb: Option<usb::HostUsb>,
     pub bluetooth: Option<bluetooth::HostBluetooth>,
+    pub audio: Option<audio::HostAudio>,
 }
 
 impl Service {
@@ -144,6 +149,7 @@ impl Service {
             input,
             usb,
             bluetooth,
+            audio,
         }: Peripherals,
         network: Option<network::GuestNetwork>,
         nor: Option<nor::HostNor>,
@@ -159,6 +165,7 @@ impl Service {
             input,
             usb,
             bluetooth,
+            audio,
             network,
             nor,
             power,
@@ -233,6 +240,7 @@ impl Service {
             input,
             usb,
             bluetooth,
+            audio,
             network,
             nor,
             power,
@@ -350,6 +358,17 @@ impl Service {
                     *input_peak = Some(input_turn);
                 }
             }
+        }
+        if let Some(audio) = audio.as_mut().filter(|_| due(AUDIO, true, &mut turn)) {
+            // The guest's frames are copied under the devices' lock, and
+            // written to the controller outside it.
+            devices.with(|devices| audio.take(devices));
+            audio.play();
+            audio.record();
+            if audio.has_samples() {
+                devices.with(|devices| audio.give(devices));
+            }
+            lap.part(Part::Audio);
         }
         if due(LOGS, true, &mut turn) {
             // The logs' disks are looked at without waiting for the host
@@ -472,6 +491,9 @@ impl Service {
                 Some(network) => network.report(),
                 None => network::report_absent(),
             }
+            if let Some(audio) = audio.as_ref() {
+                audio.report();
+            }
             power.disks().report(*tsc_hz);
             *reported = stamp;
         }
@@ -500,9 +522,11 @@ enum Part {
     /// The NOR's stores and the power button.
     Nor,
     Log,
+    /// The guest's sound to the host's controller.
+    Audio,
 }
 
-const PARTS: usize = 8;
+const PARTS: usize = 9;
 const NAMES: [&str; PARTS] = [
     "read",
     "restore",
@@ -512,6 +536,7 @@ const NAMES: [&str; PARTS] = [
     "bluetooth",
     "nor",
     "log",
+    "audio",
 ];
 
 /// The longest each part took since the last [`report`], in counter ticks.

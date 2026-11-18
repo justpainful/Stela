@@ -238,3 +238,64 @@ fn a_frame_that_missed_its_buffer_is_dropped_and_ends_multiple_fetch() {
         "{line}"
     );
 }
+
+/// A full transmit ring refuses the send and rings the doorbell once
+/// more, as Linux's `rtl_tx` does while sent descriptors are still queued
+/// ("TxPoll requests are lost when the Tx packets are too close"): a ring
+/// whose last request was lost would otherwise never move again. The ring
+/// itself is left as it was.
+#[test]
+fn a_full_transmit_ring_refuses_the_send_and_asks_the_chip_again() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; 262_144];
+    registers[PHY_STATUS / 4] = u32::from(LINK_STATUS) << (8 * (PHY_STATUS % 4));
+    let mut net = modelled(&mut registers, &mut memory, false);
+    net.transmit.initialize(false);
+    for sequence in 0..DESCRIPTORS {
+        assert_eq!(net.transmit(&[sequence as u8; 60]), Ok(()));
+    }
+    let poll = |registers: &[u32]| registers[TX_POLL / 4].to_le_bytes()[TX_POLL % 4];
+    let descriptors = net.transmit.descriptors.bytes().to_vec();
+    registers[TX_POLL / 4] = 0;
+    assert_eq!(net.transmit(&[0xee; 60]), Err(LinkError::Busy));
+    assert_eq!(poll(&registers), POLL_NORMAL);
+    assert_eq!(net.transmit.descriptors.bytes(), descriptors);
+}
+
+/// A restart whose MAC reset never completes is refused and keeps both
+/// rings with the chip; a chip that reads all ones gets no write at all.
+#[test]
+fn an_adapter_restart_that_never_sees_its_reset_keeps_the_rings() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; 262_144];
+    registers[PHY_STATUS / 4] = u32::from(LINK_STATUS) << (8 * (PHY_STATUS % 4));
+    let mut net = modelled(&mut registers, &mut memory, false);
+    net.receive.initialize(true);
+    net.transmit.initialize(false);
+    for _ in 0..DESCRIPTORS {
+        net.transmit(&[0x5a; 60]).unwrap();
+    }
+    let before = (
+        net.receive.descriptors.bytes().to_vec(),
+        net.transmit.descriptors.bytes().to_vec(),
+    );
+    let refused = net.recover();
+    assert!(
+        matches!(&refused, Err(LinkError::Adapter(why)) if why.contains("model restart")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        (
+            net.receive.descriptors.bytes().to_vec(),
+            net.transmit.descriptors.bytes().to_vec()
+        ),
+        before
+    );
+    assert_eq!(net.transmit(&[0; 60]), Err(LinkError::Busy));
+    drop(net);
+    let mut registers = vec![u32::MAX; 64];
+    let mut net = modelled(&mut registers, &mut memory, false);
+    assert!(matches!(net.recover(), Err(LinkError::Adapter(_))));
+    drop(net);
+    assert!(registers.iter().all(|&word| word == u32::MAX));
+}

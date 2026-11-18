@@ -103,35 +103,45 @@ pub(super) fn prepare_image(snapshot: &Snapshot) -> Result<EngineImage> {
     })
 }
 
-/// Reserve the engine's working memory and each physical worker's resources.
-/// The other cores start from a page below 1 MiB, taken first: a free one,
-/// or else a boot services page; firmware that left neither boots on one
-/// core.
-pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemory> {
-    let (cores, sipi, sipi_taken) = match cores {
-        1 => (1, 0, false),
+/// Reserve the engine's working memory and each physical worker's resources:
+/// `cores` executors, of which the first `runners` run PEs and the rest are
+/// compile workers. The other cores start from a page below 1 MiB, taken
+/// first: a free one, or else a boot services page; firmware that left
+/// neither boots on one core.
+pub(super) fn reserve(
+    cores: usize,
+    runners: usize,
+    ram: &[(usize, usize)],
+) -> Result<EngineMemory> {
+    let (cores, runners, sipi, sipi_taken) = match cores {
+        1 => (1, 1, 0, false),
         _ => match sipi_page() {
-            Some(page) => (cores, page, false),
+            Some(page) => (cores, runners, page, false),
             None => match boot_services_sipi_page() {
                 Some(page) => {
                     output::arguments(format_args!(
                         "HOST STARTUP PAGE {page:#x} taken from boot services memory: the \
                          firmware left no free page below 1 MiB\n"
                     ));
-                    (cores, page, true)
+                    (cores, runners, page, true)
                 }
                 None => {
                     crate::status::info(&format!(
                         "the firmware left no free memory below 1 MiB to start the other cores \
-                         from, so macOS runs on one of this PC's {cores}"
+                         from, so macOS runs on one of this PC's {runners}"
                     ));
-                    (1, 0, false)
+                    (1, 1, 0, false)
                 }
             },
         },
     };
+    if runners == 0 || runners > cores {
+        return Err(refuse!(
+            "the PE executors are none or more than the reserved"
+        ));
+    }
     let free = free_ram()?;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
+    let sizes = stela_boot_core::host_memory::sizes(free, cores, runners)?;
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M\n",
         free >> 20,
@@ -140,11 +150,11 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         sizes.pool >> 20,
         sizes.guest >> 20,
     ));
-    // Each claimed core owns a full native part. Check both ends before allocation.
+    // Each claimed core owns a native part. Check both ends before allocation.
     for slot in [0, cores - 1] {
         let part = crate::native_smp::resources::partition(
             cores,
-            cores,
+            runners,
             slot,
             sizes.code.bytes,
             sizes.pool,
@@ -181,6 +191,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     })?;
     let native_resources = NativeResources {
         cores: cores as u32,
+        runners: runners as u32,
         code_parts: sizes.code.parts,
         stacks,
         invocations,

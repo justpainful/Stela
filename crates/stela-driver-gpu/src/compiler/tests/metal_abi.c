@@ -1059,6 +1059,101 @@ static void kernel_stage_in_reads_dynamic_strides(void)
    ralloc_free(b.shader);
 }
 
+/* The compose kernel's memory: its arguments, three layers (4x2 BGRA over
+ * the screen, a 1x1 straight RGBA source widened to 2x2, a 1x1
+ * premultiplied extended-range one with its alpha byte at an unaligned
+ * address) and a 4x2 scanout whose rows are 32 bytes apart. */
+#define COMPOSE_BASE 0x200000ull
+#define COMPOSE_ARGUMENTS 0x0u
+#define COMPOSE_BOTTOM 0x200u
+#define COMPOSE_RGBA 0x300u
+#define COMPOSE_XR10 0x340u
+#define COMPOSE_ALPHA 0x380u
+#define COMPOSE_SCANOUT 0x400u
+#define COMPOSE_MEMORY 0x500u
+
+static uint8_t compose_memory[COMPOSE_MEMORY];
+
+static void compose_layer(unsigned index, uint32_t source, uint32_t stride, uint32_t flags,
+                          uint32_t source_side, uint32_t x, uint32_t y, uint32_t side,
+                          uint32_t columns_end, uint32_t rows_end)
+{
+   uint8_t *layer = compose_memory + COMPOSE_ARGUMENTS + STELA_METAL_COMPOSE_LAYERS +
+                    index * STELA_METAL_COMPOSE_LAYER_BYTES;
+   put64(layer + STELA_METAL_COMPOSE_SOURCE, COMPOSE_BASE + source);
+   put32(layer + STELA_METAL_COMPOSE_STRIDE, stride);
+   put32(layer + STELA_METAL_COMPOSE_FLAGS, flags);
+   put32(layer + STELA_METAL_COMPOSE_SOURCE_WIDTH, source_side == 4 ? 4 : source_side);
+   put32(layer + STELA_METAL_COMPOSE_SOURCE_HEIGHT, source_side == 4 ? 2 : source_side);
+   put32(layer + STELA_METAL_COMPOSE_X, x);
+   put32(layer + STELA_METAL_COMPOSE_Y, y);
+   put32(layer + STELA_METAL_COMPOSE_WIDTH_SHOWN, side == 4 ? 4 : side);
+   put32(layer + STELA_METAL_COMPOSE_HEIGHT_SHOWN, side == 4 ? 2 : side);
+   put32(layer + STELA_METAL_COMPOSE_COLUMNS_END, columns_end);
+   put32(layer + STELA_METAL_COMPOSE_ROWS_END, rows_end);
+}
+
+static void compose_blends_each_layer_as_the_cpu_compose(void)
+{
+   nir_shader *shader = stela_metal_compose_kernel(NULL);
+   check_kernel(shader);
+   memset(compose_memory, 0, sizeof(compose_memory));
+   uint8_t *arguments = compose_memory + COMPOSE_ARGUMENTS;
+   put64(arguments + STELA_METAL_COMPOSE_DESTINATION, COMPOSE_BASE + COMPOSE_SCANOUT);
+   put32(arguments + STELA_METAL_COMPOSE_COUNT, 8);
+   put32(arguments + STELA_METAL_COMPOSE_PITCH, 32);
+   put32(arguments + STELA_METAL_COMPOSE_WIDTH, 4);
+   put32(arguments + STELA_METAL_COMPOSE_FIRST_ROW, 0);
+   put32(arguments + STELA_METAL_COMPOSE_LAYER_COUNT, 3);
+   for (unsigned y = 0; y < 2; y++)
+      for (unsigned x = 0; x < 4; x++)
+         put32(compose_memory + COMPOSE_BOTTOM + 16 * y + 4 * x, 0xff000000u | (x * 16 + y * 64));
+   compose_layer(0, COMPOSE_BOTTOM, 16, 0, 4, 0, 0, 4, 4, 2);
+   /* Red 200 at alpha 128, straight, widened over columns 2 and 3. */
+   put32(compose_memory + COMPOSE_RGBA, 0x800000c8u);
+   compose_layer(1, COMPOSE_RGBA, 4, STELA_METAL_COMPOSE_RGBA, 1, 2, 0, 2, 4, 2);
+   /* Codes 383, 385 and 1000 at alpha 0, premultiplied: added to what is
+    * below. The alpha byte lies between two others. */
+   put32(compose_memory + COMPOSE_XR10, 383u | 385u << 10 | 1000u << 20);
+   put32(compose_memory + COMPOSE_ALPHA, 0x33220011u);
+   compose_layer(2, COMPOSE_XR10, 4, STELA_METAL_COMPOSE_XR10 | STELA_METAL_COMPOSE_PREMULTIPLIED,
+                 1, 0, 1, 1, 1, 2);
+   uint8_t *xr10 = arguments + STELA_METAL_COMPOSE_LAYERS + 2 * STELA_METAL_COMPOSE_LAYER_BYTES;
+   put64(xr10 + STELA_METAL_COMPOSE_ALPHA, COMPOSE_BASE + COMPOSE_ALPHA + 1);
+   put32(xr10 + STELA_METAL_COMPOSE_ALPHA_STRIDE, 4);
+
+   uint8_t push[STELA_METAL_PUSH_BYTES] = {0};
+   put64(push + STELA_METAL_PUSH_ARGUMENTS, COMPOSE_BASE + COMPOSE_ARGUMENTS);
+   /* Thread 8 is past the count and writes nothing. */
+   for (unsigned thread = 0; thread < 9; thread++) {
+      const struct air_effect_environment environment = {
+         .base = COMPOSE_BASE, .bytes = compose_memory, .size = sizeof(compose_memory),
+         .push = push, .push_size = sizeof(push), .local_index = thread,
+      };
+      static struct air_effect_store trace[64];
+      struct air_effect_run run = air_effect_execute_in(shader, 100000, trace, ARRAY_SIZE(trace),
+                                                        &environment);
+      if (run.status != AIR_EFFECT_COMPLETE)
+         fprintf(stderr, "compose: %s\n", run.detail);
+      assert(run.status == AIR_EFFECT_COMPLETE);
+      assert(run.stores == (thread < 8 ? 1u : 0u));
+   }
+   const uint32_t expected[2][4] = {
+      /* 200 * 128 / 255 = 100 red; blue 32 and 48 under alpha 127. */
+      {0xff000000u, 0xff000010u, 0xff640010u, 0xff640018u},
+      /* 0 + 64 blue, 1 + 0 green, 255 red; blue 112 under alpha 127. */
+      {0xffff0140u, 0xff000050u, 0xff640030u, 0xff640038u},
+   };
+   for (unsigned y = 0; y < 2; y++)
+      for (unsigned x = 0; x < 4; x++) {
+         uint32_t pixel = get32(compose_memory + COMPOSE_SCANOUT + 32 * y + 4 * x);
+         if (pixel != expected[y][x])
+            fprintf(stderr, "compose (%u, %u): %08x, not %08x\n", x, y, pixel, expected[y][x]);
+         assert(pixel == expected[y][x]);
+      }
+   ralloc_free(shader);
+}
+
 int main(void)
 {
    glsl_type_singleton_init_or_ref();
@@ -1085,6 +1180,7 @@ int main(void)
    kernel_stage_in_reads_dynamic_strides();
    tessellation_control_reads_factors_by_step();
    attributes_decode_metal_vertex_formats();
+   compose_blends_each_layer_as_the_cpu_compose();
    glsl_type_singleton_decref();
    puts("metal abi: ok");
    return 0;

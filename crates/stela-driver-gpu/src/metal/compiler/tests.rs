@@ -503,6 +503,7 @@ fn service() -> Service {
         decode_pvrtc_kernel: kernel::<8>,
         reorder_blocks_kernel: kernel::<9>,
         decode_astc_kernel: kernel::<10>,
+        compose_kernel: kernel::<11>,
         release,
         buffer_reads,
         nir_options: [NonNull::dangling(); super::NIR_STAGES],
@@ -518,8 +519,8 @@ fn compiler(device: &PhysicalDevice) -> AirCompiler {
 fn internal_kernels_are_released_with_their_code() {
     // SAFETY: the fake service never reads the options.
     let kernels = unsafe { service().internal_kernels() }.unwrap();
-    let code: [usize; 11] = [
-        0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00, 0xb00,
+    let code: [usize; 12] = [
+        0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0x900, 0xa00, 0xb00, 0xc00,
     ];
     assert_eq!(kernels.code(), code.map(|code| ShaderCode(code as u64)));
     drop(kernels);

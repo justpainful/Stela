@@ -198,7 +198,10 @@ impl Shaped {
         };
         shaped.hand_off(inputs, options, boot_manifest.as_ref())?;
         let fused = variant.map(|variant| variant.name);
-        shaped.publish_platform(inputs, carveouts, fused)?;
+        let admission = board::Admission {
+            second_display: options.second_display,
+        };
+        shaped.publish_platform(inputs, carveouts, fused, admission)?;
         apply_overlay(&mut shaped.tree, &options.overlay)?;
         verify_boot_cpu(&shaped.tree, &original_tree, &shaped.boot_cpu)?;
         shaped
@@ -286,6 +289,7 @@ impl Shaped {
         inputs: &Inputs,
         carveouts: &[Placed],
         fused: Option<&'static str>,
+        admission: board::Admission,
     ) -> Result<()> {
         let tree = &mut self.tree;
         let unresolved = &mut self.unresolved;
@@ -346,7 +350,7 @@ impl Shaped {
                 });
             }
         }
-        self.hidden_devices = devices::hide_unmodeled(tree);
+        self.hidden_devices = devices::hide_unmodeled_under(tree, admission);
         if !self.hidden_devices.is_empty() {
             unresolved.push(format!(
                 "{} device admissions are restricted by missing models or providers (hidden_devices)",

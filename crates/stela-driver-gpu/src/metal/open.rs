@@ -270,6 +270,7 @@ pub unsafe fn stack(
             decode_pvrtc,
             reorder_blocks,
             decode_astc,
+            compose,
         ] = kernels.code();
         // The kernels last until the pipelines hold their own copies.
         built = Some((service, kernels));
@@ -285,6 +286,7 @@ pub unsafe fn stack(
             decode_pvrtc,
             reorder_blocks,
             decode_astc,
+            compose,
         })
     };
     // SAFETY: the caller guarantees the entry point, and the kernels are the

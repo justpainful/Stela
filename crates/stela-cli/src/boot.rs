@@ -1271,6 +1271,9 @@ impl Prepare {
                 .map(read_overlay)
                 .transpose()?
                 .unwrap_or_default(),
+            // A prepared bundle presents the one display the board always
+            // has; `--second-display` belongs to the boot that builds its own.
+            second_display: false,
         })
     }
 

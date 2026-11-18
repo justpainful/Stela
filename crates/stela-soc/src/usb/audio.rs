@@ -1,26 +1,39 @@
-//! A native high-speed USB audio output: a USB Audio Class 2.0 speaker
-//! whose PCM the machine owner plays on a host audio device.
+//! A native high-speed USB audio headset: a USB Audio Class 2.0 speaker
+//! whose PCM the machine owner plays on a host audio device, and a
+//! microphone whose samples the owner gives from a host capture device.
 //!
 //! Evidence: USB Audio Class 2.0 (Audio Device Class Definition, release
 //! 2.0): the Interface Association (4.6), the class-specific AC interface
-//! header (4.7.2), Clock Source (4.7.2.1), Input and Output Terminals
-//! (4.7.2.4-5), Feature Unit (4.7.2.8), the AS interface and isochronous
-//! endpoint descriptors (4.9.2, 4.10.1.2), the CUR and RANGE requests and
-//! their parameter blocks (5.2.1-5.2.3), the Clock Source frequency and
-//! validity controls (5.2.5.1.1-2) and the Feature Unit mute and volume
-//! controls (5.2.5.7.1-2); Frmts20 2.3.1 for Type I PCM (samples MSB first
-//! in little-endian subslots). macOS binds its own class driver to a
-//! UAC2 function, so this needs no Apple-specific audio hardware.
+//! header (4.7.2) and its function categories (A.7), Clock Source
+//! (4.7.2.1), Input and Output Terminals (4.7.2.4-5), Feature Unit
+//! (4.7.2.8), the AS interface and isochronous endpoint descriptors
+//! (4.9.2, 4.10.1.2), the CUR and RANGE requests and their parameter blocks
+//! (5.2.1-5.2.3), the Clock Source frequency and validity controls
+//! (5.2.5.1.1-2) and the Feature Unit mute and volume controls
+//! (5.2.5.7.1-2); Frmts20 2.3.1 for Type I PCM (samples MSB first in
+//! little-endian subslots); USB 2.0 5.12.4.2 for an asynchronous source
+//! endpoint, whose packet sizes carry its own clock. Termt20 2.2 for the
+//! microphone terminal type. macOS binds its own class driver to a UAC2
+//! function, so this needs no Apple-specific audio hardware.
 //!
-//! The function is one stereo output: a fixed internal 48 kHz clock (ID 1,
-//! frequency and validity read-only), a USB streaming input terminal (ID
-//! 2), a feature unit with master mute and volume (ID 3) and a speaker
-//! output terminal (ID 4). There is no input terminal, so the host sees no
-//! capture device. Interface 1 streams: alternate setting 1 carries 16-bit
-//! and setting 2 24-bit samples (3-byte subslots), each on isochronous OUT
+//! The function is a headset, one association of three interfaces sharing
+//! a fixed internal 48 kHz clock (ID 1, frequency and validity read-only).
+//! Playback is a USB streaming input terminal (ID 2), a feature unit with
+//! master mute and volume (ID 3) and a speaker output terminal (ID 4).
+//! Capture is a mono microphone input terminal (ID 5), a feature unit with
+//! master mute and volume (ID 6) and a USB streaming output terminal (ID
+//! 7). Mono is what voice applications take from a headset microphone, and
+//! halves the capture bandwidth.
+//!
+//! Interface 1 plays: alternate setting 1 carries 16-bit and setting 2
+//! 24-bit stereo samples (3-byte subslots), each on isochronous OUT
 //! endpoint 1, adaptive: the host sends at its own clock's rate and the
 //! owner absorbs the difference. Each 1 ms service interval carries up to
-//! one frame more than the nominal 48.
+//! one frame more than the nominal 48. Interface 2 captures with the same
+//! two settings, mono, on isochronous IN endpoint 2, asynchronous: the
+//! owner's source clock is the reference, and each 1 ms packet carries 47,
+//! 48 or 49 frames as the capture FIFO stands below, at or above its
+//! target, so the guest follows the source's rate.
 //!
 //! Received frames go to a ring of [`RING_FRAMES`] stereo frames, kept as
 //! 32-bit samples MSB-aligned. A packet arriving at a full ring drops the
@@ -28,6 +41,16 @@
 //! guest than the ring holds. The owner takes frames with [`Audio::take`],
 //! which applies mute and volume. A packet that splits a frame loses the
 //! split frame's bytes, counted.
+//!
+//! The owner gives microphone samples with [`Audio::give`], MSB-aligned
+//! 32-bit like playback, to a FIFO of [`MIC_FRAMES`] (60 ms); a full FIFO
+//! drops its oldest samples, counted. The guest selecting a capture
+//! setting trims the FIFO to its [`MIC_TARGET`] (20 ms) so capture starts
+//! that far behind the source, not with stale audio. An IN packet sends
+//! nothing (zero length, counted) until the FIFO first holds the target,
+//! and again after it runs dry, so a starved stream refills to the target
+//! rather than trickling a few frames per packet. Feature unit 6's mute
+//! and volume apply to the samples as they are sent.
 //!
 //! The clock frequency request accepts SET CUR of 48 kHz although the
 //! control is read-only, as some hosts write it regardless; any other
@@ -52,14 +75,29 @@ pub const RING_FRAMES: usize = RATE as usize / 5;
 /// Frames received since the owner last took any that make the function
 /// ask for a host service: 5 ms.
 const DUE_FRAMES: usize = RATE as usize / 200;
+/// The microphone's channels.
+pub const MIC_CHANNELS: usize = 1;
+/// Microphone frames the capture FIFO holds: 60 ms.
+pub const MIC_FRAMES: usize = RATE as usize * 3 / 50;
+/// The capture FIFO's fill the packet sizes steer toward: 20 ms.
+pub const MIC_TARGET: usize = RATE as usize / 50;
+/// How far from the target the fill may stand before a packet carries a
+/// frame more or less than nominal: 1 ms, so a source delivering in
+/// bursts does not swing every packet.
+const MIC_BAND: usize = NOMINAL_FRAMES;
 
 const STREAM: u8 = 0x01;
+const CAPTURE: u8 = 0x82;
 const CONTROL_INTERFACE: u16 = 0;
 const STREAM_INTERFACE: u16 = 1;
+const CAPTURE_INTERFACE: u16 = 2;
 const CLOCK: u8 = 1;
 const INPUT: u8 = 2;
 const FEATURE: u8 = 3;
 const OUTPUT: u8 = 4;
+const MIC: u8 = 5;
+const MIC_FEATURE: u8 = 6;
+const MIC_OUTPUT: u8 = 7;
 
 // Class-specific descriptor types and subtypes.
 const CS_INTERFACE: u8 = 0x24;
@@ -91,8 +129,10 @@ const UNITY: i64 = 1 << 30;
 
 /// The streaming settings: (alternate, subslot bytes, bit resolution).
 const SETTINGS: [(u8, u8, u8); 2] = [(1, 2, 16), (2, 3, 24)];
+/// Frames one 1 ms service interval carries nominally.
+const NOMINAL_FRAMES: usize = RATE as usize / 1000;
 /// Frames one service interval carries at most: the nominal 48 and one.
-const PACKET_FRAMES: usize = RATE as usize / 1000 + 1;
+const PACKET_FRAMES: usize = NOMINAL_FRAMES + 1;
 
 /// Counters for the owner's diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -116,22 +156,108 @@ pub struct Status {
     pub counters: Counters,
 }
 
+/// The microphone's counters for the owner's diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureCounters {
+    /// Frames the owner gave.
+    pub given: u64,
+    /// Frames dropped, oldest first: at a full FIFO, or beyond the target
+    /// when the guest starts capturing.
+    pub dropped: u64,
+    /// Frames sent to the guest.
+    pub sent: u64,
+    /// IN packets sent with no data: the FIFO empty, or still filling to
+    /// its target.
+    pub empty: u64,
+    /// Packets the FIFO ran dry in, sent short or empty.
+    pub underruns: u64,
+    /// Packets sized one frame over nominal: the FIFO above its target.
+    pub ahead: u64,
+    /// Packets sized one frame under nominal: the FIFO below its target.
+    pub behind: u64,
+}
+
+/// What the owner reports about the microphone stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureStatus {
+    /// The selected capture setting's bit resolution, 0 while idle.
+    pub bits: u8,
+    pub muted: bool,
+    /// 1/256 dB.
+    pub volume: i16,
+    pub counters: CaptureCounters,
+}
+
 pub struct Audio {
     control: Control,
     state: State,
 }
 
-struct State {
-    alternate: u8,
+/// A feature unit's master mute and volume.
+#[derive(Debug, Clone, Copy)]
+struct Level {
     muted: bool,
+    /// 1/256 dB.
     volume: i16,
     /// The volume's gain in Q30.
     gain: i64,
+}
+
+struct State {
+    alternate: u8,
+    speaker: Level,
     ring: VecDeque<[i32; CHANNELS]>,
     /// Frames received since the owner last took frames.
     fresh: usize,
     due: bool,
     counters: Counters,
+    capture_alternate: u8,
+    mic: Level,
+    fifo: VecDeque<i32>,
+    /// Whether the FIFO reached its target since it last ran dry.
+    primed: bool,
+    capture_counters: CaptureCounters,
+}
+
+/// One streaming interface's alternate settings: the zero-bandwidth
+/// setting and one per [`SETTINGS`] entry, linked to `terminal`, on
+/// isochronous `endpoint` with `attributes`.
+fn streaming(
+    number: u8,
+    terminal: u8,
+    channels: usize,
+    channel_config: u8,
+    endpoint: u8,
+    attributes: u8,
+    interval: u8,
+) -> Vec<Vec<u8>> {
+    let mut parts = vec![vec![9, INTERFACE, number, 0, 0, 1, 2, 0x20, 0]];
+    for (alternate, subslot, bits) in SETTINGS {
+        let [low, high] = ((PACKET_FRAMES * channels * usize::from(subslot)) as u16).to_le_bytes();
+        parts.push(vec![9, INTERFACE, number, alternate, 1, 1, 2, 0x20, 0]);
+        parts.push(vec![
+            16,
+            CS_INTERFACE,
+            AS_GENERAL,
+            terminal,
+            0,
+            1, // format type I
+            1, // PCM
+            0,
+            0,
+            0,
+            channels as u8,
+            channel_config,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        parts.push(vec![6, CS_INTERFACE, FORMAT_TYPE, 1, subslot, bits]);
+        parts.push(vec![7, ENDPOINT, endpoint, attributes, low, high, interval]);
+        parts.push(vec![8, CS_ENDPOINT, EP_GENERAL, 0, 0, 0, 0, 0]);
+    }
+    parts
 }
 
 fn descriptors() -> Descriptors {
@@ -211,58 +337,110 @@ fn descriptors() -> Descriptors {
         0,
         0,
     ];
-    let total = (9 + clock.len() + input.len() + feature.len() + output.len()) as u16;
+    // The microphone: one channel with no spatial position.
+    let mic = [
+        17,
+        CS_INTERFACE,
+        INPUT_TERMINAL,
+        MIC,
+        0x01,
+        0x02, // microphone
+        0,
+        CLOCK,
+        MIC_CHANNELS as u8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    // Master mute and volume read-write; no per-channel controls.
+    let mic_feature = [
+        14,
+        CS_INTERFACE,
+        FEATURE_UNIT,
+        MIC_FEATURE,
+        MIC,
+        0x0f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mic_output = [
+        12,
+        CS_INTERFACE,
+        OUTPUT_TERMINAL,
+        MIC_OUTPUT,
+        0x01,
+        0x01, // USB streaming
+        0,
+        MIC_FEATURE,
+        CLOCK,
+        0,
+        0,
+        0,
+    ];
+    let total = (9
+        + clock.len()
+        + input.len()
+        + feature.len()
+        + output.len()
+        + mic.len()
+        + mic_feature.len()
+        + mic_output.len()) as u16;
     let [total_low, total_high] = total.to_le_bytes();
-    // bcdADC 2.00, category desktop speaker.
+    // bcdADC 2.00, category headset.
     let header = [
         9,
         CS_INTERFACE,
         HEADER,
         0x00,
         0x02,
-        0x01,
+        0x04,
         total_low,
         total_high,
         0,
     ];
     let configuration = |interval: u8| {
-        let mut streams: Vec<Vec<u8>> = vec![vec![9, INTERFACE, 1, 0, 0, 1, 2, 0x20, 0]];
-        for (alternate, subslot, bits) in SETTINGS {
-            let [low, high] =
-                ((PACKET_FRAMES * CHANNELS * usize::from(subslot)) as u16).to_le_bytes();
-            streams.push(vec![9, INTERFACE, 1, alternate, 1, 1, 2, 0x20, 0]);
-            streams.push(vec![
-                16,
-                CS_INTERFACE,
-                AS_GENERAL,
-                INPUT,
-                0,
-                1, // format type I
-                1, // PCM
-                0,
-                0,
-                0,
-                CHANNELS as u8,
-                0x03,
-                0,
-                0,
-                0,
-                0,
-            ]);
-            streams.push(vec![6, CS_INTERFACE, FORMAT_TYPE, 1, subslot, bits]);
-            // Isochronous, adaptive, data.
-            streams.push(vec![7, ENDPOINT, STREAM, 0x09, low, high, interval]);
-            streams.push(vec![8, CS_ENDPOINT, EP_GENERAL, 0, 0, 0, 0, 0]);
-        }
+        // Isochronous, adaptive, data; isochronous, asynchronous, data.
+        let mut streams = streaming(
+            STREAM_INTERFACE as u8,
+            INPUT,
+            CHANNELS,
+            0x03,
+            STREAM,
+            0x09,
+            interval,
+        );
+        streams.extend(streaming(
+            CAPTURE_INTERFACE as u8,
+            MIC_OUTPUT,
+            MIC_CHANNELS,
+            0,
+            CAPTURE,
+            0x05,
+            interval,
+        ));
         let mut parts: Vec<&[u8]> = vec![
-            // One association of the control and streaming interfaces.
-            &[8, 0x0b, 0, 2, 1, 0, 0x20, 0],
+            // One association of the control and both streaming interfaces.
+            &[8, 0x0b, 0, 3, 1, 0, 0x20, 0],
             &[9, INTERFACE, 0, 0, 0, 1, 1, 0x20, 0],
             &header,
             &clock,
             &input,
             &feature,
             &output,
+            &mic,
+            &mic_feature,
+            &mic_output,
         ];
         parts.extend(streams.iter().map(Vec::as_slice));
         control::configuration(1, 0, &parts)
@@ -308,6 +486,67 @@ fn range(width: usize, min: i32, max: i32, resolution: i32) -> Vec<u8> {
     bytes
 }
 
+/// Whether a request's endpoint index names a streaming endpoint.
+fn isochronous(index: u16) -> bool {
+    index == u16::from(STREAM) || index == u16::from(CAPTURE)
+}
+
+/// The setting `alternate` selects: (subslot bytes, bit resolution).
+fn setting(alternate: u8) -> Option<(u8, u8)> {
+    SETTINGS
+        .iter()
+        .find(|(a, ..)| *a == alternate)
+        .map(|&(_, subslot, bits)| (subslot, bits))
+}
+
+impl Level {
+    const UNITY: Self = Self {
+        muted: false,
+        volume: VOLUME_MAX,
+        gain: UNITY,
+    };
+
+    /// `sample` with mute and volume applied.
+    fn apply(&self, sample: i32) -> i32 {
+        let gain = if self.muted { 0 } else { self.gain };
+        ((i64::from(sample) * gain) >> 30) as i32
+    }
+
+    /// A request to the unit's master channel.
+    fn request(
+        &mut self,
+        selector: u8,
+        request: u8,
+        read: bool,
+        data: &[u8],
+    ) -> Result<Outcome, Stall> {
+        match (selector, request, read) {
+            (MUTE, CUR, true) => Ok(Outcome::Data(vec![u8::from(self.muted)])),
+            (MUTE, CUR, false) if data.len() == 1 => {
+                self.muted = data[0] != 0;
+                Ok(Outcome::Done)
+            }
+            (VOLUME, CUR, true) => Ok(Outcome::Data(self.volume.to_le_bytes().to_vec())),
+            (VOLUME, RANGE, true) => Ok(Outcome::Data(range(
+                2,
+                i32::from(VOLUME_MIN),
+                i32::from(VOLUME_MAX),
+                i32::from(VOLUME_STEP),
+            ))),
+            (VOLUME, CUR, false) if data.len() == 2 => {
+                let asked = i16::from_le_bytes([data[0], data[1]]).clamp(VOLUME_MIN, VOLUME_MAX);
+                // Round down to a step: toward the minimum.
+                let steps = (i32::from(VOLUME_MAX) - i32::from(asked) + i32::from(VOLUME_STEP) - 1)
+                    / i32::from(VOLUME_STEP);
+                self.volume = (i32::from(VOLUME_MAX) - steps * i32::from(VOLUME_STEP)) as i16;
+                self.gain = gain(self.volume);
+                Ok(Outcome::Done)
+            }
+            _ => Err(Stall),
+        }
+    }
+}
+
 impl Default for Audio {
     fn default() -> Self {
         Self::new()
@@ -320,25 +559,30 @@ impl Audio {
             control: Control::new(descriptors()),
             state: State {
                 alternate: 0,
-                muted: false,
-                volume: VOLUME_MAX,
-                gain: UNITY,
+                speaker: Level::UNITY,
                 ring: VecDeque::with_capacity(RING_FRAMES),
                 fresh: 0,
                 due: false,
                 counters: Counters::default(),
+                capture_alternate: 0,
+                mic: Level::UNITY,
+                fifo: VecDeque::with_capacity(MIC_FRAMES),
+                primed: false,
+                capture_counters: CaptureCounters::default(),
             },
         }
     }
 
-    /// The selected setting's (subslot bytes, bit resolution), while the
-    /// guest streams.
+    /// The selected playback setting's (subslot bytes, bit resolution),
+    /// while the guest streams.
     fn setting(&self) -> Option<(u8, u8)> {
-        let alternate = self.state.alternate;
-        SETTINGS
-            .iter()
-            .find(|(a, ..)| *a == alternate && self.control.configuration() != 0)
-            .map(|&(_, subslot, bits)| (subslot, bits))
+        setting(self.state.alternate).filter(|_| self.control.configuration() != 0)
+    }
+
+    /// The selected capture setting's (subslot bytes, bit resolution),
+    /// while the guest captures.
+    fn capture_setting(&self) -> Option<(u8, u8)> {
+        setting(self.state.capture_alternate).filter(|_| self.control.configuration() != 0)
     }
 
     /// Whether the guest has a streaming setting selected.
@@ -346,12 +590,26 @@ impl Audio {
         self.setting().is_some()
     }
 
+    /// Whether the guest has a capture setting selected.
+    pub fn capturing(&self) -> bool {
+        self.capture_setting().is_some()
+    }
+
     pub fn status(&self) -> Status {
         Status {
             bits: self.setting().map_or(0, |(_, bits)| bits),
-            muted: self.state.muted,
-            volume: self.state.volume,
+            muted: self.state.speaker.muted,
+            volume: self.state.speaker.volume,
             counters: self.state.counters,
+        }
+    }
+
+    pub fn capture_status(&self) -> CaptureStatus {
+        CaptureStatus {
+            bits: self.capture_setting().map_or(0, |(_, bits)| bits),
+            muted: self.state.mic.muted,
+            volume: self.state.mic.volume,
+            counters: self.state.capture_counters,
         }
     }
 
@@ -360,14 +618,19 @@ impl Audio {
         self.state.ring.len()
     }
 
+    /// Microphone frames waiting for the guest.
+    pub fn capture_queued(&self) -> usize {
+        self.state.fifo.len()
+    }
+
     /// Moves up to `out.len()` frames to `out`, mute and volume applied;
     /// the number moved.
     pub fn take(&mut self, out: &mut [[i32; CHANNELS]]) -> usize {
         let state = &mut self.state;
         let n = out.len().min(state.ring.len());
-        let gain = if state.muted { 0 } else { state.gain };
+        let speaker = state.speaker;
         for (slot, frame) in out.iter_mut().zip(state.ring.drain(..n)) {
-            *slot = frame.map(|sample| ((i64::from(sample) * gain) >> 30) as i32);
+            *slot = frame.map(|sample| speaker.apply(sample));
         }
         state.fresh = 0;
         n
@@ -378,11 +641,38 @@ impl Audio {
     pub fn take_due(&mut self) -> bool {
         core::mem::take(&mut self.state.due)
     }
+
+    /// Queues mono microphone `samples`, MSB-aligned in 32 bits, for the
+    /// guest; a full FIFO drops its oldest, counted.
+    pub fn give(&mut self, samples: &[i32]) {
+        let state = &mut self.state;
+        for &sample in samples {
+            if state.fifo.len() == MIC_FRAMES {
+                state.fifo.pop_front();
+                state.capture_counters.dropped += 1;
+            }
+            state.fifo.push_back(sample);
+        }
+        state.capture_counters.given += samples.len() as u64;
+    }
 }
 
 impl State {
     fn select(&mut self, alternate: u8) {
         self.alternate = alternate;
+    }
+
+    /// The guest selecting capture setting `alternate`: starting from idle
+    /// trims the FIFO to its target, so capture starts that far behind the
+    /// source.
+    fn select_capture(&mut self, alternate: u8) {
+        if self.capture_alternate == 0 && alternate != 0 {
+            let excess = self.fifo.len().saturating_sub(MIC_TARGET);
+            self.fifo.drain(..excess);
+            self.capture_counters.dropped += excess as u64;
+        }
+        self.primed = false;
+        self.capture_alternate = alternate;
     }
 
     /// One isochronous OUT packet of `subslot`-byte samples.
@@ -412,6 +702,47 @@ impl State {
         }
     }
 
+    /// One isochronous IN packet of `subslot`-byte samples into `out`; the
+    /// bytes sent. Its size follows the FIFO's fill around the target.
+    fn send(&mut self, out: &mut [u8], subslot: usize) -> usize {
+        let fill = self.fifo.len();
+        let counters = &mut self.capture_counters;
+        if !self.primed {
+            if fill < MIC_TARGET {
+                counters.empty += 1;
+                return 0;
+            }
+            self.primed = true;
+        }
+        let size = if fill > MIC_TARGET + MIC_BAND {
+            counters.ahead += 1;
+            NOMINAL_FRAMES + 1
+        } else if fill + MIC_BAND < MIC_TARGET {
+            counters.behind += 1;
+            NOMINAL_FRAMES - 1
+        } else {
+            NOMINAL_FRAMES
+        };
+        let frame = subslot * MIC_CHANNELS;
+        let size = size.min(out.len() / frame);
+        let n = size.min(fill);
+        if n < size {
+            // Dry: what is left goes, then the FIFO refills to the target.
+            counters.underruns += 1;
+            self.primed = false;
+        }
+        if n == 0 {
+            counters.empty += 1;
+            return 0;
+        }
+        for (bytes, sample) in out.chunks_exact_mut(subslot).zip(self.fifo.drain(..n)) {
+            // The sample's top bytes, little-endian.
+            bytes.copy_from_slice(&self.mic.apply(sample).to_le_bytes()[4 - subslot..]);
+        }
+        counters.sent += n as u64;
+        n * frame
+    }
+
     /// A class request to an entity of the control interface.
     fn entity(&mut self, setup: Setup, data: &[u8]) -> Result<Outcome, Stall> {
         let entity = (setup.index >> 8) as u8;
@@ -424,29 +755,8 @@ impl State {
             }
             (CLOCK, SAM_FREQ, 0, CUR, false) if data == RATE.to_le_bytes() => Ok(Outcome::Done),
             (CLOCK, CLOCK_VALID, 0, CUR, true) => Ok(Outcome::Data(vec![1])),
-            (FEATURE, MUTE, 0, CUR, true) => Ok(Outcome::Data(vec![u8::from(self.muted)])),
-            (FEATURE, MUTE, 0, CUR, false) if data.len() == 1 => {
-                self.muted = data[0] != 0;
-                Ok(Outcome::Done)
-            }
-            (FEATURE, VOLUME, 0, CUR, true) => {
-                Ok(Outcome::Data(self.volume.to_le_bytes().to_vec()))
-            }
-            (FEATURE, VOLUME, 0, RANGE, true) => Ok(Outcome::Data(range(
-                2,
-                i32::from(VOLUME_MIN),
-                i32::from(VOLUME_MAX),
-                i32::from(VOLUME_STEP),
-            ))),
-            (FEATURE, VOLUME, 0, CUR, false) if data.len() == 2 => {
-                let asked = i16::from_le_bytes([data[0], data[1]]).clamp(VOLUME_MIN, VOLUME_MAX);
-                // Round down to a step: toward the minimum.
-                let steps = (i32::from(VOLUME_MAX) - i32::from(asked) + i32::from(VOLUME_STEP) - 1)
-                    / i32::from(VOLUME_STEP);
-                self.volume = (i32::from(VOLUME_MAX) - steps * i32::from(VOLUME_STEP)) as i16;
-                self.gain = gain(self.volume);
-                Ok(Outcome::Done)
-            }
+            (FEATURE, _, 0, ..) => self.speaker.request(selector, setup.request, read, data),
+            (MIC_FEATURE, _, 0, ..) => self.mic.request(selector, setup.request, read, data),
             _ => Err(Stall),
         }
     }
@@ -458,6 +768,9 @@ impl Requests for State {
         self.ring.clear();
         self.fresh = 0;
         self.due = false;
+        self.capture_alternate = 0;
+        self.fifo.clear();
+        self.primed = false;
         Ok(())
     }
 
@@ -468,13 +781,14 @@ impl Requests for State {
                 self.entity(setup, data)
             }
             (STANDARD, RECIPIENT_INTERFACE, GET_STATUS, true)
-                if setup.index <= STREAM_INTERFACE =>
+                if setup.index <= CAPTURE_INTERFACE =>
             {
                 Ok(Outcome::Data(vec![0, 0]))
             }
             (STANDARD, RECIPIENT_INTERFACE, GET_INTERFACE, true) => match setup.index {
                 CONTROL_INTERFACE => Ok(Outcome::Data(vec![0])),
                 STREAM_INTERFACE => Ok(Outcome::Data(vec![self.alternate])),
+                CAPTURE_INTERFACE => Ok(Outcome::Data(vec![self.capture_alternate])),
                 _ => Err(Stall),
             },
             (STANDARD, RECIPIENT_INTERFACE, SET_INTERFACE, false) => {
@@ -484,17 +798,19 @@ impl Requests for State {
                         self.select(alternate as u8);
                         Ok(Outcome::Done)
                     }
+                    (CAPTURE_INTERFACE, alternate @ 0..=2) => {
+                        self.select_capture(alternate as u8);
+                        Ok(Outcome::Done)
+                    }
                     _ => Err(Stall),
                 }
             }
             // An isochronous endpoint has no halt; the requests succeed.
-            (STANDARD, RECIPIENT_ENDPOINT, GET_STATUS, true)
-                if setup.index == u16::from(STREAM) =>
-            {
+            (STANDARD, RECIPIENT_ENDPOINT, GET_STATUS, true) if isochronous(setup.index) => {
                 Ok(Outcome::Data(vec![0, 0]))
             }
             (STANDARD, RECIPIENT_ENDPOINT, CLEAR_FEATURE | SET_FEATURE, false)
-                if setup.index == u16::from(STREAM) && setup.value == ENDPOINT_HALT =>
+                if isochronous(setup.index) && setup.value == ENDPOINT_HALT =>
             {
                 Ok(Outcome::Done)
             }
@@ -514,11 +830,18 @@ impl BusPeer for Audio {
         if endpoint == 0 {
             return self.control.packet(token, data, &mut self.state);
         }
-        Ok(match (endpoint, token, self.setting()) {
-            (STREAM, Token::Out, Some((subslot, _))) => {
-                self.state.receive(data, usize::from(subslot));
-                Reply::Ack(data.len())
-            }
+        Ok(match (endpoint, token) {
+            (STREAM, Token::Out) => match self.setting() {
+                Some((subslot, _)) => {
+                    self.state.receive(data, usize::from(subslot));
+                    Reply::Ack(data.len())
+                }
+                None => Reply::Stall,
+            },
+            (CAPTURE, Token::In) => match self.capture_setting() {
+                Some((subslot, _)) => Reply::Ack(self.state.send(data, usize::from(subslot))),
+                None => Reply::Stall,
+            },
             _ => Reply::Stall,
         })
     }

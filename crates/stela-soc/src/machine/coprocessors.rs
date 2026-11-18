@@ -240,6 +240,12 @@ impl AppleDevices {
     /// AP's wake once RTKit enumeration completes behind the boot-chain
     /// handoff. This does not admit DCPEXT in `stela_soc_data::board::models` (see
     /// `platform::apple::dcp`).
+    ///
+    /// The nub's `role` and `identity` say which display pipe this is: a
+    /// second call with the DCP-role pipe's (`DCP`,
+    /// [`stela_soc_data::dcp::ExternalIdentity::Disp0`]) places the second
+    /// display, an independent coprocessor with its own wrapper, mailbox
+    /// lines, DART streams, scanout, vblank and log beside the first.
     pub fn add_dcpext(
         &mut self,
         nub: DcpextNub,

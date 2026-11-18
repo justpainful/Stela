@@ -10,7 +10,7 @@ use crate::{
     usb::descriptor::Endpoint,
     usb::xhci::{Device, IsoStatus, IsoTransfer, Shared, SlotId},
 };
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 struct DiscoveryControl<'a> {
     shared: &'a Shared,
@@ -86,8 +86,20 @@ pub struct Native {
     capture: Arena,
     status_plan: Result<Option<super::status::StatusPlan>, super::Error>,
     connector_plan: Result<super::connector::ConnectorPlan, super::Error>,
+    /// The device descriptor's idVendor and idProduct.
+    identity: (u16, u16),
+    /// The device's place in the topology, as the xHCI owner names it.
+    location: String,
 }
 impl Native {
+    /// The device's idVendor and idProduct (USB 2.0 9.6.1).
+    pub fn identity(&self) -> (u16, u16) {
+        self.identity
+    }
+    /// The device's place in the topology, as the xHCI owner names it.
+    pub fn location(&self) -> &str {
+        &self.location
+    }
     pub(super) fn connector_status(
         &mut self,
         terminal: u8,
@@ -242,6 +254,11 @@ impl UsbAudio {
             capture: Arena::new(dma)?,
             status_plan,
             connector_plan,
+            identity: (
+                u16::from_le_bytes([device.descriptor[8], device.descriptor[9]]),
+                u16::from_le_bytes([device.descriptor[10], device.descriptor[11]]),
+            ),
+            location: device.location.clone(),
         };
         Self::new(native, binding, dma).map_err(|error| match error {
             super::Error::Transport(e) => e,
@@ -349,6 +366,8 @@ pub(crate) mod tests {
                 connector_plan: Err(super::super::Error::Unsupported(
                     "fixture has no connector binding",
                 )),
+                identity: (0, 0),
+                location: String::new(),
             };
             let ep = Endpoint {
                 address: 0x82,

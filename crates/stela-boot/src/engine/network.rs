@@ -26,7 +26,7 @@ use core::{
 use stela_contracts::refuse;
 use stela_drivers::{
     Clock,
-    net::{Link, LinkError, Mac},
+    net::{Link, LinkError, Mac, watchdog::Watchdog},
     probe::Adapter,
 };
 use stela_runtime::net::{
@@ -188,6 +188,29 @@ impl RootLink {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
         Some(self.arrived())
+    }
+
+    /// Whether the adapter's driver restarts it in place ([`Link::recover`]).
+    /// `probe::Adapter` does not pass `recover` on to its drivers, so the
+    /// one driver that has it, Realtek's, is named here.
+    fn recovers(&self) -> bool {
+        matches!(*self.device, Adapter::Realtek(_))
+    }
+
+    /// The adapter's state line, then its in-place restart
+    /// ([`Link::recover`]), for a service turn, as [`Self::transmit_now`]:
+    /// `None` while another processor is inside the host drivers. The
+    /// restart's waits are its driver's own, each bounded (an RTL8168H's
+    /// take milliseconds); no lock is waited for.
+    fn recover_now(&mut self) -> Option<(Option<String>, Result<(), LinkError>)> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        let state = self.device.diagnostic();
+        let result = match &mut *self.device {
+            Adapter::Realtek(device) => device.recover(),
+            device => device.recover(),
+        };
+        Some((state, result))
     }
 }
 
@@ -741,6 +764,21 @@ pub struct GuestNetwork {
     facts: stela_runtime::net::facts::Facts,
     /// Reports since the facts line was last looked at.
     facts_reports: u32,
+    /// What the host adapter's sends and receives did, in milliseconds
+    /// since [`Self::origin`], for its restart ([`Self::watch`]) and the
+    /// stall line ([`Self::report`]).
+    watchdog: Watchdog,
+    /// The counter origin of the watchdog's clock (`output::now`).
+    origin: u64,
+    /// The adapter's frame counts at the last report.
+    reported_frames: (u64, u64),
+    /// Whether a frame moved either way in the last report's interval.
+    moved: bool,
+    /// Reports in a row that found the adapter stalled.
+    stalled_reports: u32,
+    /// Service turns since the last report that found another processor
+    /// inside the host drivers and left the adapter alone.
+    lock_missed: u64,
 }
 
 /// Reports between two host adapter state lines while the guest receives
@@ -851,7 +889,18 @@ impl GuestNetwork {
             carrier_checked: 0,
             facts: Default::default(),
             facts_reports: 0,
+            watchdog: Watchdog::default(),
+            origin: output::now(),
+            reported_frames: (0, 0),
+            moved: false,
+            stalled_reports: 0,
+            lock_missed: 0,
         })
+    }
+
+    /// The watchdog's clock: milliseconds since the guest network opened.
+    fn millis(&self) -> u64 {
+        output::millis_since(self.origin)
     }
 
     pub fn mac(&self) -> Mac {
@@ -921,7 +970,17 @@ impl GuestNetwork {
     /// one, the adapter's own state line follows once a minute: a log that
     /// kept no early lines still shows whether its link, PHY, receive ring
     /// and interrupts work.
+    ///
+    /// The adapter is also stalled when no frame moved either way in the
+    /// report's interval while the guest's frames waited on its full
+    /// transmit ring, or right after an interval that moved frames with its
+    /// link up: an idle guest still sends. A stall says so with the
+    /// watchdog's times (`GUEST NETWORK stalled ...`) and the adapter's own
+    /// state line, at the first report and then once a minute, where the
+    /// counters alone, which only ever said whether frames had moved at
+    /// all, stopped for minutes with nothing said.
     pub fn report(&mut self) {
+        self.report_stall();
         // Once a minute, when they changed: whether the guest's lookups of
         // Apple's services were answered, its HTTPS connections to them
         // accepted or reset, TLS stopped with an alert, and its clock
@@ -974,33 +1033,122 @@ impl GuestNetwork {
         self.silent_reports = self.silent_reports.wrapping_add(1);
     }
 
+    /// [`Self::report`]'s stall lines.
+    fn report_stall(&mut self) {
+        let now = self.millis();
+        let frames = (self.link.frames.sent.get(), self.link.frames.received.get());
+        let moved = frames != core::mem::replace(&mut self.reported_frames, frames);
+        let moved_before = core::mem::replace(&mut self.moved, moved);
+        let lock_missed = core::mem::take(&mut self.lock_missed);
+        let busy = self.watchdog.busy_ms(now);
+        let waiting = !self.unsent.is_empty() || busy.is_some();
+        if moved || !(waiting || (self.carrier == Some(true) && moved_before)) {
+            self.stalled_reports = 0;
+            return;
+        }
+        if self.stalled_reports.is_multiple_of(SILENT_REPORTS) {
+            let ago = |ms: Option<u64>| ms.map_or(String::from("never"), |ms| format!("{ms}"));
+            output::arguments(format_args!(
+                "GUEST NETWORK stalled tx_busy_ms={} unsent={} last_tx_ms={} last_rx_ms={} \
+                 lock_missed={lock_missed} recoveries={}\n",
+                busy.unwrap_or(0),
+                self.unsent.len(),
+                ago(self.watchdog.since_sent(now)),
+                ago(self.watchdog.since_received(now)),
+                self.watchdog.recoveries()
+            ));
+            if let Some(Some(state)) = self.link.diagnostic_now() {
+                output::arguments(format_args!(
+                    "GUEST NETWORK host adapter stalled: {state}\n"
+                ));
+            }
+        }
+        self.stalled_reports = self.stalled_reports.wrapping_add(1);
+    }
+
     /// Read frames from the host adapter while the guest's receive queue
     /// had `room` and nothing read earlier still waits, without the devices'
     /// lock: the adapter's MMIO and DMA can wait milliseconds on the host.
     /// While another processor is inside the host drivers the frames wait
     /// in the adapter's ring for the next turn: a turn does not wait for
     /// the drivers' lock, which can be held for longer than a PE's exit
-    /// may take.
+    /// may take. Then the watchdog's turn ([`Self::watch`]).
     pub fn receive(&mut self, room: bool) {
+        self.read(room);
+        self.watch();
+    }
+
+    fn read(&mut self, room: bool) {
         if !room || !self.received.is_empty() {
             return;
         }
+        let now = self.millis();
         while self.received.len() < RECEIVE_BURST {
             let Some(received) = self.link.receive_now() else {
+                self.lock_missed = self.lock_missed.saturating_add(1);
                 break;
             };
             match received {
                 Ok(Some(frame)) => {
+                    self.watchdog.received(now);
                     self.facts.inbound(&frame);
                     self.received.push_back(frame);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    self.watchdog.empty(now);
+                    break;
+                }
                 Err(error) => {
                     self.refuse(error.into());
                     break;
                 }
             }
         }
+    }
+
+    /// Linux's transmit watchdog and `rtl_reset_work`, for a host adapter
+    /// whose driver restarts in place ([`RootLink::recovers`]): once a
+    /// frame has waited on its full transmit ring for 6 s with carrier, or
+    /// it received nothing for 30 s while the guest's frames left and went
+    /// unanswered after earlier traffic (`watchdog::Watchdog::due`), the
+    /// adapter is restarted, at most once per 30 s, and its state line
+    /// from just before is logged with the result. Its rings' frames are
+    /// dropped, as Linux drops them; the frames the guest queued that the
+    /// full ring refused ([`Self::unsent`]) are kept and sent first: they
+    /// are seconds old, and a late frame is no worse to the guest's stack
+    /// than one lost. A turn that finds another processor inside the host
+    /// drivers leaves the restart to a later turn.
+    fn watch(&mut self) {
+        if !self.link.recovers() {
+            return;
+        }
+        let now = self.millis();
+        let Some(stall) = self.watchdog.due(now, self.carrier == Some(true)) else {
+            return;
+        };
+        let Some((state, result)) = self.link.recover_now() else {
+            self.lock_missed = self.lock_missed.saturating_add(1);
+            return;
+        };
+        self.watchdog.recovered(now, stall);
+        let count = self.watchdog.recoveries();
+        if let Some(state) = state {
+            output::arguments(format_args!(
+                "GUEST NETWORK host adapter before recovery: {state}\n"
+            ));
+        }
+        match result {
+            Ok(()) => output::arguments(format_args!(
+                "GUEST NETWORK recovered the host adapter after {stall} (n={count})\n"
+            )),
+            Err(error) => output::arguments(format_args!(
+                "GUEST NETWORK host adapter recovery after {stall} failed: {} (n={count})\n",
+                NetError::from(error)
+            )),
+        }
+        // Its link is read again at the next turn, and logged: the log says
+        // whether the restarted adapter kept it.
+        self.carrier = None;
     }
 
     /// Give the guest the frames read so far while its receive queue has
@@ -1032,19 +1180,32 @@ impl GuestNetwork {
     /// does another processor inside the host drivers, whose lock a turn
     /// does not wait for. A frame sent while the host link has no carrier
     /// is dropped, as a NIC without a cable drops it: the guest sees the
-    /// link down ([`Self::carrier`]), and that is no refusal.
+    /// link down ([`Self::carrier`]), and that is no refusal. What each
+    /// send did is the watchdog's ([`Self::watch`]): a frame a full ring
+    /// keeps refusing is how a hung transmit shows.
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
         for frame in &frames {
             self.facts.outbound(frame);
         }
         self.unsent.extend(frames);
         let mut reusable = None;
+        let now = self.millis();
         while let Some(frame) = self.unsent.front() {
             match self.link.transmit_now(frame) {
-                Some(Ok(())) => {}
-                None | Some(Err(LinkError::Busy)) => break,
-                Some(Err(LinkError::NoCarrier)) => {}
-                Some(Err(error)) => self.refuse(error.into()),
+                Some(Ok(())) => self.watchdog.sent(now),
+                None => {
+                    self.lock_missed = self.lock_missed.saturating_add(1);
+                    break;
+                }
+                Some(Err(LinkError::Busy)) => {
+                    self.watchdog.busy(now);
+                    break;
+                }
+                Some(Err(LinkError::NoCarrier)) => self.watchdog.dropped(),
+                Some(Err(error)) => {
+                    self.watchdog.dropped();
+                    self.refuse(error.into());
+                }
             }
             reusable = self.unsent.pop_front();
         }

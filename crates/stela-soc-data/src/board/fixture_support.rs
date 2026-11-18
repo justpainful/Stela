@@ -282,3 +282,163 @@ pub fn power_states_fixture(
         implicit: Vec::new(),
     }
 }
+
+/// The aperture both pipes of [`two_display_pipelines`] share, translated.
+pub const SHARED_DISPLAY_APERTURE: (u64, u64) = (0x2_3b3d_0000, 0x4000);
+
+/// The J473AP's two display pipelines as its DeviceTree gives
+/// them (phandles, mapper streams, IRQs and apertures), the DCP-role
+/// one's nub marked `running` as the boot chain marks an admitted one, and
+/// its power expert present with `dcp_expert`. Both pipes end with one
+/// shared SoC aperture ([`SHARED_DISPLAY_APERTURE`]), as J473AP's
+/// `dispext0` and `disp0` end with the same three.
+pub fn two_display_pipelines(dcp_running: bool, dcp_expert: bool) -> Vec<u8> {
+    use stela_contracts::adt::encode;
+    const MODELED: [&str; 3] = [UART, WATCHDOG, "aic,2"];
+    let z = |text: &str| [text.as_bytes(), &[0]].concat();
+    let words = |cells: &[u32]| {
+        cells
+            .iter()
+            .flat_map(|c| c.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let pairs = |cells: &[u64]| {
+        cells
+            .iter()
+            .flat_map(|c| c.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let mapper = |name: &str, stream: u32, phandle: u32| {
+        encode(
+            &[
+                ("name", &z(name)),
+                ("compatible", &z(IOMMU_MAPPER)),
+                ("reg", &words(&[stream])),
+                ("AAPL,phandle", &words(&[phandle])),
+            ],
+            &[],
+        )
+    };
+    let dart = |name: &str, regs: &[u64], instance: &[u8], irq: u32, mappers: &[Vec<u8>]| {
+        encode(
+            &[
+                ("name", &z(name)),
+                ("compatible", &z(DART)),
+                ("reg", &pairs(regs)),
+                ("sid-count", &words(&[16])),
+                ("instance", instance),
+                ("interrupts", &words(&[irq])),
+                ("vm-base", &words(&[0, 8])),
+            ],
+            mappers,
+        )
+    };
+    let pipe_instances: &[u8] = b"TRAD\0\0\0\0DART\0\0\0\0UMMS\0\0\0\0SMMU\0\0\0\0";
+    let nub = |name: &str, running: bool| {
+        let mut props: Vec<(&str, &[u8])> = alloc::vec![
+            ("name", name.as_bytes()),
+            ("compatible", b"iop-nub,rtbuddy-v2\0"),
+            ("quiesced", &[]),
+        ];
+        if running {
+            props.extend([("pre-loaded", &[][..]), ("running", &[][..])]);
+        }
+        encode(&props, &[])
+    };
+    let expert = |name: &str, role: &[u8]| {
+        encode(
+            &[
+                ("name", &z(name)),
+                ("compatible", &z(DCP_EXPERT)),
+                ("role", role),
+                ("join-power-plane", &words(&[1])),
+            ],
+            &[],
+        )
+    };
+    let mut children = alloc::vec![
+        dart(
+            "dart-dcpext",
+            &[0x7130_c000, 0x4000],
+            b"TRAD\0\0\0\0DARTASC\0",
+            0x251,
+            &[mapper("mapper-dcpext", 5, 0xc8)],
+        ),
+        encode(
+            &[
+                ("name", &z("dcpext")),
+                ("compatible", &z(ASC)),
+                ("role", DCPEXT_ROLE),
+                ("interrupts", &words(&[0x242, 0x242, 0x245, 0x244])),
+                ("iommu-parent", &words(&[0xc8])),
+                ("truncate-dvas", &[]),
+                ("reg", &pairs(&[0x71c0_0000, 0x6c000, 0x7185_0000, 0x4000])),
+            ],
+            &[nub("iop-dcpext-nub\0", true)],
+        ),
+        expert("dcpext-expert", DCPEXT_ROLE),
+        dart(
+            "dart-dispext0",
+            &[0x7130_4000, 0x4000, 0x7130_0000, 0x4000],
+            pipe_instances,
+            0x251,
+            &[
+                mapper("mapper-dispext0", 0, 0xca),
+                mapper("mapper-dispext0-piodma", 4, 0xcb),
+            ],
+        ),
+        encode(
+            &[
+                ("name", &z("dispext0")),
+                ("compatible", &z(DISPEXT)),
+                ("reg", &pairs(&[0x7000_0000, 0x61c000, 0x3b3d_0000, 0x4000])),
+                ("iommu-parent", &words(&[0xca, 0xcb])),
+            ],
+            &[],
+        ),
+        dart(
+            "dart-dcp",
+            &[0x3130_c000, 0x4000],
+            b"TRAD\0\0\0\0DARTASC\0",
+            0x229,
+            &[mapper("mapper-dcp", 5, 0xbd)],
+        ),
+        encode(
+            &[
+                ("name", &z("dcp")),
+                ("compatible", &z(ASC)),
+                ("role", DCP_ROLE),
+                ("interrupts", &words(&[0x218, 0x217, 0x21a, 0x219])),
+                ("iommu-parent", &words(&[0xbd])),
+                ("hdcp-channels", &words(&[5, 6])),
+                ("dp-switch-ufp-endpoint", &words(&[0])),
+                ("reg", &pairs(&[0x31c0_0000, 0x6c000, 0x3185_0000, 0x4000])),
+            ],
+            &[nub("iop-dcp-nub\0", dcp_running)],
+        ),
+        dart(
+            "dart-disp0",
+            &[0x3130_4000, 0x4000, 0x3130_0000, 0x4000],
+            pipe_instances,
+            0x229,
+            &[
+                mapper("mapper-disp0", 0, 0xbf),
+                mapper("mapper-disp0-piodma", 4, 0xc0),
+            ],
+        ),
+        encode(
+            &[
+                ("name", &z("disp0")),
+                ("compatible", &z(DISP0)),
+                ("external", &words(&[1])),
+                ("reg", &pairs(&[0x3000_0000, 0x61c000, 0x3b3d_0000, 0x4000])),
+                ("iommu-parent", &words(&[0xbf, 0xc0])),
+            ],
+            &[],
+        ),
+    ];
+    if dcp_expert {
+        children.push(expert("dcp0-expert", DCP_ROLE));
+    }
+    tree_with_io(0x8112, "Apple M2", MODELED, &[], &children)
+}
