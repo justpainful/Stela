@@ -237,6 +237,9 @@ const SWAP_INFO_ID: usize = 0x38;
 const SWAP_INFO_BLOB: usize = 0xe0;
 /// The ticks per second of the counter refreshes are timed by.
 const COUNTER_HZ: u64 = crate::counter::FREQUENCY_HZ;
+/// How often the display looks for a frame the host GPU composes to be
+/// done ([`Methods::refresh_deadline`]): each look reads one marker word.
+const GPU_POLL_MICROS: u64 = 250;
 
 /// The counter ticks each pacing report covers.
 const PACING_WINDOW: u64 = 10 * COUNTER_HZ;
@@ -1276,7 +1279,20 @@ impl Methods {
                 .scanout
                 .as_ref()
                 .is_some_and(|scanout| scanout.queued());
-        (wanted && !self.shut_down).then_some(self.next_refresh)
+        let refresh = (wanted && !self.shut_down).then_some(self.next_refresh);
+        // A frame the host GPU composes is done in well under a
+        // millisecond, and its swaps complete only once a look sees it
+        // done ([`Self::finish_compose`]): looks come every
+        // [`GPU_POLL_MICROS`] meanwhile rather than at the next vblank,
+        // which left a 144 Hz desktop's frames 4-5 ms on the GPU's books.
+        let gpu = (self.gpu.is_some() && !self.shut_down).then(|| {
+            self.now
+                .saturating_add(COUNTER_HZ * GPU_POLL_MICROS / 1_000_000)
+        });
+        match (refresh, gpu) {
+            (Some(refresh), Some(gpu)) => Some(refresh.min(gpu)),
+            (refresh, gpu) => refresh.or(gpu),
+        }
     }
 
     /// Advance the display to counter `now`: flush what the scanout queued,

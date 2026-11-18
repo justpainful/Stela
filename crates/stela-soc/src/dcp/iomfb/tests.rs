@@ -2898,6 +2898,15 @@ fn a_frame_the_host_gpu_takes_completes_its_swap_only_once_the_gpu_is_done() {
         methods.observe(at);
         assert!(!methods.finish_compose(0).unwrap(), "poll {poll}");
         assert!(methods.composing());
+        // The next look comes within the GPU poll, not at the next vblank.
+        let poll_ticks = COUNTER_HZ * GPU_POLL_MICROS / 1_000_000;
+        assert!(
+            methods
+                .refresh_deadline()
+                .is_some_and(|due| due <= at + poll_ticks),
+            "poll {poll}: {:?}",
+            methods.refresh_deadline()
+        );
         assert!(!methods.frame.keeps(), "the kept rows are forgotten");
         assert!(
             methods.take_callback().is_none(),
