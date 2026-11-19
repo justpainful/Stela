@@ -14,8 +14,12 @@
 //! is kept [`TARGET_MS`] ahead in a [`RING_MS`] cyclic buffer whose played
 //! slots are zeroed, so a turn later than the fill plays silence, an
 //! underrun, and one later than the whole buffer is detected and zeroed;
-//! neither stops the stream. The guest's clock is followed by evenly
-//! spread drops or repeats (`host_audio::Pending`).
+//! neither stops the stream. The guest's clock is followed by resampling
+//! its frames, linearly and phase-continuous across turns, at a ratio
+//! within an eighth of one that eases toward what the queue and fill ask
+//! (`host_audio::Pending`, `StereoResampler`); the report's `stretched`
+//! is the net of the guest's frames taken past those played, as it was
+//! when drops and repeats made it up.
 //!
 //! The guest's mute and volume are applied by its headset as the frames are
 //! taken (`Audio::take`); the codec's path is left at 0 dB.
