@@ -7,9 +7,9 @@ use CoreClass::{Efficiency as E, Performance as P, Unknown as U};
 const ALDER_LAKE: [CoreClass; 20] = [P, P, P, P, P, P, P, P, E, E, E, E, P, P, P, P, P, P, P, P];
 
 #[test]
-fn a_hybrid_host_gets_every_efficiency_core_after_the_runners_by_default() {
-    assert_eq!(AUTO, 4);
-    assert_eq!(count(None, 8, &ALDER_LAKE), 4);
+fn a_hybrid_host_gets_two_efficiency_cores_after_the_runners_by_default() {
+    assert_eq!(AUTO, 2);
+    assert_eq!(count(None, 8, &ALDER_LAKE), 2);
     // One efficiency core after the runners gives one.
     assert_eq!(count(None, 11, &ALDER_LAKE), 1);
 }

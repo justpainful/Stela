@@ -1627,9 +1627,10 @@ struct SharedEntry {
 /// The part of the shared bound blocks translated ahead of execution may
 /// take, as one in this many: speculation never takes the room of blocks
 /// PEs ran, and the oldest of them are not evicted for it. A quarter left
-/// 73% of a desktop session's blocks translated ahead unpublished, with the
-/// shared store evicting little: half of it.
-pub const AHEAD_SHARE: usize = 2;
+/// 73% of a desktop session's blocks translated ahead unpublished; half
+/// still left 71% unpublished while the code cache churned five times as
+/// many new blocks a minute: a quarter.
+pub const AHEAD_SHARE: usize = 4;
 
 /// One local producer's shared offer, allocated and charged before the
 /// producer acquires the store lock.

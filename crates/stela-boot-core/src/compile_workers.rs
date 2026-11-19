@@ -19,13 +19,16 @@
 //! does both, so at least two run: one free for Linux while the other
 //! compiles. Workers also translate guest code ahead of its first run, and a
 //! desktop session kept both busy (6403 deferred compile jobs and 72 thousand
-//! translations dropped from a full queue in 2 h on an i7-12700KF), while its
-//! other two efficiency cores were parked: every efficiency core after the
-//! runners works by default.
+//! translations dropped from a full queue in 2 h on an i7-12700KF). All four
+//! of its efficiency cores translating ahead never emptied the queue (151
+//! million queued in 5.5 h, 14% of them ever run), and the PEs on the
+//! performance cores beside them lost a quarter of their speed: system exits
+//! took 4.4 us against 2.5 us with two workers, their table walks sharing
+//! the busier last-level cache. Two work by default.
 use crate::topology::CoreClass;
 
 /// Workers a boot starts when `--compile-workers` names no count.
-pub const AUTO: usize = 4;
+pub const AUTO: usize = 2;
 /// The most workers a boot starts.
 pub const MOST: usize = 4;
 
