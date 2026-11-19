@@ -18,6 +18,7 @@ pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
         MODELED_CORE_HZ, lock_scale, lock_scale_arguments, measure_core_hz,
     };
     let core_hz = measure_core_hz(tsc_hz);
+    super::speed::set_single_core_hz(core_hz);
     let scale = lock_scale(core_hz);
     output::arguments(format_args!(
         "GUEST TIMEOUTS lock_scale={scale} core_hz={core_hz} tsc_hz={tsc_hz} \
@@ -229,6 +230,7 @@ fn start(handoff: u64) -> Started {
     // From here a stop the USB's log cannot keep leaves its record in the
     // firmware; an earlier one has only the screen.
     crate::stop_record::arm(handoff.stop_record, Some(handoff.root));
+    crate::stop_record::set_regions(&handoff.runtime_regions);
     layout::set(handoff.placement);
     // Before this image's first line: the loader's lines that no log stored.
     let lines = handoff
@@ -247,7 +249,11 @@ fn start(handoff: u64) -> Started {
     // off and its descriptors installed; nothing else writes its P-state
     // registers. After the stop record is armed, so that a fault here
     // leaves its report. The APs ask for theirs when they are ready.
-    unsafe { stela_boot_core::host_performance::request_full_performance() };
+    unsafe {
+        stela_boot_core::host_performance::request_full_performance(
+            &mut host::pmu::PerformanceRegisters,
+        )
+    };
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
     // satisfy higher-order CPU/physical page alignment simultaneously.
@@ -258,6 +264,15 @@ fn start(handoff: u64) -> Started {
     crate::ALLOCATOR.reserve_tail(handoff.heap.bytes as usize / HEAP_RESERVE_SHARE);
     output::keep_stop_reserve();
     super::large_blocks::install();
+    // Before any user of the rate: this image's copy has not been found.
+    crate::firmware::adopt_tsc(
+        handoff.tsc_hz,
+        handoff.tsc_source,
+        handoff.tsc_tolerance_ppm,
+    );
+    // Before any AP: the boot processor's class, its caches, clock and
+    // memory, with its heap's buffer (`HOST SPEED`).
+    super::speed::calibrate_once();
     // SAFETY: this loader-owned private seed is held in the shared physmap,
     // exclusively consumed here before any native service is published.
     if let Err(error) = unsafe { crate::random::initialize(handoff.random_seed) } {
@@ -283,12 +298,6 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
-    // Before any user of the rate: this image's copy has not been found.
-    crate::firmware::adopt_tsc(
-        handoff.tsc_hz,
-        handoff.tsc_source,
-        handoff.tsc_tolerance_ppm,
-    );
     crate::status::set_clock(handoff.tsc_hz);
     // Before any AP agrees with the BSP through a software offset: from
     // then on the drivers' times and deadlines read the BSP's counter on
@@ -425,7 +434,7 @@ fn open_host(
         mmio: native_mmio,
         remappers,
         work: kernel_work,
-    } = start_platform(handoff, &mut host_owner, options);
+    } = start_platform(handoff, &mut host_owner, options, native_processors);
     // The signing service is asked only during an install, so a boot that
     // installs nothing leaves the adapter to the guest. An install without a
     // medium partition also streams its remote image.
@@ -949,8 +958,9 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         full_profile.processors.len().max(1),
     ));
     output::arguments(format_args!(
-        "{}",
-        stela_boot_core::host_performance::summary()
+        "{}{}",
+        stela_boot_core::host_performance::summary(),
+        super::speed::lines()
     ));
     if loaded_tree.is_some() {
         crate::status::begin("Setting up the Mac's hardware");
@@ -1551,7 +1561,14 @@ fn open_gpus(
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, &isa_bridges, gop, firmware.as_ref())
+            gpu::claim_all(
+                &services,
+                &adapters,
+                &isa_bridges,
+                gop,
+                firmware.as_ref(),
+                &|address| gpu::link::port_above(mmio, address),
+            )
         });
         (claimed, refused, random)
     });
@@ -2616,10 +2633,82 @@ fn takeover_part(detail: &str, stage: &'static &'static str) {
     super::step_watchdog::progress();
 }
 
+/// The `HOST POWER LIMITS` line (`stela_boot_core::host_power_limits`):
+/// on Intel the package's power limits in their model-specific registers,
+/// read through probes, and in the host bridge's memory-mapped copy, read
+/// through the mapping AML's SystemMemory fields use, before the PCI census
+/// as `pci_power` reads configuration. Nothing is written.
+fn report_power_limits(
+    acpi: Option<&'static super::aml::HostAcpi>,
+    mmio: Option<&'static crate::native_mmio::Source>,
+    root: u64,
+) {
+    use stela_boot_core::host_power_limits::{
+        IntelPackage, MMIO_POWER_LIMIT, amd_line, intel_line, mchbar,
+    };
+    let identity = core::arch::x86_64::__cpuid(0);
+    let intel =
+        (identity.ebx, identity.edx, identity.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+    if !intel {
+        if [identity.ebx, identity.edx, identity.ecx] == stela_boot_core::msr::AMD_VENDOR {
+            output::arguments(format_args!("{}", amd_line()));
+        }
+        return;
+    }
+    let limit = host::pmu::read(0x610);
+    // The memory-mapped copy, where the host bridge decodes MCHBAR and the
+    // package has the register copy at all.
+    let mmio_limit = (|| {
+        let (acpi, mmio) = (acpi?, mmio?);
+        limit?;
+        let bridge = stela_drivers::bus::pci::Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let config = |offset| mmio.read_firmware_config(bridge, offset, 4).ok();
+        // An Intel host bridge (class 06h, subclass 00h).
+        if config(0)? & 0xffff != 0x8086 || config(8)? >> 8 != 0x06_0000 {
+            return None;
+        }
+        let register = mchbar(config(0x48)?, config(0x4c)?)? + MMIO_POWER_LIMIT;
+        if !mmio.firmware_owned(register, register + 8) {
+            return None;
+        }
+        // SAFETY: the loader root, which AML's SystemMemory mappings use and
+        // which keeps the engine window, on the BSP whose local record is
+        // installed, as `gpu::keep_video_bios_table` enters it here.
+        let _root = unsafe { super::storage::RestoreRoot::enter(root) };
+        let pointer = acpi.firmware_memory(register, 8)?.cast::<u32>();
+        // SAFETY: the host bridge's register, outside RAM, mapped uncached
+        // by the call above; reads have no effect.
+        let (low, high) = unsafe { (pointer.read_volatile(), pointer.add(1).read_volatile()) };
+        Some(u64::from(high) << 32 | u64::from(low))
+    })();
+    let package_status = stela_boot_core::host_clock::PACKAGE_THERM_STATUS
+        .implemented()
+        // SAFETY: CPUID.06H:EAX[6] enumerates the register; reading has no
+        // effect.
+        .then(|| unsafe { stela_boot_core::host_clock::PACKAGE_THERM_STATUS.read() });
+    output::arguments(format_args!(
+        "{}",
+        intel_line(IntelPackage {
+            units: host::pmu::read(0x606),
+            limit,
+            mmio_limit,
+            info: host::pmu::read(0x614),
+            temperature_target: host::pmu::read(0x1a2),
+            package_status,
+        })
+    ));
+}
+
 fn start_platform(
     handoff: &'static Handoff,
     host_owner: &mut host::HostOwner,
     options: &Options,
+    native_processors: Option<&'static crate::native_smp::firmware::Capture>,
 ) -> Platform {
     // The owned MMIO permission the host devices' services map through. A
     // host it cannot check is reported, and those services refuse.
@@ -2645,6 +2734,23 @@ fn start_platform(
     static PCI_FUNCTIONS: &str = "taking over the PC's devices: stopping its PCI functions";
     static CONTROLLERS: &str =
         "taking over the PC's devices: DMA remapping units and interrupt controllers";
+    // First: from here every other processor answers the firmware's SMIs,
+    // which its AML, its services and its handlers of Stela's device
+    // accesses can raise (`park_before_firmware`).
+    static PROCESSORS: &str = "taking over the PC's devices: parking the other processors";
+    takeover_part("other processors", &PROCESSORS);
+    if let Some(capture) = native_processors {
+        // SAFETY: the installed boot processor in the engine's root with
+        // interrupts masked; no processor started from the startup page
+        // and no AML ran yet.
+        unsafe {
+            crate::native_smp::executor::park_before_firmware(
+                handoff,
+                capture,
+                super::step_watchdog::progress,
+            )
+        };
+    }
     takeover_part("memory-mapped registers", &REGISTERS);
     let activating = host::rdtsc();
     // SAFETY: this boot's capture, on the installed boot processor before
@@ -2770,6 +2876,7 @@ fn start_platform(
         takeover_part("PCI ports", &PCI_PORTS);
         super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
     }
+    report_power_limits(host_acpi, native_mmio, handoff.root);
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
     takeover_part("PCI functions", &PCI_FUNCTIONS);

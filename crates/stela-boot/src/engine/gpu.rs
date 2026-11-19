@@ -24,6 +24,7 @@ pub(super) mod display;
 mod file;
 #[cfg(feature = "nvk")]
 pub(super) mod gate;
+pub(super) mod link;
 /// `xtask guest`'s objects of the StelaGPU kext.
 #[cfg(feature = "nvk")]
 mod kext {
@@ -1093,16 +1094,19 @@ pub(super) struct Claimed {
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
     link: Option<PcieLink>,
+    /// The PCI Express port above it, read for the link's lines.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read at a loss"))]
+    port: Option<link::Port>,
 }
 
 fn claim(
     services: &dyn NativeServices,
-    stack: &'static GpuStack,
-    adapter: &gpu::Adapter,
+    (stack, adapter): (&'static GpuStack, &gpu::Adapter),
     isa_bridges: &[stela_drivers::probe::IsaBridge],
     line: u32,
     gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
+    port: Option<link::Port>,
 ) -> Result<Claimed, ServiceError> {
     use crate::pci_io::ScreenOwner;
     let address = adapter.address;
@@ -1250,6 +1254,18 @@ fn claim(
             if decode.memory_was_off { "off" } else { "on" }
         ));
     }
+    link::log_link(
+        address,
+        "as the firmware left it",
+        &*function.config(),
+        port.as_ref(),
+    );
+    // Before the reset, which saves the GPU's side as set here and puts it
+    // back, as Linux sets a link at enumeration before its driver resets.
+    // SAFETY: the cold owner of `address` its fabric promoted, in D0 since
+    // `enable_decode`, Bus Master sealed by its preparation; the fabric
+    // keeps every other configuration writer out.
+    unsafe { link::set_substates(address, function, port.as_ref()) };
     let config = function
         .config()
         .retain_epoch()
@@ -1352,6 +1368,14 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
+    if reset {
+        link::log_link(
+            address,
+            "after its reset",
+            &*function.config(),
+            port.as_ref(),
+        );
+    }
     (before.settle)(services, &resources[registers_at], &identified)?;
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
@@ -1414,6 +1438,7 @@ fn claim(
         drm,
         #[cfg(feature = "nvk")]
         link,
+        port,
     })
 }
 
@@ -1530,6 +1555,7 @@ pub(super) fn claim_all(
     isa_bridges: &[stela_drivers::probe::IsaBridge],
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
+    port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
@@ -1596,12 +1622,12 @@ pub(super) fn claim_all(
             .and_then(|catalog| {
                 claim(
                     services,
-                    stack,
-                    adapter,
+                    (stack, adapter),
                     isa_bridges,
                     claimed.len() as u32,
                     source,
                     catalog.clone(),
+                    port_above(adapter.address),
                 )
             });
         match result {
@@ -1675,6 +1701,8 @@ struct Bound {
     integrated: Option<bool>,
     drm: client::DrmDevice,
     link: Option<PcieLink>,
+    /// The PCI Express port above it, read when it stops answering.
+    port: Option<link::Port>,
 }
 
 /// The original managed child runs the driver's initcalls and probe.
@@ -1829,6 +1857,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
                         integrated: claimed.integrated,
                         drm: claimed.drm,
                         link: claimed.link,
+                        port: claimed.port,
                     });
                 } else {
                     // The claim reset the function, so the firmware's

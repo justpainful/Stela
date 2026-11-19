@@ -336,7 +336,7 @@ fn find(path: &Path) -> Result<Found> {
     let mut magic = [0u8; 8];
     file.seek(SeekFrom::Start(0))?;
     if file.read_exact(&mut magic).is_ok() && &magic == boot_log::MAGIC {
-        let mut region = vec![0; usize::try_from(end.min(boot_log::LOG_BYTES))?];
+        let mut region = vec![0; usize::try_from(end.min(boot_log::MAX_FILE_BYTES))?];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut region)?;
         let log = boot_log::read(&region).with_context(|| format!("{}", path.display()))?;
@@ -497,23 +497,25 @@ fn stick(read: &mut Reader<'_>, bytes: u64) -> bool {
 }
 
 /// The USB's own log, [`crate::efi::BOOT_LOG`] on the FAT32 volume of a
-/// `bytes`-long partition: the file's first [`boot_log::LOG_BYTES`], which
-/// `stela.efi` writes through its clusters. A file no boot has written is
-/// refused; one whose header does not decode is read raw.
+/// `bytes`-long partition: the region the file's length gives
+/// ([`boot_log::file_region`]), which `stela.efi` writes through its
+/// clusters. A file no boot has written is refused; one whose header does
+/// not decode is read raw.
 fn file_log(read: &mut Reader<'_>, bytes: u64) -> Result<StickLog> {
     let mut volume = Fat32::open(Span { read, bytes }).map_err(|error| anyhow!("{error}"))?;
     let file = volume
         .file(crate::efi::BOOT_LOG)
         .map_err(|error| anyhow!("{error}"))?;
-    ensure!(
-        file.bytes >= boot_log::LOG_BYTES,
-        "{} holds {} bytes, fewer than the log's {}",
-        crate::efi::BOOT_LOG,
-        file.bytes,
-        boot_log::LOG_BYTES
-    );
+    let region_bytes = boot_log::file_region(file.bytes).with_context(|| {
+        format!(
+            "{} holds {} bytes, fewer than the log's {}",
+            crate::efi::BOOT_LOG,
+            file.bytes,
+            boot_log::LOG_BYTES
+        )
+    })?;
     let mut span = volume.into_inner();
-    let mut region = vec![0; boot_log::LOG_BYTES as usize];
+    let mut region = vec![0; usize::try_from(region_bytes)?];
     let mut done = 0;
     for extent in &file.extents {
         let take = usize::try_from(extent.bytes)?.min(region.len() - done);
@@ -734,6 +736,14 @@ pub(crate) fn summary(log: &Log) -> String {
             duration_text(seconds)
         );
     }
+    let left_out = left_out_notes(&log.stream);
+    if left_out != 0 {
+        let _ = write!(
+            text,
+            "; {left_out} lines say where lines were left out of it (BOOT LOG THINNED, \
+             [boot log dropped, BOOT LOG busy)"
+        );
+    }
     if log.overwritten() != 0 {
         text.push_str("; older lines were overwritten");
         let kept: Vec<u64> = log.kept_starts().map(|(start, _)| start.boot).collect();
@@ -752,6 +762,32 @@ pub(crate) fn summary(log: &Log) -> String {
     }
     text.push('\n');
     text
+}
+
+/// The lines of `stream` that say a boot left lines out of its log: a
+/// family past its budget (`stela_boot_core::log_budget`), a buffer that
+/// overflowed between stores (`boot_log::Pending`), or writes that found
+/// the log held elsewhere.
+fn left_out_notes(stream: &[u8]) -> usize {
+    const NOTES: [&[u8]; 3] = [
+        b"BOOT LOG THINNED ",
+        b"[boot log dropped ",
+        b"BOOT LOG busy: ",
+    ];
+    stream
+        .split(|&byte| byte == b'\n')
+        .filter(|line| {
+            // After the line's stamp, if any.
+            let text = match line.strip_prefix(b"[") {
+                Some(rest) if stamp(line).is_some() => rest
+                    .iter()
+                    .position(|&byte| byte == b']')
+                    .map_or(*line, |end| rest[end + 1..].trim_ascii_start()),
+                _ => line,
+            };
+            NOTES.iter().any(|note| text.starts_with(note))
+        })
+        .count()
 }
 
 /// End every device skip the stick's boot log at `path` holds (`pc::device_starts`):
@@ -939,6 +975,13 @@ pub(crate) mod tests {
 
     /// A log region with one boot per entry of `boots`, each printing it.
     pub(crate) fn region(boots: &[&str]) -> Vec<u8> {
+        let boots: Vec<Vec<u8>> = boots.iter().map(|line| line.as_bytes().to_vec()).collect();
+        written(&boots)
+    }
+
+    /// A 4 MiB log region as this tree's writer leaves it, with one boot per
+    /// entry of `boots`, each printing it and storing every 64 KiB.
+    pub(crate) fn written(boots: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = vec![0u8; boot_log::LOG_BYTES as usize];
         let mut region = Bytes {
             bytes: &mut bytes,
@@ -953,12 +996,75 @@ pub(crate) mod tests {
                 features: Default::default(),
             },
         };
-        for line in boots {
+        for lines in boots {
             let mut writer = Writer::open(&mut region).unwrap();
-            writer.append(line.as_bytes());
-            writer.flush(&mut region).unwrap();
+            for part in lines.chunks(64 << 10) {
+                writer.append(part);
+                writer.flush(&mut region).unwrap();
+            }
         }
         bytes
+    }
+
+    /// `boots` boots of `lines` numbered lines each (`boot B line L`), from
+    /// `first` on: a boot's own lines, without its marker.
+    pub(crate) fn boot_lines(first: usize, boots: usize, lines: usize) -> Vec<Vec<u8>> {
+        (first..first + boots)
+            .map(|boot| {
+                (0..lines)
+                    .flat_map(|line| {
+                        format!("[{line:5}.000] boot {boot} line {line:06}\n").into_bytes()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A 4 MiB log region as every released `stela.efi` (0.5.0 and older)
+    /// left it: a version 1 header of 40 bytes and its SHA-256, and a ring
+    /// that fills the region, holding the newest bytes of `boots`, each
+    /// after its `=== STELA BOOT n ===` marker.
+    pub(crate) fn released_region(boots: &[Vec<u8>]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut stream = Vec::new();
+        for (boot, lines) in boots.iter().enumerate() {
+            stream.extend_from_slice(format!("=== STELA BOOT {} ===\n", boot + 1).as_bytes());
+            stream.extend_from_slice(lines);
+        }
+        let mut bytes = vec![0u8; boot_log::LOG_BYTES as usize];
+        let ring = boot_log::LOG_BYTES - boot_log::HEADER_BYTES;
+        let head = stream.len() as u64;
+        bytes[..8].copy_from_slice(boot_log::MAGIC);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&head.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(boots.len() as u64).to_le_bytes());
+        bytes[32..40].copy_from_slice(&ring.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..40]);
+        bytes[40..72].copy_from_slice(&digest);
+        for at in head.saturating_sub(ring)..head {
+            bytes[(boot_log::HEADER_BYTES + at % ring) as usize] = stream[at as usize];
+        }
+        bytes
+    }
+
+    /// What `stela log IMAGE` saves for the image of a stick whose EFI
+    /// partition holds `log` as its log file: the command's own path, from
+    /// the disk's GPT through the FAT32 volume to the file's clusters.
+    pub(crate) fn stick_log_text(log: &[u8]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("stick.img");
+        disk_image(&image, &[(ESP, &fat_volume(Some(log)))]);
+        let output = dir.path().join("log.txt");
+        BootLog {
+            file: Some(image),
+            output: Some(output.clone()),
+            partition: None,
+            offset: None,
+            in_target: false,
+        }
+        .run()
+        .unwrap();
+        String::from_utf8(std::fs::read(output).unwrap()).unwrap()
     }
 
     const GUID: &str = "5E1A0000-0000-4000-8000-0000000000C0";
@@ -972,6 +1078,7 @@ pub(crate) mod tests {
         let mut bytes = vec![0u8; disk_bytes as usize];
         let table = Table {
             disk_guid: Guid([7; 16]),
+            slots: Default::default(),
             partitions: vec![Partition {
                 type_guid: "0FC63DAF-8483-4772-8E79-3D69D8477DE4".parse().unwrap(),
                 unique_guid: GUID.parse().unwrap(),
@@ -1245,10 +1352,11 @@ pub(crate) mod tests {
 
     /// A whole-disk image of `partitions`, each a type and its bytes, laid
     /// out from 1 MiB.
-    fn disk_image(path: &Path, partitions: &[(&str, &[u8])]) {
+    pub(crate) fn disk_image(path: &Path, partitions: &[(&str, &[u8])]) {
         let mut first = 2048u64;
         let mut table = Table {
             disk_guid: Guid([9; 16]),
+            slots: Default::default(),
             partitions: Vec::new(),
         };
         let mut writes = Vec::new();
@@ -1282,7 +1390,7 @@ pub(crate) mod tests {
         std::fs::write(path, image).unwrap();
     }
 
-    const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+    pub(crate) const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
     const LINUX: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
 
     #[test]
@@ -1325,13 +1433,85 @@ pub(crate) mod tests {
         );
     }
 
+    /// A stick whose log file `stela` made 32 MiB long is read whole, and
+    /// a copy of that file too.
+    #[test]
+    fn boot_log_reads_a_long_log_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = region(&["boot one\n", "boot two\n"]);
+        let long = boot_log::relayout(&old, boot_log::FILE_BYTES).unwrap();
+        let path = dir.path().join("usb.img");
+        disk_image(&path, &[(ESP, &fat_volume(Some(&long)))]);
+        let (found, notes) = find(&path).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let [(_, log)] = &found[..] else {
+            panic!("{}", found.len());
+        };
+        assert_eq!(
+            log.ring_bytes,
+            boot_log::Layout::of(boot_log::FILE_BYTES).ring_bytes
+        );
+        assert_eq!(
+            log.stream,
+            b"=== STELA BOOT 1 ===\nboot one\n=== STELA BOOT 2 ===\nboot two\n"
+        );
+        let copy = dir.path().join("boot.log");
+        std::fs::write(&copy, &long).unwrap();
+        let (found, _) = find(&copy).unwrap();
+        assert_eq!(found[0].1.stream, log.stream);
+    }
+
+    /// A stick put back to a released Stela after `stela` made its log
+    /// 32 MiB, and booted by it: that loader starts its own 4 MiB log at
+    /// the file's start. `stela log` lists the boots from before it, which
+    /// the header's copy still names, then its boots, numbered on.
+    #[test]
+    fn stela_log_lists_the_boots_from_before_an_older_loader_s_log() {
+        let newer = written(&boot_lines(1, 5, 2_000));
+        let long = boot_log::relayout(&newer, boot_log::FILE_BYTES).unwrap();
+        let before = boot_log::read(&long).unwrap();
+        let older = released_region(&boot_lines(100, 2, 500));
+        let mut file = long.clone();
+        // The released loader's header block and the ring it reached.
+        let reached = boot_log::read(&older).unwrap().head.next_multiple_of(512) as usize;
+        let ring = boot_log::HEADER_BYTES as usize;
+        file[..512].copy_from_slice(&older[..512]);
+        file[ring..ring + reached].copy_from_slice(&older[ring..ring + reached]);
+        let text = stick_log_text(&file);
+        assert!(
+            text.starts_with("=== Stela boot log: 7 boots"),
+            "{}",
+            &text[..200]
+        );
+        for boot in 1..=7 {
+            let marker = format!("=== STELA BOOT {boot} ===\n");
+            assert!(text.contains(&marker), "{marker}");
+        }
+        // The boots from before keep their first lines; the older loader's
+        // lines follow them.
+        for start in &before.starts {
+            assert!(text.contains(std::str::from_utf8(&start.first).unwrap()));
+        }
+        let six = text
+            .find("=== STELA BOOT 6 ===\n[    0.000] boot 100 line 000000\n")
+            .unwrap();
+        assert!(text.find("boot 5 line 001999\n").unwrap() < six);
+        assert!(text.ends_with("boot 101 line 000499\n"));
+    }
+
     #[test]
     fn a_stick_log_that_cannot_be_read_whole_is_said_and_kept() {
         let dir = tempfile::tempdir().unwrap();
-        // A header that no longer decodes: the lines are read as they lie.
+        // A header that no longer decodes is read from its copy.
         let mut torn = region(&["CHOICE 1 (macOS)\n"]);
         torn[16] ^= 0xff;
         let raw = dir.path().join("torn.img");
+        std::fs::write(&raw, fat_volume(Some(&torn))).unwrap();
+        let (found, notes) = find(&raw).unwrap();
+        assert_eq!(found[0].0, "the file, EFI/stela/boot.log");
+        assert!(notes.is_empty(), "{notes:?}");
+        // Without its copy, the lines are read as they lie.
+        torn[boot_log::COPY_AT as usize + 16] ^= 0xff;
         std::fs::write(&raw, fat_volume(Some(&torn))).unwrap();
         let (found, notes) = find(&raw).unwrap();
         assert_eq!(found.len(), 1);
@@ -1506,6 +1686,9 @@ pub(crate) mod tests {
             duration_text(seconds)
         );
         assert_eq!(said, expected);
+        // Lines that say others were left out are counted.
+        let notes = b"[   1.000] BOOT LOG THINNED \"GUEST|\": 3 lines\n[boot log dropped 12 bytes]\nGUEST| BOOT LOG THINNED\n";
+        assert_eq!(left_out_notes(notes), 2);
         let mut written = Vec::new();
         write_log(&mut written, &log).unwrap();
         let text = String::from_utf8(written).unwrap();
