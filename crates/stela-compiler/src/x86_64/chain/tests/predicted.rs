@@ -236,10 +236,18 @@ impl Run {
                 TAIL,
                 &lookup_tail(tail, word, RAN, probe, 0).unwrap(),
             ),
+            // A miss calls the jump probe, as the engine links it.
             Way::Unlinked | Way::Linked => put(
                 &region,
                 TAIL,
-                &predicted_tail(tail, GuestAddress(predicted), word, RAN, probe).unwrap(),
+                &predicted_tail(
+                    tail,
+                    GuestAddress(predicted),
+                    word,
+                    RAN,
+                    region.at(PROBES + JUMP_PROBE_ENTRY),
+                )
+                .unwrap(),
             ),
         }
         if way != Way::Bare {

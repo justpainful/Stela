@@ -1,8 +1,10 @@
-//! The jump cache of [`lookup_tail`]s: a target the table probe entered is
-//! entered from the tail across native runs, and every change the probe
-//! would see (a TLBI of the page, a rekeyed page, a block's release or
-//! replacement, a context switch, a native transition's new contexts) takes
-//! the entry with it. Random runs against the plain tail.
+//! The jump cache of [`lookup_tail`]s and of the jump probe a predicted
+//! tail's miss calls ([`JUMP_PROBE_ENTRY`]): a target the table probe
+//! entered is entered from the tail or that probe across native runs, and
+//! every change the probe would see (a TLBI of the page, a rekeyed page, a
+//! block's release or replacement, a context switch, a native transition's
+//! new contexts) takes the entry with it. Random runs against the plain
+//! tail.
 use super::super::*;
 use super::Controlled;
 use alloc::{boxed::Box, vec::Vec};
@@ -20,13 +22,17 @@ unsafe extern "C" {
 }
 
 const PAGE: usize = 4096;
-/// The cached tail's site, the plain tail's, the probes of BTYPE 0 and 2.
-const CACHED: usize = 64;
-const PLAIN: usize = 256;
-const PROBES: usize = 1024;
-const BRANCH_CACHED: usize = 384;
-const BRANCH_PROBES: usize = 2048;
-const REGION: usize = 4 * PAGE;
+/// The cached tail's site, the plain tail's, the branch's cached tail's,
+/// the plain tails of BTYPE 0 and 2 that call the jump probe, the probes
+/// of BTYPE 0 and 2.
+const CACHED: usize = 128;
+const PLAIN: usize = 384;
+const BRANCH_CACHED: usize = 448;
+const JUMPED: usize = 704;
+const BRANCH_JUMPED: usize = 768;
+const PROBES: usize = 2048;
+const BRANCH_PROBES: usize = 4096;
+const REGION: usize = 6 * PAGE;
 const BLOCKS: usize = 8;
 const RAN: u32 = 3;
 const CONTEXTS: [u64; 2] = [5 << LOOKUP_SALT_BITS, 9 << LOOKUP_SALT_BITS];
@@ -62,12 +68,19 @@ fn blocks() -> Pages {
     blocks
 }
 
-/// `mov rax, rsi` and a jump to the tail at `site`, at the region's start
-/// and at `site - 16`; the cached tails, the plain tail and the probes.
+/// `mov rax, rsi` and a jump to each tail, 16 bytes apart from the
+/// region's start: the cached tail, the plain tail, the branch's cached
+/// tail, then the plain tails of BTYPE 0 and 2 that call the jump probe
+/// ([`JUMP_PROBE_ENTRY`]), as a predicted tail's miss does; the probes.
 fn region() -> Pages {
     let region = pages(REGION);
     let base = region.0 as u64;
-    for (stub, site) in [(0, CACHED), (16, PLAIN), (32, BRANCH_CACHED)] {
+    let sites = [CACHED, PLAIN, BRANCH_CACHED, JUMPED, BRANCH_JUMPED];
+    for (stub, site) in sites
+        .into_iter()
+        .enumerate()
+        .map(|(at, site)| (16 * at, site))
+    {
         let mut code = vec![0x48, 0x89, 0xf0];
         code.extend(jump(base + stub as u64 + 3, base + site as u64).unwrap());
         put(&region, stub, &code);
@@ -89,6 +102,15 @@ fn region() -> Pages {
         BRANCH_CACHED,
         &lookup_tail(base + BRANCH_CACHED as u64, branch, RAN, branch_probe, 2).unwrap(),
     );
+    for (site, word, probes) in [
+        (JUMPED, word, PROBES),
+        (BRANCH_JUMPED, branch, BRANCH_PROBES),
+    ] {
+        let mut jumped = Code::new();
+        let probe = base + (probes + JUMP_PROBE_ENTRY) as u64;
+        tail(&mut jumped, base + site as u64, word, RAN, probe).unwrap();
+        put(&region, site, &jumped);
+    }
     put(&region, PROBES, &lookup_dispatcher(0).unwrap());
     put(&region, BRANCH_PROBES, &lookup_dispatcher(2).unwrap());
     region
@@ -193,18 +215,29 @@ fn a_filled_entry_holds_until_its_page_goes() {
         (1, u64::from(RAN), 3)
     );
     assert_eq!(filled(&world), 1);
-    // Later runs take it from the tail.
+    // Later runs take it from the tail, and from the jump probe.
     for hits in 2..5 {
         assert_eq!(world.run(0, PC), (0x7703, 99));
         assert_eq!(world.control.hits, hits);
     }
+    assert_eq!(world.run(48, PC), (0x7703, 99));
+    assert_eq!(
+        (
+            world.control.hits,
+            world.control.account.retired(),
+            world.control.block
+        ),
+        (5, u64::from(5 * RAN), 3)
+    );
     assert_eq!(filled(&world), 1, "the cache's hit fills nothing");
-    // A TLBI of the page: the probe and the cached tail both exit.
+    // A TLBI of the page: the probe, the cached tail and the jump probe
+    // all exit.
     let page = PC & !0xfff;
     assert!(world.itlb.forget_range(page..=page | 0xfff, u64::MAX));
     assert_eq!(world.run(16, PC), exit(PC, ExitKind::Return));
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    assert_eq!(world.control.hits, 4);
+    assert_eq!(world.run(48, PC), exit(PC, ExitKind::Return));
+    assert_eq!(world.control.hits, 5);
     // The page back, the probe fills again.
     world.map(PC, block_key(0x4000_0000, 1), 3, 0b1111);
     assert_eq!(world.run(0, PC), (0x7703, 99));
@@ -261,26 +294,34 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
     // Filled by the BTYPE 0 probe, taken by a BTYPE 2 tail.
     assert_eq!(world.run(0, PC), (0x7705, 99));
     assert_eq!(world.run(0, REFUSING), (0x7706, 99));
-    let hits = world.control.hits;
-    assert_eq!(world.run(32, PC), (0x7705, 99));
-    assert_eq!(world.control.block, 5 | 2 << BLOCK_BTYPE_SHIFT);
-    assert_eq!(world.control.hits, hits + 1);
     let branch = (REFUSING, ExitKind::Indirect as u64 | (RAN as u64) << 20);
-    assert_eq!(world.run(32, REFUSING), branch);
+    // The branch's cached tail, and its plain tail through the jump probe.
+    for stub in [32, 64] {
+        let hits = world.control.hits;
+        assert_eq!(world.run(stub, PC), (0x7705, 99));
+        assert_eq!(world.control.block, 5 | 2 << BLOCK_BTYPE_SHIFT);
+        assert_eq!(world.control.hits, hits + 1);
+        assert_eq!(world.run(stub, REFUSING), branch);
+    }
     // A spent budget returns with the word and the instructions run, the
     // account unchanged.
     world.control.account = world.control.account.with_budget(0);
     let account = world.control.account;
-    assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    assert_eq!(world.control.account, account);
+    for stub in [0, 48] {
+        assert_eq!(world.run(stub, PC), exit(PC, ExitKind::Return));
+        assert_eq!(world.control.account, account);
+    }
     world.control.account = world.control.account.with_budget(100);
     // An interruption posted: the probe's check exits.
     world.control.interrupt();
     let account = world.control.account;
-    assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    assert_eq!(world.control.account, account);
+    for stub in [0, 48] {
+        assert_eq!(world.run(stub, PC), exit(PC, ExitKind::Return));
+        assert_eq!(world.control.account, account);
+    }
     world.control.acknowledge();
     assert_eq!(world.run(0, PC), (0x7705, 99));
+    assert_eq!(world.run(48, PC), (0x7705, 99));
 }
 
 /// Random runs: targets that share entries, pages put in, rekeyed and
@@ -330,12 +371,13 @@ fn cached_tails_run_as_plain_tails() {
                 world.control.salts[half] = world.itlb.salt(world.control.contexts[half]);
             }
             _ => {
-                // The cached tail first: an entry of an earlier change
-                // must miss.
+                // The cached tail or the jump probe first: an entry of an
+                // earlier change must miss.
+                let stub = if next() % 2 == 0 { 0 } else { 48 };
                 let mut plain = *world.control;
-                let got = world.run(0, pc);
+                let got = world.run(stub, pc);
                 let expected = run(&world.region, 16, &mut plain, pc);
-                assert_eq!(got, expected, "{pc:#x}");
+                assert_eq!(got, expected, "{pc:#x} {stub}");
                 // The probe fills; the tail counts as the probe counts.
                 assert_eq!(
                     (
@@ -344,7 +386,7 @@ fn cached_tails_run_as_plain_tails() {
                         world.control.hits
                     ),
                     (plain.block, plain.account.retired(), plain.hits),
-                    "{pc:#x}"
+                    "{pc:#x} {stub}"
                 );
                 compared += 1;
             }
