@@ -479,6 +479,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.permissions_changed();
     }
 
+    /// TCR changed the layout of translation ([`Self::layout_written`]):
+    /// everything that translates goes, as after any control: fetch
+    /// translations, lookup contexts, the code page and device reads, and
+    /// the host's shadow follows the new controls.
+    pub(super) fn layout_changed(&mut self) {
+        self.advance_translation_generation();
+        self.statistics.translation_changes += 1;
+        self.sync_host_regime(step_timing::SyncSource::Translation);
+    }
+
     /// Translation changed, but nothing derived from System registers:
     /// an SPRR_PERM write, which XNU makes around its writes to protected
     /// data and at thread switches, thousands of times a second.
@@ -518,6 +528,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) {
         self.mirrors.close_code_page();
         self.forget_device_reads();
+        let mut whole = None;
         match everywhere {
             mmu::tlbi::Everywhere::Addresses(addresses)
             | mmu::tlbi::Everywhere::AsidAddresses(addresses, _) => {
@@ -550,14 +561,46 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     false => ItlbSource::AllLocal,
                 };
                 self.statistics.itlb_sources[source as usize] += 1;
+                let started = self.whole_tlbi_clock();
+                let live =
+                    !self.fill_log.is_empty() || self.spaces.iter().any(|spaces| spaces.len() != 0);
                 self.forget_spaces(0..=1, 1);
+                if !self.applying_mail {
+                    whole = Some((started, live));
+                }
             }
         }
         self.statistics.tlb_maintenance += 1;
         if reach != mmu::tlbi::Reach::All {
             self.statistics.scoped_maintenance += 1;
         }
+        let forgot = match whole {
+            Some(_) => self.whole_tlbi_clock(),
+            None => 0,
+        };
         self.host.invalidate_reach(reach, everywhere);
+        // A local TLBI of everything: its PC, whether the ITLB held
+        // anything, and, under step timing, the time of the engine's and
+        // the host's parts.
+        if let Some((started, live)) = whole {
+            let done = self.whole_tlbi_clock();
+            self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
+            let times = &mut self.statistics.whole_tlbi_times;
+            times[0] += u64::from(live);
+            times[1] += forgot.wrapping_sub(started);
+            times[2] += done.wrapping_sub(forgot);
+        }
+    }
+
+    /// The counter, for the times of a TLBI of everything, while step
+    /// timing is on; zero otherwise. A guest flushes everything often, and
+    /// timing it is profiling, which normal runs do not pay for
+    /// (`system_access_samples_the_counter_and_interrupts_only_when_needed`).
+    fn whole_tlbi_clock(&mut self) -> u64 {
+        match self.step_timing {
+            Some(_) => self.host.counter(),
+            None => 0,
+        }
     }
 
     /// A TTBR0 write, which changes the translation of the lower half
@@ -741,6 +784,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 Ok(place) => {
                     let address = arena.address(place);
                     arena.write(address, bytes);
+                    self.install_causes.window_bytes += bytes.len().next_multiple_of(16) as u64;
+                    self.install_causes.window_pieces += 1;
                     self.host.serialize_code();
                     if retire {
                         self.held_places.push(place);
@@ -901,6 +946,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// fetches would write. The choice needs only the parts' order by
     /// heat, which a batch of at most that many fetches per PE leaves.
     pub(super) fn entered(&mut self, slot: usize) {
+        if self.step_timing.is_some() {
+            self.code.blocks.record(slot).fetched();
+        }
         let part = self.code.blocks[slot].part;
         if part == board::NO_PART {
             return;

@@ -98,7 +98,7 @@
 //! (`plane.c`), which marks premultiplied only its formats without alpha
 //! (XRGB, XBGR, XBGR2101010) and straight its ARGB ones: premultiplied over
 //! black, an X byte of any value shows the colour unchanged.
-use super::super::scanout::{self, Mode, Scanout};
+use super::super::scanout::{self, GpuStats, Mode, Scanout};
 use super::Log;
 use super::abi::{self, Fields, IO_RETURN_SUCCESS, Interface, LINK_UNSUPPORTED, Method, Packed};
 use super::avipc::DisplayState;
@@ -237,9 +237,6 @@ const SWAP_INFO_ID: usize = 0x38;
 const SWAP_INFO_BLOB: usize = 0xe0;
 /// The ticks per second of the counter refreshes are timed by.
 const COUNTER_HZ: u64 = crate::counter::FREQUENCY_HZ;
-/// How often the display looks for a frame the host GPU composes to be
-/// done ([`Methods::refresh_deadline`]): each look reads one marker word.
-const GPU_POLL_MICROS: u64 = 250;
 
 /// The counter ticks each pacing report covers.
 const PACING_WINDOW: u64 = 10 * COUNTER_HZ;
@@ -329,6 +326,11 @@ pub struct Pacing {
     /// completed.
     pub overlapped: u32,
     pub most_unanswered: usize,
+    /// Swaps composed on the GPU and on the CPU, and what became of the
+    /// GPU's frames ([`Scanout::take_gpu_stats`]).
+    pub gpu_composed: u32,
+    pub cpu_composed: u32,
+    pub gpu: GpuStats,
     /// The first [`SAMPLED_SWAPS`] swaps submitted in the window, each with
     /// its own times: what decides when the AP starts its next frame, which
     /// the window's averages cannot tell apart.
@@ -336,21 +338,6 @@ pub struct Pacing {
     /// The display's refresh period, in counter ticks, for the sample's
     /// report.
     pub refresh: u64,
-    /// Frames the scanout's host GPU took to compose
-    /// ([`Scanout::try_present_layers`]), and those it refused, which the
-    /// CPU composed instead: whether the GPU path runs, and how often it
-    /// fails. A sink that declines a frame counts in neither.
-    pub gpu_frames: u32,
-    pub gpu_fallbacks: u32,
-    /// Each GPU frame from its compose's hand-off (the look that latched
-    /// it) to the look that found the GPU done and completed its swaps;
-    /// and each frame composed on the CPU outside the devices' lock, from
-    /// that hand-off to the look that took the compose back. Both are on
-    /// the counter, so they hold the wait for the next look as well as the
-    /// compose: the same measure for either composer. A present composed
-    /// in place starts and ends at one counter reading, and is not timed.
-    pub gpu: Latency,
-    pub cpu_compose: Latency,
 }
 
 /// How many swaps each pacing window samples ([`Pacing::swaps`]).
@@ -535,7 +522,7 @@ impl core::fmt::Display for Pacing {
         let ms = |ticks: u64| ticks as f64 * 1000.0 / COUNTER_HZ as f64;
         write!(
             f,
-            "DCP PACING seconds={:.1} presented={} submitted={} merged={} per_second={:.1} gap_ms={:.1}/{:.1}/{:.1} stalls={} late_ms={:.1}/{:.1} deepest={} reordered={} ahead_of_gpu={} fence_waits={} fence_timeouts={} calls={} unmodeled={} color_matrix={} moved={} swap_ms=n:avg/max fence={} notice={} latch={} complete={} total={} vsync={} gpu_frames={} gpu_fallbacks={} gpu_ms={} cpu_compose_ms={}",
+            "DCP PACING seconds={:.1} presented={} submitted={} merged={} per_second={:.1} gap_ms={:.1}/{:.1}/{:.1} stalls={} late_ms={:.1}/{:.1} deepest={} reordered={} ahead_of_gpu={} fence_waits={} fence_timeouts={} calls={} unmodeled={} color_matrix={} moved={} swap_ms=n:avg/max fence={} notice={} latch={} complete={} total={} vsync={}",
             ms(self.ticks) / 1000.0,
             self.presented,
             self.submitted,
@@ -566,10 +553,6 @@ impl core::fmt::Display for Pacing {
             self.complete,
             self.total,
             self.vsync,
-            self.gpu_frames,
-            self.gpu_fallbacks,
-            self.gpu,
-            self.cpu_compose,
         )?;
         let [one, two, three, few, many] = self.refreshes;
         write!(
@@ -584,6 +567,19 @@ impl core::fmt::Display for Pacing {
             self.after_vsync,
             self.overlapped,
             self.most_unanswered,
+        )?;
+        let gpu = self.gpu;
+        write!(
+            f,
+            " composed=gpu:{}/cpu:{} gpu_frames=flipped:{}/replaced:{} gpu_ms={:.2}/{:.2} \
+             gpu_copied_layers={}",
+            self.gpu_composed,
+            self.cpu_composed,
+            gpu.flipped,
+            gpu.replaced,
+            gpu.total_ns as f64 / 1e6 / f64::from(gpu.flipped + gpu.replaced).max(1.0),
+            gpu.longest_ns as f64 / 1e6,
+            gpu.copied,
         )?;
         let Some(first) = self.swaps.first() else {
             return Ok(());
@@ -783,18 +779,7 @@ struct Batch {
     count: usize,
     planes: [Option<scanout::Layer>; swap::LAYERS],
     layers: Vec<scanout::Layer>,
-    /// Each layer's surface ID, where one of the swaps shown set its slot
-    /// ([`Scanout::try_present_layers`]).
-    surface_ids: Vec<Option<u32>>,
     damage: Option<core::ops::Range<usize>>,
-}
-
-/// A present the scanout's host GPU is composing: what it latched, and
-/// the GPU's ticket. Its swaps complete once the GPU is done
-/// ([`Methods::finish_compose`]).
-struct GpuPresent {
-    batch: Batch,
-    pending: scanout::GpuPending,
 }
 
 /// The IOMFB methods of the one connected display, presenting to a host
@@ -817,11 +802,6 @@ pub struct Methods {
     /// The present whose compose runs outside the devices' lock, and what
     /// it hands back.
     composing: Option<(Batch, Arc<Handoff<Composition>>)>,
-    /// The present the host GPU is composing, once its compose ended: the
-    /// scanout is back, but no other present starts before it finishes.
-    gpu: Option<GpuPresent>,
-    /// The host GPU refused a frame, which is reported once.
-    gpu_refusal_reported: bool,
     /// A compose read past its resolved pages: the next present is made in
     /// place.
     in_place: bool,
@@ -940,6 +920,9 @@ pub struct Methods {
     /// For each queued completion, in the same order: its swap and the
     /// counter when it was submitted and presented ([`Pacing::complete`]).
     completion_times: VecDeque<(u32, u64, u64)>,
+    /// Why the scanout left frames to the CPU's compose, each reported
+    /// once.
+    cpu_composes: BTreeSet<&'static str>,
     /// A swap, mode or hot-plug callback is out and not answered yet:
     /// these leave one at a time, in order.
     in_flight: bool,
@@ -1029,8 +1012,6 @@ impl Methods {
             scanout: Some(scanout),
             frame: scanout::Composed::default(),
             composing: None,
-            gpu: None,
-            gpu_refusal_reported: false,
             in_place: false,
             compose_stall_reported: false,
             shown: None,
@@ -1083,6 +1064,7 @@ impl Methods {
             completed: VecDeque::new(),
             completion_times: VecDeque::new(),
             in_flight: false,
+            cpu_composes: BTreeSet::new(),
             vsync_out: false,
             shut_down: false,
             now: 0,
@@ -1212,7 +1194,7 @@ impl Methods {
     fn repaint_wanted(&self) -> bool {
         self.shown.is_some()
             && !self.repaint_refused
-            && !self.composing()
+            && self.composing.is_none()
             && !self.shut_down
             && self.display.borrow().active()
             && self
@@ -1279,20 +1261,7 @@ impl Methods {
                 .scanout
                 .as_ref()
                 .is_some_and(|scanout| scanout.queued());
-        let refresh = (wanted && !self.shut_down).then_some(self.next_refresh);
-        // A frame the host GPU composes is done in well under a
-        // millisecond, and its swaps complete only once a look sees it
-        // done ([`Self::finish_compose`]): looks come every
-        // [`GPU_POLL_MICROS`] meanwhile rather than at the next vblank,
-        // which left a 144 Hz desktop's frames 4-5 ms on the GPU's books.
-        let gpu = (self.gpu.is_some() && !self.shut_down).then(|| {
-            self.now
-                .saturating_add(COUNTER_HZ * GPU_POLL_MICROS / 1_000_000)
-        });
-        match (refresh, gpu) {
-            (Some(refresh), Some(gpu)) => Some(refresh.min(gpu)),
-            (refresh, gpu) => refresh.or(gpu),
-        }
+        (wanted && !self.shut_down).then_some(self.next_refresh)
     }
 
     /// Advance the display to counter `now`: flush what the scanout queued,
@@ -1389,7 +1358,11 @@ impl Methods {
         if ticks < PACING_WINDOW {
             return;
         }
-        let pacing = core::mem::take(&mut self.pacing);
+        let mut pacing = core::mem::take(&mut self.pacing);
+        // A scanout composing now keeps its count for the next window.
+        if let Some(scanout) = &mut self.scanout {
+            pacing.gpu = scanout.take_gpu_stats();
+        }
         if pacing.presented != 0 || pacing.submitted != 0 {
             self.record_log(Log::Pacing(Box::new(Pacing {
                 ticks,
@@ -1453,21 +1426,19 @@ impl Methods {
     /// if a swap is ready and no compose is in flight: the swaps it shows,
     /// the newest one's layers and the rows that may change.
     fn batch(&mut self, now: u64) -> Option<Batch> {
-        if !self.display.borrow().active() || self.composing() {
+        if !self.display.borrow().active() || self.composing.is_some() {
             return None;
         }
         self.refresh(now);
         if !self.swap_ready(now) {
             // The frame on screen again, whole, completing no swap.
             let planes = self.shown.filter(|_| self.repaint_wanted())?;
-            let layers: Vec<scanout::Layer> = planes.iter().flatten().copied().collect();
             return Some(Batch {
                 now,
                 due: now,
                 count: 0,
                 planes,
-                surface_ids: alloc::vec![None; layers.len()],
-                layers,
+                layers: planes.iter().flatten().copied().collect(),
                 damage: None,
             });
         }
@@ -1476,17 +1447,6 @@ impl Methods {
         let newest = &self.frames[count - 1];
         let planes = newest.planes;
         let layers = newest.layers();
-        // A slot's surface is the one the newest swap that set it named.
-        let shown = || self.frames.iter().take(count).rev();
-        let surface_ids = (0..swap::LAYERS)
-            .filter(|&slot| planes[slot].is_some())
-            .map(|slot| {
-                shown()
-                    .find(|frame| frame.updated & 1 << slot != 0)
-                    .map(|frame| frame.surface_ids[slot])
-                    .filter(|&id| id != 0)
-            })
-            .collect();
         let updated = self
             .frames
             .iter()
@@ -1501,7 +1461,6 @@ impl Methods {
             count,
             planes,
             layers,
-            surface_ids,
             damage,
         })
     }
@@ -1518,7 +1477,7 @@ impl Methods {
         page: u64,
         resolve: impl FnMut(u64) -> core::result::Result<u64, stela_contracts::dma::DmaError>,
     ) -> Option<Compose> {
-        if self.composing() || self.scanout.is_none() || self.in_place {
+        if self.composing.is_some() || self.scanout.is_none() || self.in_place {
             return None;
         }
         // Read-only until it is certain the compose leaves: the batch is
@@ -1531,7 +1490,6 @@ impl Methods {
             scanout,
             composed,
             probe.layers.clone(),
-            probe.surface_ids.clone(),
             probe.damage.clone(),
             pages,
         );
@@ -1564,10 +1522,9 @@ impl Methods {
         ))
     }
 
-    /// Whether a compose outside the devices' lock is in flight, or the
-    /// host GPU is still composing the frame one handed it.
+    /// Whether a compose outside the devices' lock is in flight.
     pub fn composing(&self) -> bool {
-        self.composing.is_some() || self.gpu.is_some()
+        self.composing.is_some()
     }
 
     /// Take back what a finished compose left, if it did: the scanout and
@@ -1575,13 +1532,8 @@ impl Methods {
     /// presented, `Ok(false)` when nothing finished or a read missed the
     /// resolved pages (the latch stays open for a present in place), and
     /// the present's refusal. A compose in flight is waited for at most
-    /// `spins` spin-loop hints. A frame the host GPU took presents only
-    /// once the GPU is done with it, which is asked again for at most
-    /// `spins` hints; until then this is `Ok(false)` and the swaps wait.
+    /// `spins` spin-loop hints.
     pub fn finish_compose(&mut self, spins: u64) -> Result<bool> {
-        if self.gpu.is_some() {
-            return Ok(self.finish_gpu(spins));
-        }
         let Some((_, done)) = &self.composing else {
             return Ok(false);
         };
@@ -1591,73 +1543,33 @@ impl Methods {
             composed,
             result,
             missed,
-            gpu,
-            gpu_refused,
+            declined,
         }) = finished
         else {
             return Ok(false);
         };
+        let on_gpu = declined.is_none() && result.is_ok();
+        if let Some(reason) = declined
+            && self.cpu_composes.insert(reason)
+        {
+            self.reported
+                .push(format!("IOMFB composes on the CPU: {reason}"));
+        }
         let (batch, _) = self.composing.take().expect("checked above");
         self.scanout = Some(sink);
         self.frame = composed;
-        if let Some(reason) = gpu_refused {
-            self.pacing.gpu_fallbacks += 1;
-            if !core::mem::replace(&mut self.gpu_refusal_reported, true) {
-                self.reported.push(format!(
-                    "IOMFB the host GPU refused to compose a frame: {reason}; \
-                     the CPU composes the frames it refuses"
-                ));
-            }
-        }
-        if let Some(pending) = gpu {
-            self.pacing.gpu_frames += 1;
-            self.gpu = Some(GpuPresent { batch, pending });
-            return Ok(self.finish_gpu(spins));
-        }
         if missed {
             self.in_place = true;
             return Ok(false);
         }
-        self.pacing
-            .cpu_compose
-            .add(self.now.saturating_sub(batch.now));
         if batch.count == 0 {
             return self.repainted(result).map(|()| false);
         }
         result?;
+        self.pacing.gpu_composed += u32::from(on_gpu);
+        self.pacing.cpu_composed += u32::from(!on_gpu);
         self.presented(batch);
         Ok(true)
-    }
-
-    /// Finish the present the host GPU is composing once the GPU is done,
-    /// asking at most `spins` spin-loop hints apart: true when it presented
-    /// a swap. The GPU wrote the scanout whole or not at all, so a present
-    /// it took does not fail here.
-    fn finish_gpu(&mut self, spins: u64) -> bool {
-        let Some(GpuPresent { pending, .. }) = &self.gpu else {
-            return false;
-        };
-        let scanout = self
-            .scanout
-            .as_mut()
-            .expect("a GPU present gives the scanout back");
-        let mut left = spins;
-        while !scanout.gpu_pending_done(pending) {
-            if left == 0 {
-                return false;
-            }
-            core::hint::spin_loop();
-            left -= 1;
-        }
-        let GpuPresent { batch, .. } = self.gpu.take().expect("checked above");
-        self.pacing.gpu.add(self.now.saturating_sub(batch.now));
-        if batch.count == 0 {
-            // The frame on screen again ([`Self::repainted`]): no swap.
-            self.unshown = 0;
-            return false;
-        }
-        self.presented(batch);
-        true
     }
 
     /// Finish a present of the frame on screen again: it completes no swap.
@@ -1687,7 +1599,6 @@ impl Methods {
             count,
             planes,
             layers,
-            surface_ids: _,
             damage: _,
         } = batch;
         // A vblank passed during a compose opened a new latch: it stays.
@@ -2884,12 +2795,15 @@ fn visible(
     let mut shown = [None; swap::LAYERS];
     for (shown, layer) in shown.iter_mut().zip(planes) {
         if let Some(layer) = layer {
-            *shown = Some(scanout::Layer::new(
-                layer.record.surface(layer.dva)?,
-                layer.source,
-                layer.destination,
-                layer.record.premultiplied,
-            )?);
+            *shown = Some(
+                scanout::Layer::new(
+                    layer.record.surface(layer.dva)?,
+                    layer.source,
+                    layer.destination,
+                    layer.record.premultiplied,
+                )?
+                .with_id(layer.id),
+            );
         }
     }
     Ok(shown)

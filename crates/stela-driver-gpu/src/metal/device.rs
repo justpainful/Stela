@@ -36,6 +36,7 @@ const MARKER_MEMORY: MemoryRequest = MemoryRequest {
     mapped: true,
 };
 
+pub mod display;
 mod execution_sets;
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -171,6 +172,8 @@ pub struct Device<B: Backend, C: Compiler> {
     /// The most deferred bytes that only held work kept ([`DeviceMemory`]).
     peak_pinned: u64,
     allocated: u64,
+    /// Display layers composed from a device copy of their planes.
+    display_copies: u64,
     /// The allocations that ran out of memory ([`reclaim`]).
     shortage: reclaim::Shortage,
     /// The service's lock, which says when the platform withdrew a host
@@ -390,6 +393,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             release_serial: None,
             peak_pinned: 0,
             allocated: 0,
+            display_copies: 0,
             shortage: reclaim::Shortage::default(),
             host_calls: None,
             memory_cap: crate::metal::vulkan::physical::VRAM_CAP,
@@ -445,31 +449,6 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .as_ref()
             .filter(|_| !self.lost)
             .map(|marker| marker.word)
-    }
-
-    /// Imports the display's scanout buffer `handle` for display frames
-    /// composed here ([`crate::metal::compose`]): the dma-buf `fd` of
-    /// `bytes`, which the driver takes on success and the caller keeps on
-    /// failure.
-    pub fn import_compose_target(&mut self, handle: u32, fd: i32, bytes: u64) -> Result<()> {
-        self.ensure_admission()?;
-        self.backend.import_compose_target(handle, fd, bytes)
-    }
-
-    /// Composes a display frame on the queue, after the Metal work
-    /// submitted before it.
-    pub fn compose(
-        &mut self,
-        job: &crate::metal::compose::Job<'_>,
-    ) -> Result<crate::metal::compose::Submitted> {
-        self.ensure_admission()?;
-        self.backend.compose(job)
-    }
-
-    /// The host's view of the compose marker, valid while this device
-    /// lives and is not lost ([`Backend::compose_marker`]).
-    pub fn compose_word(&self) -> Option<NonNull<AtomicU32>> {
-        self.backend.compose_marker().filter(|_| !self.lost)
     }
 
     /// The marker buffer the commands writing serial `serial` write, for the

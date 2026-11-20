@@ -17,6 +17,56 @@ pub(crate) unsafe fn enter(
     unsafe { super::block_entry::enter(code, state, first, second) }
 }
 
+#[cfg(target_os = "macos")]
+core::arch::global_asm!(
+    "_stela_counted_enter:",
+    "push r13",
+    "mov r13, [rdi + {account}]",
+    "lea r11, [rsp - 8]",
+    "mov [rdi + {exit_rsp}], r11",
+    "call rcx",
+    "mov [rdi + {account}], r13",
+    "pop r13",
+    "ret",
+    account = const super::pinned::ACCOUNT_HOME,
+    exit_rsp = const super::chain::EXIT_RSP_OFFSET,
+);
+#[cfg(not(target_os = "macos"))]
+core::arch::global_asm!(
+    "stela_counted_enter:",
+    "push r13",
+    "mov r13, [rdi + {account}]",
+    "lea r11, [rsp - 8]",
+    "mov [rdi + {exit_rsp}], r11",
+    "call rcx",
+    "mov [rdi + {account}], r13",
+    "pop r13",
+    "ret",
+    account = const super::pinned::ACCOUNT_HOME,
+    exit_rsp = const super::chain::EXIT_RSP_OFFSET,
+);
+
+unsafe extern "sysv64" {
+    fn stela_counted_enter(state: *mut GuestState, first: u64, second: u64, code: u64) -> u128;
+}
+
+/// [`enter`] for code that runs on the chain's account
+/// ([`super::chain::ACCOUNT`]) without an entry of its own, as links,
+/// tails and probes do: the account taken from `state.account` before and
+/// put back after, the host's R13 kept.
+///
+/// # Safety
+/// As for [`enter`].
+pub(crate) unsafe fn enter_counted(
+    code: *const u8,
+    state: *mut GuestState,
+    first: u64,
+    second: u64,
+) -> u128 {
+    // SAFETY: the caller's contract; the entry keeps R13 for its caller.
+    unsafe { stela_counted_enter(state, first, second, code as u64) }
+}
+
 /// [`enter`] with what the code returns in RAX, or RAX and RDX, taken as
 /// `R`: a value of at most 16 bytes, its low bytes first.
 ///

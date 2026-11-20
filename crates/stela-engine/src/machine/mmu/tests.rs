@@ -575,3 +575,308 @@ fn fault_syndromes_and_hpfar_follow_the_stage_and_the_walk() {
     );
     assert_eq!(fault(FaultKind::ExternalOnWalk, false).hpfar(), None);
 }
+
+/// A deterministic generator for the walk-table tests (xorshift64*).
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len() as u64) as usize]
+    }
+}
+
+/// Stage-2 tables at this PA map IPA 0-4 GiB to the same PAs in 1 GiB
+/// Normal Write-Back read/write blocks.
+const IDENTITY_VTTBR: u64 = 0xf000_0000;
+
+/// A random leaf of `size` bytes: a page (`page`) or a block descriptor,
+/// with random access flag, permissions, attributes, nG, PXN, UXN and GP,
+/// its output mostly in the first 4 GiB.
+fn random_leaf(random: &mut Random, size: u64, page: bool) -> u64 {
+    let output = if random.chance(95) {
+        random.below(0x1_0000_0000 / size) * size
+    } else {
+        (1 << 45) | (random.below(1 << 20) * size)
+    };
+    let mut descriptor = output | if page { 0b11 } else { 0b01 };
+    for (bit, percent) in [(10, 90), (11, 50), (53, 30), (54, 30), (50, 10)] {
+        if random.chance(percent) {
+            descriptor |= 1 << bit;
+        }
+    }
+    descriptor | random.below(4) << 6 | random.below(4) << 8 | random.below(8) << 2
+}
+
+/// A random table descriptor to `child`, with random hierarchical limits.
+fn random_table(random: &mut Random, child: u64) -> u64 {
+    let mut descriptor = child | 0b11;
+    for bit in 59..=62 {
+        if random.chance(25) {
+            descriptor |= 1 << bit;
+        }
+    }
+    descriptor
+}
+
+/// The granule and input bits of the half of `controls` that `address`
+/// selects.
+fn walk_shape(controls: &Controls, address: u64) -> (u32, u32) {
+    let upper = controls.regime != Regime::El2 && address & (1 << 55) != 0;
+    let (tnsz_shift, tg_shift) = if upper { (16, 30) } else { (0, 14) };
+    let granule_bits = match (controls.tcr >> tg_shift & 3, upper) {
+        (0, false) | (2, true) => 12,
+        _ => 14,
+    };
+    let input_bits = 64 - geometry::forced_tnsz((controls.tcr >> tnsz_shift & 63) as u32);
+    (granule_bits, input_bits)
+}
+
+/// Random stage-1 tables on the walk of `address` under `controls`: a path
+/// of random table descriptors to a table at level 2 or 3 whose entries
+/// are all random (invalid, pages, blocks, reserved encodings and, above
+/// level 3, tables of random pages). Returns that table's level.
+fn random_tables(
+    random: &mut Random,
+    controls: &Controls,
+    address: u64,
+    tables: &mut Tables,
+) -> i8 {
+    let upper = controls.regime != Regime::El2 && address & (1 << 55) != 0;
+    let ttbr = if upper {
+        controls.ttbr1
+    } else {
+        controls.ttbr0
+    };
+    let (granule_bits, input_bits) = walk_shape(controls, address);
+    let geometry = geometry::Geometry::stage1(granule_bits, input_bits);
+    let granule = 1u64 << granule_bits;
+    let mut next = 0x100_0000 + u64::from(upper) * 0x800_0000;
+    let mut allocate = || {
+        let table = next;
+        next += granule;
+        table
+    };
+    let last = (if random.chance(30) { 2 } else { 3 }).max(geometry.start_level);
+    let mut table = ttbr & 0x0000_ffff_ffff_f000 & !(geometry.start_table_bytes().max(64) - 1);
+    let mut level = geometry.start_level;
+    while level < last {
+        let child = allocate();
+        let slot = table + geometry.index(address, level) * 8;
+        tables.0.insert(slot, random_table(random, child));
+        table = child;
+        level += 1;
+    }
+    let size = 1u64 << geometry.shift(level);
+    for index in 0..1u64 << geometry.index_bits(level) {
+        let descriptor = match random.below(100) {
+            0..15 => 0,
+            15..20 => random.next() & !1,
+            _ if level == 3 => {
+                let page = random.chance(90);
+                random_leaf(random, size, page)
+            }
+            20..60 => random_leaf(random, size, false),
+            _ => {
+                let child = allocate();
+                let page = size >> (granule_bits - 3);
+                for _ in 0..32 {
+                    let slot = child + random.below(granule / 8) * 8;
+                    let leaf = random_leaf(random, page, true);
+                    tables.0.insert(slot, leaf);
+                }
+                random_table(random, child)
+            }
+        };
+        if descriptor != 0 {
+            tables.0.insert(table + index * 8, descriptor);
+        }
+    }
+    level
+}
+
+/// Random translation controls: any regime, either granule, region sizes,
+/// HPD, TBI, TBID, E0PD, EPD, WXN, EPAN, MAIR, SPRR and, in EL1&0, a stage
+/// 2 that maps the first 4 GiB as they are.
+fn random_controls(random: &mut Random) -> Controls {
+    let regime = random.pick(&[Regime::El20, Regime::El20, Regime::El10, Regime::El2]);
+    let sixteen = random.chance(70);
+    let mut tcr = if regime == Regime::El2 {
+        random.pick(&[17u64, 25, 28]) | if sixteen { 2 << 14 } else { 0 } | 5 << 16
+    } else {
+        random.pick(&[17u64, 25, 28])
+            | random.pick(&[17u64, 25, 28]) << 16
+            | if sixteen { 2 << 14 | 1 << 30 } else { 2 << 30 }
+            | 5 << 32
+    };
+    let bits: &[u32] = if regime == Regime::El2 {
+        &[20, 24, 29]
+    } else {
+        &[7, 23, 36, 37, 38, 41, 42, 51, 52, 55, 56]
+    };
+    for &bit in bits {
+        let percent = match bit {
+            7 | 23 | 55 | 56 => 4,
+            _ => 30,
+        };
+        if random.chance(percent) {
+            tcr |= 1 << bit;
+        }
+    }
+    let mut sctlr = SCTLR_M | alignment::SCTLR_C | 1 << 12;
+    if random.chance(10) {
+        sctlr |= SCTLR_WXN;
+    }
+    if random.chance(30) {
+        sctlr |= 1 << 57;
+    }
+    let mair = (0..8).fold(0u64, |mair, index| {
+        mair | u64::from(random.pick(&[0xffu8, 0x44, 0x00, 0x04, 0xbb, 0xf0])) << (8 * index)
+    });
+    let sprr = if random.chance(20) {
+        Sprr {
+            config: SPRR_CONFIG_EN,
+            el1: random.next(),
+            el0: random.next(),
+            ..Sprr::default()
+        }
+    } else {
+        Sprr::default()
+    };
+    let stage2 = regime == Regime::El10 && random.chance(25);
+    Controls {
+        sctlr,
+        tcr,
+        ttbr0: 0x10_0000 | random.below(256) << 48,
+        ttbr1: 0x20_0000 | random.below(256) << 48,
+        mair,
+        xs: test_xs(),
+        sprr,
+        regime,
+        stage2,
+        second_stage: stage2.then_some(Stage2 {
+            hcr: HCR_VM,
+            vtcr: VTCR,
+            vttbr: IDENTITY_VTTBR,
+            xs: test_xs(),
+        }),
+        ..Controls::default()
+    }
+}
+
+/// A walk that starts at a table an earlier walk noted gives what a full
+/// walk gives, for every entry of that table, every access and requester,
+/// any regime, granule, stage 2, SPRR and hierarchical limits; an address
+/// the table does not hold walks in full.
+#[test]
+fn walks_from_a_noted_table_translate_as_full_walks() {
+    test_translation_chip();
+    let mut random = Random(0x5eed_0f7a_b1e5);
+    let requesters = [
+        KERNEL,
+        Requester {
+            pan: true,
+            ..KERNEL
+        },
+        Requester { el: 0, ..KERNEL },
+        Requester {
+            unprivileged: true,
+            ..KERNEL
+        },
+        Requester {
+            guarded: true,
+            ..KERNEL
+        },
+    ];
+    let accesses = [Access::Read, Access::Write, Access::Execute];
+    let (mut compared, mut held, mut outside, mut mapped) = (0u64, 0u64, 0u64, 0u64);
+    for _ in 0..300 {
+        let controls = random_controls(&mut random);
+        let mut tables = Tables::default();
+        for block in 0..4u64 {
+            tables.0.insert(
+                IDENTITY_VTTBR + block * 8,
+                block << 30 | 1 | 1 << 10 | 0b11 << 6 | 0b1111 << 2 | 0b11 << 8,
+            );
+        }
+        let upper = controls.regime != Regime::El2 && random.chance(50);
+        let low = random.below(1 << 36);
+        let mut address = if upper {
+            low | 0xffff_fff0_0000_0000
+        } else {
+            low
+        };
+        if random.chance(20) {
+            address = address & !(0xff << 56) | random.below(256) << 56;
+        }
+        let level = random_tables(&mut random, &controls, address, &mut tables);
+        let requester = random.pick(&requesters);
+        let access = random.pick(&accesses);
+        let (outcome, noted) = translate_noting(&controls, address, access, requester, &mut tables);
+        assert_eq!(
+            outcome,
+            translate(&controls, address, access, requester, &mut tables)
+        );
+        let Some(noted) = noted else {
+            continue;
+        };
+        let (granule_bits, _) = walk_shape(&controls, address);
+        let stride = granule_bits - 3;
+        let entry_bits = granule_bits + stride * (3 - level) as u32;
+        let span_bits = entry_bits + stride;
+        let mut targets: alloc::vec::Vec<u64> = (0..64)
+            .map(|_| {
+                let entry = random.below(1 << stride);
+                let offset = random.below(1 << entry_bits);
+                address & !((1u64 << span_bits) - 1) | entry << entry_bits | offset
+            })
+            .collect();
+        for distance in 1..=4u64 {
+            targets.push(address.wrapping_add(distance << entry_bits));
+            targets.push(address.wrapping_sub(distance << entry_bits));
+        }
+        // Outside the table: other indices above it, the other half,
+        // another top byte.
+        targets.extend([
+            address ^ 1 << 33,
+            address ^ 1 << 55,
+            address ^ 1 << 60,
+            address.wrapping_add(1 << span_bits),
+        ]);
+        for target in targets {
+            if noted.holds(target) {
+                held += 1;
+            } else {
+                outside += 1;
+            }
+            for requester in requesters {
+                for access in accesses {
+                    compared += 1;
+                    let full = translate(&controls, target, access, requester, &mut tables);
+                    mapped += u64::from(matches!(full, Outcome::Mapped(_)));
+                    assert_eq!(
+                        translate_from(&controls, &noted, target, access, requester, &mut tables),
+                        full,
+                        "{target:#x} {access:?} {requester:?} from {address:#x} {controls:#x?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(held > 10_000 && outside > 500, "{held} {outside}");
+    assert!(compared > 200_000 && mapped > 20_000, "{compared} {mapped}");
+}

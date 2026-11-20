@@ -261,7 +261,7 @@ impl Heap {
         let state = unsafe { &mut *self.state.get() };
         // A block a core's cache handed out is not in `state.live`.
         if let Some(class) = class(layout) {
-            state.live = state.live.saturating_sub(super::SMALLEST << class);
+            state.live = state.live.saturating_sub(super::class_bytes(class));
             // SAFETY: the caller's block of this class, which it no longer
             // accesses.
             unsafe { slab_give(state, class, pointer) };

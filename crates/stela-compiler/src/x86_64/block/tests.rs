@@ -1,4 +1,4 @@
-use super::super::chain::{DIRECT_EXIT_BYTES, DYNAMIC_EXIT_BYTES};
+use super::super::chain::DIRECT_EXIT_BYTES;
 use super::*;
 use crate::block::{SynchronousTrap, TrapKind};
 use alloc::vec;
@@ -1977,9 +1977,9 @@ fn conditional_exits_branch_over_the_fallthrough_exit() {
     assert_eq!(code[..6], [0x0f, 0x85, DIRECT_EXIT_BYTES as u8, 0, 0, 0]);
     assert_eq!(code[6..6 + DIRECT_EXIT_BYTES], fallthrough);
     assert_eq!(code[6 + DIRECT_EXIT_BYTES..], taken);
-    // The branch, then MOVABS, MOV, the patch point, the return (one
-    // emission) and four INT3s each.
-    assert_eq!(code.instructions(), 17);
+    // The branch, then each exit's point (one emission), MOVABS, and its
+    // word and return (one emission).
+    assert_eq!(code.instructions(), 7);
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
@@ -3003,9 +3003,7 @@ fn clock_exit_requests_runtime_service_without_counter_or_guest_writes() {
             Some(&(pc, Terminator::Clock(request))),
             request.next_pc,
         );
-        let mut expected = vec![0x48, 0xb8];
-        expected.extend(pc.0.to_le_bytes());
-        expected.extend(super::super::chain::exit_word(7));
+        let expected = super::super::chain::direct_exit_word(pc, 7);
         // No RDTSC, host helper address, guessed counter, destination write
         // or placeholder ISB: only the checked runtime service may complete.
         assert_eq!(native.x86_64_code, expected);
@@ -3045,9 +3043,7 @@ fn pac_helper_exit_has_no_guest_writes_or_embedded_service_address() {
             Some(&(pc, Terminator::PointerAuthentication(request))),
             request.next_pc,
         );
-        let mut expected = vec![0x48, 0xb8];
-        expected.extend(pc.0.to_le_bytes());
-        expected.extend(super::super::chain::exit_word(6));
+        let expected = super::super::chain::direct_exit_word(pc, 6);
         // Only the SysV return registers RAX/RDX are touched, including for
         // RETAB: the runtime must keep signed LR while authenticating target.
         assert_eq!(native.x86_64_code, expected);
@@ -3083,8 +3079,8 @@ fn ordinary_native_prefix_is_preserved_before_pac_boundary() {
     assert_eq!(native.source_map.len(), 2);
     assert_eq!(native.source_map[1].0, pc);
     assert_eq!(
-        &native.x86_64_code[native.x86_64_code.len() - DYNAMIC_EXIT_BYTES..],
-        super::super::chain::exit_word(6)
+        native.x86_64_code[native.x86_64_code.len() - DIRECT_EXIT_BYTES..],
+        super::super::chain::direct_exit_word(pc, 6)
     );
 }
 
@@ -3107,9 +3103,8 @@ fn trap_exit_uses_instruction_pc_and_only_native_return_scratch_registers() {
             Some(&(pc, Terminator::Trap(trap))),
             GuestAddress(pc.0 + 4),
         );
-        let mut expected = vec![0x48, 0xb8]; // movabs rax,instruction_pc
-        expected.extend(pc.0.to_le_bytes());
-        expected.extend(super::super::chain::exit_word(5)); // mov edx,Trap; ret
+        // The point, movabs rax,instruction_pc, mov edx,Trap and the return.
+        let expected = super::super::chain::direct_exit_word(pc, 5);
         assert_eq!(native.x86_64_code, expected);
         assert_eq!(native.source_map, [(pc, 0)]);
     }

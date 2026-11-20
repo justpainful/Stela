@@ -3,20 +3,26 @@
 //! successor's code, so the dispatcher runs once for a chain of blocks.
 //!
 //! Each PE owns one [`ChainControl`] that [`Anchor::Control`] names. Before it
-//! enters a block it sets `budget` to the chained transfers it allows,
-//! `retired`, `linked` and `hits` to 0 and `block` to the entered block's
-//! index. Each thunk takes one transfer from `budget` (or, when none is
-//! left, exits exactly as the redirected exit would), adds the
-//! instructions of the block it leaves to `retired` and names the block it
-//! enters in `block`; only a table probe counts its transfers apart, in
-//! `hits`, and the engine takes the others from the budget spent. Notifications publish a monotonic interrupt epoch;
-//! every thunk compares it with the owner's acknowledged pre-drain snapshot
-//! before spending the local budget. A mismatch takes the original exit. After the native
-//! call returns, `block` is the block whose exit or fault ended the run, in
-//! its low 32 bits, and the BTYPE it was entered with in bits 33:32: 0 from
-//! every thunk but a lookup dispatcher of a BR or BLR form.
-//! Thunks clobber only RAX, RCX, RDX and flags, which every direct exit
-//! already may.
+//! enters a block the engine sets `linked` and `hits` to 0 and `block` to the
+//! entered block's index, and the run's [`Account`] to the chained transfers
+//! it allows and no instructions. Native code keeps the account in a host
+//! register, [`ACCOUNT`], whose home outside native code is
+//! `GuestState::account` ([`super::pinned`]). Each link adds the instructions
+//! of the block it leaves and takes one transfer off in one LEA, then tests
+//! the transfers left by MOVZX and JRCXZ: none left takes the instructions
+//! off again and exits exactly as the redirected exit would. Otherwise it
+//! names the block it enters in `block`; only a table probe counts its
+//! transfers apart, in `hits`, and the engine takes the others from the
+//! budget spent. Notifications publish a monotonic interrupt epoch; every
+//! polled link compares it with the owner's acknowledged pre-drain snapshot
+//! before spending the budget. A mismatch takes the original exit. After the
+//! native call returns, `block` is the block whose exit or fault ended the
+//! run, in its low 32 bits, and the BTYPE it was entered with in bits 33:32:
+//! 0 from every link but a lookup dispatcher of a BR or BLR form.
+//! Links clobber only RAX, RCX and RDX, which every direct exit already may,
+//! and never the flags: LEA, MOVZX, NOT, MOV and JRCXZ leave them, so NZCV a
+//! block keeps in the host's flags could cross one. Tails and probes compare
+//! targets and clobber the flags.
 //!
 //! Live code changes only at patch points, each one instruction of
 //! [`PATCH_BYTES`] that lies in one aligned 8-byte word ([`patchable`]):
@@ -25,11 +31,11 @@
 //! instruction, so the host replaces it with one aligned 8-byte store, and
 //! the core runs either the old instruction or the new one, each complete:
 //! the jump to the exit's return to the engine ([`RET_ROOM`]) or a
-//! `jmp rel32` to a thunk or tail at an exit, a jump to the exit or
-//! [`NOP5`] into the slot's body at a slot. Whatever a new instruction
-//! reaches is written, and serialized by the writer, before the store: a
-//! thunk or tail in fresh arena bytes, or a slot's body, which nothing runs
-//! while its point still jumps over it. A body once linked is not written
+//! `jmp rel32` to a thunk or tail at an exit, a jump to the exit or the
+//! first bytes of the slot's body at a slot ([`link`]). Whatever a new
+//! instruction reaches is written, and serialized by the writer, before the
+//! store: a thunk or tail in fresh arena bytes, or the rest of a slot's
+//! body, which nothing runs while its point still jumps over it. A body once linked is not written
 //! again, as a core may still be in it after an unlink; a later link of its
 //! exit takes a thunk. Code is emitted unpadded and padded where it lands
 //! ([`align_direct_exit`]), as exits move with the code before them.
@@ -87,36 +93,45 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
 
-/// Bytes in a direct exit: `movabs rax, target` and a [`DYNAMIC_EXIT_BYTES`]
-/// exit.
+/// Bytes in a direct exit: its patch point with the pads around it
+/// ([`EXIT_POINT_BYTES`]), `movabs rax, target`, `mov edx, word` and the
+/// [`EXIT_RETURN`]. Only the unlinked path runs past the point.
 pub const DIRECT_EXIT_BYTES: usize = 10 + DYNAMIC_EXIT_BYTES;
 /// Bytes of a `jmp rel32`: what an install writes over the start of a
 /// direct exit before the code is reachable.
 pub const JUMP_BYTES: usize = 5;
 /// Bytes of the one instruction a live patch changes ([`patchable`]): a
-/// `jmp rel32`, or the [`RET_ROOM`] or [`NOP5`] it replaces.
+/// `jmp rel32`, the [`RET_ROOM`] it replaces, or the first bytes of a link
+/// slot's body ([`link`]).
 pub const PATCH_BYTES: usize = JUMP_BYTES;
 /// The most NOP bytes before a patch point that keep its instruction in
 /// one aligned 8-byte word ([`patch_pad`]).
 const MAX_PAD: usize = 4;
-/// Bytes of a [`link`]'s body, without and with the interruption gate.
-pub const LINK_BODY_BYTES: usize = 34;
-pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 10;
-/// Bytes in the largest [`thunk`]: the body and a return's `mov edx` and
-/// [`EXIT_RETURN`].
-pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + 5 + EXIT_RETURN_BYTES;
+/// Bytes of a [`link`]'s body, without and with the interruption gate, at
+/// most ([`LinkGate::Jrcxz`]'s): a slot keeps room for either tier's.
+pub const LINK_BODY_BYTES: usize = 33;
+pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 4;
+/// Bytes in the largest [`thunk`]: the body and the jump to the exit.
+pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + JUMP_BYTES;
 /// Bytes of the link slot before an exit in its page ([`link_slot`]): the
-/// pad, the patch point and the body, without and with the gate.
-pub const LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + LINK_BODY_BYTES;
-pub const POLLED_LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + POLLED_LINK_BODY_BYTES;
+/// pad and the body, which starts at the patch point, without and with the
+/// gate.
+pub const LINK_BYTES: usize = MAX_PAD + LINK_BODY_BYTES;
+pub const POLLED_LINK_BYTES: usize = MAX_PAD + POLLED_LINK_BODY_BYTES;
 /// The span within which a link needs no translation of its own.
 const LINK_PAGE: u64 = 4096;
-/// Bytes in an exit to a dynamic target in RAX: `mov edx, kind`, a pad,
-/// then the patch point, a `jmp rel32` ([`dynamic_patch`]), and the
-/// [`EXIT_RETURN`] it falls into while unlinked.
-pub const DYNAMIC_EXIT_BYTES: usize = 5 + MAX_PAD + PATCH_BYTES + EXIT_RETURN_BYTES;
+/// Bytes in an exit to a dynamic target in RAX: its patch point with the
+/// pads around it ([`EXIT_POINT_BYTES`], [`dynamic_patch`]), then
+/// `mov edx, kind` and the [`EXIT_RETURN`], which only the unlinked path
+/// runs: a linked point jumps to a tail that sets EDX where it needs it.
+pub const DYNAMIC_EXIT_BYTES: usize = EXIT_POINT_BYTES + 5 + EXIT_RETURN_BYTES;
+/// Bytes every exit starts with: a NOP of the pad that makes its patch
+/// point patchable where it lies ([`patch_pad`]), the point, and a NOP of
+/// the rest of [`MAX_PAD`], so what follows lies at one offset of the exit
+/// however it is padded (a target's guest address field among it).
+pub const EXIT_POINT_BYTES: usize = MAX_PAD + PATCH_BYTES;
 /// [`crate::GuestState::exit_rsp`], from RDI.
 pub const EXIT_RSP_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, exit_rsp) as i32;
 /// Bytes of [`EXIT_RETURN`].
@@ -138,10 +153,18 @@ pub const EXIT_RSP_STORE: [u8; 12] = {
         0x4c, 0x8d, 0x5c, 0x24, 0xf8, 0x4c, 0x89, 0x9f, d[0], d[1], d[2], d[3],
     ]
 };
-/// An unlinked exit's patch point: a `jmp rel32` to the [`EXIT_RETURN`]
-/// right after it.
-pub const RET_ROOM: [u8; PATCH_BYTES] = [0xe9, 0, 0, 0, 0];
-/// A linked slot's patch point: the 5-byte NOP that falls into its body.
+/// An unlinked exit's patch point: a 5-byte NOP into the return to the
+/// engine after it ([`unlinked_return`]).
+pub const RET_ROOM: [u8; PATCH_BYTES] = NOP5;
+/// A linked slot's patch point ([`link`]): the first bytes of its body's
+/// first instruction, `mov rdx, [rdi + anchors + 8 * Control]`, the same
+/// in every slot.
+pub const LINKED_SLOT: [u8; PATCH_BYTES] = {
+    let anchor = core::mem::offset_of!(crate::GuestState, anchors) + Anchor::Control as usize * 8;
+    let d = (anchor as u32).to_le_bytes();
+    [0x48, 0x8b, 0x97, d[0], d[1]]
+};
+/// The 5-byte NOP (Intel SDM vol. 2, NOP).
 pub const NOP5: [u8; PATCH_BYTES] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
 /// The bits of a PC above which [`lookup_slot`] folds the next ones in:
 /// what selects an entry of the largest block table.
@@ -182,9 +205,10 @@ fn sized(value: usize, low: usize, high: usize) -> usize {
     }
 }
 
-/// The block table entries for an arena of `code_bytes`, which the host
-/// sizes from its memory ([`LookupTable::with_entries`]): the power of two
-/// at least one entry per [`CODE_BYTES_PER_ENTRY`]. Rounded down, a 976 MiB
+/// The block table entries an arena of `code_bytes` full of blocks takes,
+/// which the host sizes from its memory: the power of two at least one
+/// entry per [`CODE_BYTES_PER_ENTRY`]. A board's table starts at
+/// [`first_lookup_entries`] and grows to it as its blocks fill it. Rounded down, a 976 MiB
 /// window took 2 M entries for its 2.9 M blocks, and half of the entries
 /// fetches would add were put off as other inserts kept displacing them
 /// (run 20261111-025825: `targets=` deferred 513 K of 1.09 M a beat).
@@ -194,6 +218,32 @@ pub fn lookup_entries(code_bytes: usize) -> usize {
         .next_power_of_two()
         .clamp(MIN_LOOKUP_ENTRIES, MAX_LOOKUP_ENTRIES)
 }
+
+/// Arena bytes per entry of a board's first block table, which doubles
+/// as its blocks fill it ([`LookupTable::grow`]): half of
+/// [`CODE_BYTES_PER_ENTRY`], so a window whose blocks stay few keeps half
+/// the table. Run 20261120 M4n held 1.22 M blocks in a 640 MiB window,
+/// whose 4 M entries (128 MiB) were 29% full.
+const FIRST_CODE_BYTES_PER_ENTRY: usize = 2 * CODE_BYTES_PER_ENTRY;
+
+/// The block table entries a board starts with for an arena of
+/// `code_bytes`: the power of two at least one entry per
+/// [`FIRST_CODE_BYTES_PER_ENTRY`].
+pub fn first_lookup_entries(code_bytes: usize) -> usize {
+    (code_bytes / FIRST_CODE_BYTES_PER_ENTRY)
+        .max(1)
+        .next_power_of_two()
+        .clamp(MIN_LOOKUP_ENTRIES, MAX_LOOKUP_ENTRIES)
+}
+
+/// A block table doubles once its live blocks reach this many tenths of
+/// its entries ([`LookupTable::grow`]).
+const GROW_LOAD_TENTHS: usize = 7;
+
+/// The sets of the old table one growth step copies, under the board's
+/// lock: 0.4 ms on the host (a 2 M-entry table's growth took 64 steps,
+/// the longest 0.55 ms), far below the 0.5 s an exit may take.
+const GROW_STEP_SETS: usize = 1 << 14;
 
 /// The ITLB entries for a PE whose arena holds `code_bytes`
 /// ([`LookupTable::itlb_with`]).
@@ -216,8 +266,26 @@ pub const KEY_STATES: u32 = 1 << (u64::BITS - KEY_STATE_SHIFT);
 const CONTROL: Place = Place::new(Anchor::Control, 0);
 /// The PE's [`ChainControl`], for code outside the chain's thunks.
 pub(crate) const CONTROL_PLACE: Place = CONTROL;
-/// [`ChainControl::retired`], from the control's address.
-pub(crate) const RETIRED_OFFSET: i32 = RETIRED;
+
+/// The host register that holds the run's [`Account`] while native code
+/// runs: R13, which X17 gave up ([`super::pinned::PINNED`]). Emitters never
+/// take it for scratch.
+pub(crate) const ACCOUNT: Gpr = Gpr::R13;
+
+/// `destination` = the instructions the account counts
+/// ([`Account::retired`]), signed.
+pub(crate) fn account_retired(asm: &mut crate::x86_64::asm::Asm, destination: Gpr) {
+    asm.mov(Qword, destination, ACCOUNT);
+    asm.shift_imm(ShiftOp::Sar, Qword, destination, ACCOUNT_LANE_BITS as u8);
+}
+
+/// Add `instructions`, a signed count in RAX, to the account's
+/// instructions: a self-loop's or region's settle before an exit. Clobbers
+/// RAX and the flags.
+pub(crate) fn account_add(asm: &mut crate::x86_64::asm::Asm) {
+    asm.shift_imm(ShiftOp::Shl, Qword, Rax, ACCOUNT_LANE_BITS as u8);
+    asm.alu(Alu::Add, Qword, ACCOUNT, Rax);
+}
 /// [`ChainControl::loop_entries`] and [`ChainControl::loop_iterated`].
 pub(crate) const LOOP_ENTRIES_OFFSET: i32 =
     core::mem::offset_of!(ChainControl, loop_entries) as i32;
@@ -282,11 +350,10 @@ impl From<ExitKind> for ExitWord {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChainControl {
-    /// Chained transfers still allowed; only the attached engine/native path
-    /// writes it. Wraps below zero when a thunk finds none left.
-    pub budget: u64,
-    /// Instructions of the blocks chained out of.
-    pub retired: u64,
+    /// Whether no interruption is pending, which every polled link, tail and
+    /// probe reads on the cache line of `block` that it writes anyway: the
+    /// epoch protocol keeps it ([`interrupt`], [`acknowledge`]).
+    pub quiet: Quiet,
     /// The index of the block running, and above it the BTYPE it was
     /// entered with.
     pub block: u64,
@@ -301,7 +368,11 @@ pub struct ChainControl {
     /// Kept 0 by native code: the engine counts the other transfers from the
     /// budget they spent.
     pub linked: u64,
-    /// Sources are published before a Release increment by a notifier.
+    /// Where cell probes count their transfers, in its low 32 bits: the
+    /// engine zeroes it before each native call and adds it to its counts
+    /// after.
+    pub heat: u64,
+    /// Sources are published before a notifier's increment ([`interrupt`]).
     /// Saturates at MAX; no owner may acknowledge that exhausted epoch.
     pub interrupt_epoch: u64,
     /// The attached owner's Acquire snapshot taken before draining sources.
@@ -320,10 +391,6 @@ pub struct ChainControl {
     /// The host address of the block table's first [`STAMPED_CELLS`] cells
     /// ([`LookupTable::stamped_cells`]), or 0.
     pub cells: u64,
-    /// Where cell probes count their transfers, in its low 32 bits: the
-    /// engine zeroes it before each native call and adds it to its counts
-    /// after.
-    pub heat: u64,
     /// The host address of the cell of the last transfer a cell probe
     /// named, one in [`CELL_SAMPLE`] of those it counts in `heat`, or 0:
     /// the engine zeroes it before each native call and reads it after.
@@ -396,7 +463,136 @@ const _: () = assert!(FrameWord::UpperContext as usize + 8 == FRAME_BYTES);
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 192);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 184);
+// The gates read the quiet word with no displacement, on `block`'s line.
+const _: () = assert!(core::mem::offset_of!(ChainControl, quiet) == 0);
+
+/// The bits of an [`Account`] below its instructions: the transfers left.
+pub const ACCOUNT_LANE_BITS: u32 = 16;
+/// The most transfers one native run may allow.
+pub const MAX_BUDGET: u64 = ACCOUNT_LANE;
+/// The bits of an [`Account`]'s transfers part.
+const ACCOUNT_LANE: u64 = (1 << ACCOUNT_LANE_BITS) - 1;
+
+/// [`ChainControl::quiet`] while no interruption is pending: the account's
+/// whole transfers part, so a tail's `test [control], r13w` finds a
+/// transfer left and no interruption in one AND. 0 once one is pending.
+pub const QUIET: u64 = ACCOUNT_LANE;
+
+/// [`ChainControl::quiet`]: [`QUIET`] or 0. A control is made quiet.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quiet(pub u64);
+
+impl Default for Quiet {
+    fn default() -> Self {
+        Self(QUIET)
+    }
+}
+
+/// Post an interruption to the PE whose control is at `control`: its epoch
+/// moves on (but past `u64::MAX`, where it stays), then its quiet word
+/// becomes 0, both sequentially consistent, so the PE's next polled
+/// transfer exits. Its owner's [`acknowledge`] of a snapshot taken before
+/// the epoch moved either finds the move after it makes the word quiet, or
+/// this zeroes the word after that.
+///
+/// # Safety
+///
+/// `control` is a live [`ChainControl`], whose epoch and quiet words every
+/// other writer accesses atomically.
+pub unsafe fn interrupt(control: *mut ChainControl) {
+    // SAFETY: the caller's; both words are naturally aligned.
+    let (epoch, quiet) = unsafe {
+        (
+            AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch)),
+            AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).quiet.0)),
+        )
+    };
+    let _ = epoch.try_update(Ordering::SeqCst, Ordering::Relaxed, |epoch| {
+        epoch.checked_add(1)
+    });
+    quiet.store(0, Ordering::SeqCst);
+}
+
+/// The owner's acknowledgment of `epoch`, its snapshot of the control's
+/// epoch taken before it drained the sources: the observed epoch becomes
+/// it (at most `u64::MAX - 1`, so a saturated epoch stays pending), and the
+/// quiet word [`QUIET`] unless the epoch moved since, which a notifier's
+/// [`interrupt`] may have done before this made the word quiet.
+///
+/// # Safety
+///
+/// As for [`interrupt`]; the caller owns the control, outside its native
+/// calls.
+pub unsafe fn acknowledge(control: *mut ChainControl, epoch: u64) {
+    let observed = epoch.min(u64::MAX - 1);
+    // SAFETY: the caller's; both words are naturally aligned, and only the
+    // owner writes the observed epoch.
+    unsafe {
+        core::ptr::addr_of_mut!((*control).observed_interrupt_epoch).write(observed);
+        let epoch = AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch));
+        let quiet = AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).quiet.0));
+        quiet.store(QUIET, Ordering::SeqCst);
+        if epoch.load(Ordering::SeqCst) != observed {
+            quiet.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A native run's account, which [`ACCOUNT`] holds while native code runs
+/// and `GuestState::account` outside it: the instructions of the blocks
+/// transfers left, a signed count, from bit [`ACCOUNT_LANE_BITS`] up, and
+/// the transfers still allowed below it. A transfer checks the lane first
+/// and exits at 0, else adds `ran << ACCOUNT_LANE_BITS` less one in one
+/// LEA, which never borrows; nothing is ever taken back. The instructions
+/// are signed as a self-loop's or region's settle before an exit may add
+/// less than zero (`GuestState::loop_retired` short of the exit's rows),
+/// which the exit's rows then repay, in the link that counts them or in the
+/// rows the engine adds; the lane is apart from them, so a settle never
+/// borrows a transfer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Account(pub u64);
+
+impl Account {
+    /// The account of a run that allows `budget` transfers, at most
+    /// [`MAX_BUDGET`], and has counted no instructions.
+    pub const fn new(budget: u64) -> Self {
+        debug_assert!(budget <= MAX_BUDGET);
+        Self(budget)
+    }
+
+    /// The account of a run with no transfer left, having counted
+    /// `retired` instructions.
+    pub const fn spent(retired: u64) -> Self {
+        Self(retired << ACCOUNT_LANE_BITS)
+    }
+
+    /// The transfers still allowed: 0 once the run used its budget, whether
+    /// or not a transfer then found none.
+    pub const fn budget(self) -> u64 {
+        self.0 & ACCOUNT_LANE
+    }
+
+    /// The instructions of the blocks transfers left, a signed count: one
+    /// below zero reads as its two's complement, which the rows the engine
+    /// adds for the exit complete.
+    pub const fn retired(self) -> u64 {
+        ((self.0 as i64) >> ACCOUNT_LANE_BITS) as u64
+    }
+
+    /// `budget` transfers allowed, the instructions counted kept.
+    pub const fn with_budget(self, budget: u64) -> Self {
+        debug_assert!(budget <= MAX_BUDGET);
+        Self(self.0 & !ACCOUNT_LANE | budget)
+    }
+
+    /// `retired` instructions counted, the budget kept: an exhausted one
+    /// stays exhausted.
+    pub const fn with_retired(self, retired: u64) -> Self {
+        Self(retired << ACCOUNT_LANE_BITS | self.0 & ACCOUNT_LANE)
+    }
+}
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -532,6 +728,41 @@ impl Slots {
         Self { base, len }
     }
 
+    /// `len` slots of which only the header is written: for a table whose
+    /// every slot [`Self::write`] fills before anything reads it
+    /// ([`LookupTable::grow`]), so its bytes are not written twice.
+    fn unwritten(len: usize) -> Self {
+        let layout = Self::layout(len + HEADER_SLOTS);
+        // SAFETY: a nonzero size.
+        let start = unsafe { alloc::alloc::alloc(layout) } as *mut Slot;
+        let Some(start) = core::ptr::NonNull::new(start) else {
+            alloc::alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: the header slots are the allocation's first; zero bytes
+        // are valid slots.
+        unsafe { core::ptr::write_bytes(start.as_ptr(), 0, HEADER_SLOTS) };
+        // SAFETY: as in `zeroed`.
+        let base = unsafe { start.add(HEADER_SLOTS) };
+        Self { base, len }
+    }
+
+    /// Write `entry` in slot `index` of a table no other core reads yet,
+    /// whether or not the slot was written before ([`Self::unwritten`]).
+    fn write(&self, index: usize, entry: LookupEntry) {
+        assert!(index < self.len, "a slot of the table");
+        let slot = Slot {
+            pc: AtomicU64::new(entry.pc),
+            key: AtomicU64::new(entry.key),
+            entry: AtomicU64::new(entry.entry),
+            block: AtomicU32::new(entry.block),
+            meta: AtomicU32::new(entry.targets & META_TARGETS),
+        };
+        // SAFETY: in bounds of the live allocation; no reference to the
+        // slot is held, as no reader has the table yet and its writer
+        // takes none across this.
+        unsafe { self.base.as_ptr().add(index).write(slot) };
+    }
+
     /// The first four words of the header ([`ITLB_DROPS`]).
     fn header(&self) -> &[AtomicU64; 4] {
         // SAFETY: the header is in the live allocation, aligned bytes of
@@ -579,35 +810,103 @@ impl Drop for Slots {
     }
 }
 
-/// A handle that reads a table's entries from any core without its writer's
-/// lock ([`LookupTable::reader`]).
-#[derive(Clone)]
-pub struct TableReader {
+/// A table's slots and slot mask as its writer published them
+/// ([`TableView`]).
+struct Generation {
     slots: Arc<Slots>,
     mask: u32,
 }
 
+/// The table a [`LookupTable`]'s readers read: the one its writer published
+/// last, and the one before while a growth's readers may still hold it
+/// ([`LookupTable::grow`], [`LookupTable::release_retired`]). Each is a
+/// leaked box this view frees.
+struct TableView {
+    current: AtomicPtr<Generation>,
+    retired: AtomicPtr<Generation>,
+}
+
+impl TableView {
+    fn new(slots: Arc<Slots>, mask: u32) -> Self {
+        let current = Box::into_raw(Box::new(Generation { slots, mask }));
+        Self {
+            current: AtomicPtr::new(current),
+            retired: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+}
+
+impl Drop for TableView {
+    fn drop(&mut self) {
+        for held in [self.current.get_mut(), self.retired.get_mut()] {
+            if !held.is_null() {
+                // SAFETY: made by `Box::into_raw`, and no reader is left.
+                drop(unsafe { Box::from_raw(*held) });
+            }
+        }
+    }
+}
+
+/// A handle that reads a table's entries from any core without its writer's
+/// lock ([`LookupTable::reader`]): the table its writer published last,
+/// which a growth replaces with one of twice the entries.
+#[derive(Clone)]
+pub struct TableReader {
+    view: Arc<TableView>,
+}
+
 impl TableReader {
-    /// What [`LookupTable::find`] finds.
+    /// The table published last.
+    #[inline]
+    fn generation(&self) -> &Generation {
+        // SAFETY: published whole (a release store after its last write);
+        // a replaced one is freed only once no reader holds it
+        // ([`LookupTable::release_retired`]).
+        unsafe { &*self.view.current.load(Ordering::Acquire) }
+    }
+
+    /// What [`LookupTable::find`] finds. A `slot` of a table published
+    /// before finds what the probe of a stale table would: at most a miss,
+    /// as a later table is larger.
     #[inline]
     pub fn find(&self, slot: usize, pc: u64, key: u64) -> LookupEntry {
-        find_in(&self.slots, slot, pc, key)
+        find_in(&self.generation().slots, slot, pc, key)
     }
 
     /// The slot of `pc` with `key` ([`lookup_slot`]).
     #[inline]
     pub fn slot(&self, pc: u64, key: u64) -> usize {
-        lookup_slot(pc, key, self.mask)
+        lookup_slot(pc, key, self.generation().mask)
+    }
+
+    /// The entry of `pc` with `key` as a probe would find it
+    /// ([`Self::find`] at [`Self::slot`]), in one table.
+    #[inline]
+    pub fn lookup(&self, pc: u64, key: u64) -> LookupEntry {
+        let generation = self.generation();
+        find_in(
+            &generation.slots,
+            lookup_slot(pc, key, generation.mask),
+            pc,
+            key,
+        )
     }
 
     /// The table's host address, for `ChainControl::table`.
     pub fn address(&self) -> u64 {
-        self.slots.address()
+        self.generation().slots.address()
     }
 
     /// The slot mask, for `ChainControl::masks`.
     pub fn mask(&self) -> u32 {
-        self.mask
+        self.generation().mask
+    }
+
+    /// The host address and slot mask of one table, for a PE's
+    /// `ChainControl` at its next native run.
+    pub fn current(&self) -> (u64, u32) {
+        let generation = self.generation();
+        (generation.slots.address(), generation.mask)
     }
 }
 
@@ -716,6 +1015,101 @@ const GRANULE_SHIFT: u32 = 14;
 struct Granule {
     sets: Vec<u32>,
     limit: usize,
+    /// The table's sets when `sets` were numbered: a growth doubles them,
+    /// and set `s` of its entries is `s` or `s + at` after ([`renumber`]).
+    at: u32,
+}
+
+/// Number `listed`'s sets for a table of `sets` sets, after the growths
+/// since they were numbered: each set's entries are in it or in the set
+/// as many sets on. Sets that hold none of the group's entries go at its
+/// next compaction or sweep.
+fn renumber(listed: &mut Granule, sets: u32) {
+    if listed.sets.is_empty() {
+        listed.at = sets;
+        return;
+    }
+    while listed.at < sets {
+        let at = listed.at;
+        for index in 0..listed.sets.len() {
+            let set = listed.sets[index];
+            listed.sets.push(set + at);
+        }
+        listed.limit *= 2;
+        listed.at = 2 * at;
+    }
+}
+
+/// The new table of a growth under way ([`LookupTable::grow`]): the old
+/// sets below `next` are copied, and each write to one copies it again.
+struct Growth {
+    sets: Arc<Slots>,
+    mask: u32,
+    next: usize,
+}
+
+/// Copy set `set` of `old` to the two sets of `growth`'s table its entries
+/// go to, `set` and `set` plus the old table's sets, each entry in the
+/// slot its PC and key pick there or beside it: of an old set's two
+/// entries, each new set takes at most both.
+fn copy_set(old: &Slots, set: usize, growth: &Growth) {
+    let sets = old.len / 2;
+    for at in [2 * set, 2 * set + 1, 2 * (set + sets), 2 * (set + sets) + 1] {
+        growth.sets.write(at, LookupEntry::default());
+    }
+    let mut taken = [usize::MAX; 2];
+    for (position, at) in [2 * set, 2 * set + 1].into_iter().enumerate() {
+        let entry = old.get(at).load();
+        if entry.key == 0 {
+            continue;
+        }
+        let home = lookup_slot(entry.pc, entry.key, growth.mask);
+        let slot = if taken[0] == home {
+            neighbour(home)
+        } else {
+            home
+        };
+        taken[position] = slot;
+        growth.sets.write(slot, entry);
+    }
+}
+
+/// Keep what a write to set `set` of `sets` (slot mask `mask`) leaves in
+/// the tables beside it: a growth's copy of the set, and an old table
+/// that PEs may still probe, which holds only entries the current one
+/// holds alike (an entry forgotten or replaced goes from both).
+fn mirror(
+    sets: &Slots,
+    mask: u32,
+    set: usize,
+    growth: Option<&Growth>,
+    old: Option<&(Arc<Slots>, u32)>,
+) {
+    if let Some(growth) = growth
+        && set < growth.next
+    {
+        copy_set(sets, set, growth);
+    }
+    if let Some((old, _)) = old {
+        let old_set = set & (old.len / 2 - 1);
+        for at in [2 * old_set, 2 * old_set + 1] {
+            let held = old.get(at);
+            if held.key() == 0 {
+                continue;
+            }
+            let entry = held.load();
+            if entry.key != 0
+                && find_in(
+                    sets,
+                    lookup_slot(entry.pc, entry.key, mask),
+                    entry.pc,
+                    entry.key,
+                ) != entry
+            {
+                held.store(LookupEntry::default());
+            }
+        }
+    }
 }
 
 /// The groups [`LookupTable`]'s front holds, a power of two.
@@ -855,8 +1249,8 @@ pub enum StampCount {
     Epoch,
     /// Misses for another context of the target's half.
     Context,
-    /// Misses for an interruption.
-    Interrupted,
+    /// Misses for an interruption or no transfer left.
+    Stopped,
     /// Stamps the stamping cell probe wrote.
     Restamped,
     /// Stamping cell probe transfers through a cell changed since its link,
@@ -955,6 +1349,16 @@ pub struct LookupTable {
     sets: Arc<Slots>,
     /// The slot mask of a block table, the set mask of an ITLB.
     mask: u32,
+    /// What its readers read ([`Self::reader`]).
+    view: Arc<TableView>,
+    /// The doubled table a growth fills ([`Self::grow`]).
+    growth: Option<Growth>,
+    /// The table before the last growth and its slot mask, which PEs may
+    /// probe until [`Self::release_retired`]: it holds only entries this
+    /// one holds alike ([`mirror`]).
+    old: Option<(Arc<Slots>, u32)>,
+    /// Growths so far.
+    grown: u32,
     grouping: Grouping,
     /// Each indexed group's list in `lists`.
     granules: BTreeMap<u64, u32>,
@@ -1055,8 +1459,12 @@ impl LookupTable {
             drops.store(1, Ordering::Relaxed);
         }
         Self {
+            view: Arc::new(TableView::new(Arc::clone(&sets), mask)),
             sets,
             mask,
+            growth: None,
+            old: None,
+            grown: 0,
             grouping,
             granules: BTreeMap::new(),
             front: vec![(NO_GROUP, 0); FRONT_GROUPS].into_boxed_slice(),
@@ -1123,8 +1531,7 @@ impl LookupTable {
     /// A reader of its entries for other cores.
     pub fn reader(&self) -> TableReader {
         TableReader {
-            slots: self.sets.clone(),
-            mask: self.mask,
+            view: Arc::clone(&self.view),
         }
     }
 
@@ -1152,7 +1559,9 @@ impl LookupTable {
 
     /// The bytes of its entries.
     pub fn table_bytes(&self) -> usize {
-        self.sets.len * size_of::<LookupEntry>()
+        let growth = self.growth.as_ref().map_or(0, |growth| growth.sets.len);
+        let old = self.old.as_ref().map_or(0, |(old, _)| old.len);
+        (self.sets.len + growth + old) * size_of::<LookupEntry>()
     }
 
     /// The table's host address, for `ChainControl::table` or `itlb`.
@@ -1160,13 +1569,112 @@ impl LookupTable {
         self.sets.address()
     }
 
+    /// Take a step of doubling a block table that `live` blocks have
+    /// filled to [`GROW_LOAD_TENTHS`], up to [`MAX_LOOKUP_ENTRIES`]:
+    /// whether this step published the doubled table to its readers
+    /// ([`Self::reader`]). One step copies [`GROW_STEP_SETS`] sets, so the
+    /// writer's hold stays short; meanwhile the table works as before,
+    /// and a write to a copied set copies it again, so the new table is
+    /// whole when it is published. None begins while the old one is held
+    /// ([`Self::release_retired`]).
+    pub fn grow(&mut self, live: usize) -> bool {
+        if self.grouping != Grouping::Frame {
+            return false;
+        }
+        let entries = self.sets.len;
+        if self.growth.is_none() {
+            if self.old.is_some()
+                || entries >= MAX_LOOKUP_ENTRIES
+                || live * 10 < entries * GROW_LOAD_TENTHS
+            {
+                return false;
+            }
+            let sets = Slots::unwritten(2 * entries);
+            for (word, held) in sets.header().iter().zip(self.sets.header()) {
+                word.store(held.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            self.growth = Some(Growth {
+                sets: Arc::new(sets),
+                mask: (2 * entries - 1) as u32,
+                next: 0,
+            });
+        }
+        let growth = self.growth.as_mut().expect("a growth under way");
+        let end = (growth.next + GROW_STEP_SETS).min(entries / 2);
+        for set in growth.next..end {
+            copy_set(&self.sets, set, growth);
+        }
+        growth.next = end;
+        if end < entries / 2 {
+            return false;
+        }
+        let growth = self.growth.take().expect("a growth under way");
+        let old = core::mem::replace(&mut self.sets, growth.sets);
+        let old_mask = core::mem::replace(&mut self.mask, growth.mask);
+        let published = Box::into_raw(Box::new(Generation {
+            slots: Arc::clone(&self.sets),
+            mask: self.mask,
+        }));
+        let replaced = self.view.current.swap(published, Ordering::AcqRel);
+        let held = self.view.retired.swap(replaced, Ordering::AcqRel);
+        debug_assert!(held.is_null(), "one retired table at a time");
+        self.old = Some((old, old_mask));
+        self.grown += 1;
+        true
+    }
+
+    /// Whether a growth is under way.
+    pub fn growing(&self) -> bool {
+        self.growth.is_some()
+    }
+
+    /// Whether the table before the last growth is still held
+    /// ([`Self::release_retired`]).
+    pub fn holds_retired(&self) -> bool {
+        self.old.is_some()
+    }
+
+    /// The growths so far.
+    pub fn growths(&self) -> u32 {
+        self.grown
+    }
+
+    /// Free the table the last growth replaced.
+    ///
+    /// # Safety
+    ///
+    /// No reader holds it: every reader that may have read the table
+    /// before the growth published its successor has since read again
+    /// ([`TableReader`] calls end before it) and no core's code probes it
+    /// (each PE's `ChainControl` names the new one): a grace period of the
+    /// board's PEs that began after the publication.
+    pub unsafe fn release_retired(&mut self) {
+        self.old = None;
+        let retired = self
+            .view
+            .retired
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            // SAFETY: made by `Box::into_raw` in `grow`; the caller's
+            // contract: no reader holds it.
+            drop(unsafe { Box::from_raw(retired) });
+        }
+    }
+
     /// Forget every entry, the cells' too; exits keep their cells.
     pub fn clear(&mut self) {
-        for slot in self.sets.iter() {
+        let old = self.old.as_ref().map(|(old, _)| old.as_ref());
+        for slot in self
+            .sets
+            .iter()
+            .chain(old.into_iter().flat_map(Slots::iter))
+        {
             if slot.key() != 0 {
                 slot.store(LookupEntry::default());
             }
         }
+        // Begun again, from the empty table, by the next insert.
+        self.growth = None;
         if !self.stamp_tables.is_empty() {
             forget_all_jumps(&self.stamp_tables);
         }
@@ -1476,6 +1984,38 @@ impl LookupTable {
         }
     }
 
+    /// Whether stamped cell `cell` still holds the entry its exit's stamped
+    /// tail jumps to: [`put_cell`] clears its `live` word when the entry
+    /// changes, and then every stamped transfer of it misses to the cell
+    /// probe, which stamps it no more.
+    pub fn stamped_live(&self, cell: u32) -> bool {
+        (cell as usize) < STAMPED_CELLS
+            && !self.cells.is_empty()
+            && self.cells[0]
+                .word(CELL_LIVE + 4 * cell as usize)
+                .load(Ordering::Acquire)
+                != 0
+    }
+
+    /// Set the `live` word of stamped cell `cell` again, for an exit whose
+    /// patch point now jumps to a stamped tail of `entry`, the entry the
+    /// cell holds: false, with the cell as it was, when it holds another,
+    /// holds none or is no exit's stamped cell. Every PE's stamps of the
+    /// cell are zero while the word is clear ([`stamp`]), so a stale tail
+    /// that a core is still in misses as before.
+    pub fn revive_stamped(&mut self, cell: u32, entry: LookupEntry) -> bool {
+        if entry.key == 0
+            || !self.stamped.contains(&cell)
+            || Self::cell_slot(&self.cells, cell).load() != entry
+        {
+            return false;
+        }
+        self.cells[0]
+            .word(CELL_LIVE + 4 * cell as usize)
+            .store(1, Ordering::Release);
+        true
+    }
+
     /// How many exits have a stamped tail ([`Self::note_stamped`]).
     pub fn stamped_tails(&self) -> usize {
         self.stamped.len()
@@ -1535,6 +2075,12 @@ impl LookupTable {
     /// a lookup keeps reaching put each other out, round after round,
     /// while a third that nothing reaches stayed: a random victim leaves
     /// that third the one out after a few rounds.
+    ///
+    /// The entry's older self beside it, which a resident put there, leaves
+    /// the set, its place free for the resident, and its PC the jump caches
+    /// ([`Self::put`]). Kept, it would come back when the new entry leaves,
+    /// and a jump cache entry filled from it would go on entering the block
+    /// and BTYPEs it named while the probes take the new entry's.
     pub fn insert(&mut self, slot: usize, entry: LookupEntry) {
         self.insert_over(slot, entry, &|_| false);
     }
@@ -1553,9 +2099,15 @@ impl LookupTable {
         if resident == entry {
             return;
         }
-        if resident.key != 0 && (resident.pc != entry.pc || resident.key != entry.key) {
-            let beside = self.entry(neighbour(slot));
-            let keep_resident = if beside.key == 0 || dead(beside.key) {
+        let beside = self.entry(neighbour(slot));
+        let older_beside = beside.key != 0 && beside.pc == entry.pc && beside.key == entry.key;
+        let other_resident =
+            resident.key != 0 && (resident.pc != entry.pc || resident.key != entry.key);
+        if older_beside && !other_resident {
+            self.put(neighbour(slot), LookupEntry::default());
+        }
+        if other_resident {
+            let keep_resident = if beside.key == 0 || older_beside || dead(beside.key) {
                 true
             } else if dead(resident.key) {
                 false
@@ -1581,6 +2133,13 @@ impl LookupTable {
         let held = self.sets.get(slot);
         let old = (!self.stamp_tables.is_empty()).then(|| held.load());
         held.store(entry);
+        mirror(
+            &self.sets,
+            self.mask,
+            slot / 2,
+            self.growth.as_ref(),
+            self.old.as_ref(),
+        );
         if let Some(old) = old
             && old.key != 0
             && old != entry
@@ -1646,6 +2205,7 @@ impl LookupTable {
         };
         let (sets, grouping) = (&self.sets, self.grouping);
         let listed = &mut self.lists[place as usize];
+        renumber(listed, (sets.len / 2) as u32);
         if listed.sets.last() == Some(&set) {
             return;
         }
@@ -1688,6 +2248,7 @@ impl LookupTable {
                 break;
             }
             let listed = &mut self.lists[place as usize];
+            renumber(listed, (sets.len / 2) as u32);
             visited += listed.sets.len().max(1);
             listed.sets.sort_unstable();
             listed.sets.dedup();
@@ -1825,6 +2386,13 @@ impl LookupTable {
             let held = self.sets.get(at);
             if held.key() == key && named(&held.load()) {
                 held.store(LookupEntry::default());
+                mirror(
+                    &self.sets,
+                    self.mask,
+                    at / 2,
+                    self.growth.as_ref(),
+                    self.old.as_ref(),
+                );
                 forget_jumps(&self.stamp_tables, pc);
             }
         }
@@ -1875,10 +2443,12 @@ impl LookupTable {
             }
         }
         let sets = &self.sets;
+        let (mask, growth, old) = (self.mask, self.growth.as_ref(), self.old.as_ref());
         let stamps = &self.stamp_tables;
         for (&group, &place) in self.granules.range(groups) {
             found = true;
             let listed = &mut self.lists[place as usize];
+            renumber(listed, (sets.len / 2) as u32);
             listed.sets.retain(|&set| {
                 for slot in [2 * set as usize, 2 * set as usize + 1] {
                     let held = sets.get(slot);
@@ -1888,6 +2458,7 @@ impl LookupTable {
                     let entry = held.load();
                     if entry.key != 0 && grouping.of(&entry) == group && forget(&entry) {
                         held.store(LookupEntry::default());
+                        mirror(sets, mask, set as usize, growth, old);
                         forget_jumps(stamps, entry.pc);
                     }
                 }
@@ -2004,9 +2575,6 @@ pub const fn lookup_slot(pc: u64, key: u64, mask: u32) -> usize {
     (pc >> 2 ^ pc >> (2 + LOOKUP_BITS) ^ key as u32) as usize & mask as usize
 }
 
-// `sub qword [rcx],1` addresses the budget at offset 0.
-const _: () = assert!(core::mem::offset_of!(ChainControl, budget) == 0);
-const RETIRED: i32 = core::mem::offset_of!(ChainControl, retired) as i32;
 const BLOCK: i32 = core::mem::offset_of!(ChainControl, block) as i32;
 const CONTEXTS: i32 = core::mem::offset_of!(ChainControl, contexts) as i32;
 const SALTS: i32 = core::mem::offset_of!(ChainControl, salts) as i32;
@@ -2020,7 +2588,11 @@ const HEAT: i32 = core::mem::offset_of!(ChainControl, heat) as i32;
 const SAMPLED: i32 = core::mem::offset_of!(ChainControl, sampled) as i32;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
+/// [`ChainControl::quiet`].
+pub const QUIET_OFFSET: i32 = core::mem::offset_of!(ChainControl, quiet) as i32;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const OBSERVED_INTERRUPT_EPOCH: i32 =
     core::mem::offset_of!(ChainControl, observed_interrupt_epoch) as i32;
 const FRAME_ROOM: i32 = core::mem::offset_of!(ChainControl, frame_room) as i32;
@@ -2029,91 +2601,131 @@ const PAIRS: i32 = core::mem::offset_of!(ChainControl, pairs) as i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interruption {
-    Epoch,
-    #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-    LockedBudget,
-    #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-    Flag,
+    /// The quiet word ([`ChainControl::quiet`]).
+    Quiet,
+    /// No gate: the budget alone, for the tests that show the gate is what
+    /// stops a run.
     #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
     Legacy,
 }
 impl Interruption {
-    fn extra_bytes(self) -> usize {
-        match self {
-            Self::Epoch => 10,
+    /// Bytes a polled link's checks ([`link_checks`]) take past an unpolled
+    /// one's.
+    fn link_bytes(self, gate: LinkGate) -> usize {
+        match (self, gate) {
+            (Self::Quiet, LinkGate::Jrcxz) => 4,
+            (Self::Quiet, LinkGate::Pext) => 1,
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-            Self::LockedBudget => 1,
-            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-            Self::Flag => 7,
-            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-            Self::Legacy => 0,
+            (Self::Legacy, _) => 0,
         }
     }
 }
-fn interruption_gate(
-    asm: &mut crate::x86_64::asm::Asm,
-    policy: Interruption,
-    scratch: Gpr,
-) -> Option<crate::x86_64::asm::Patch> {
-    gate(asm, policy, scratch, false)
+
+/// How a polled link finds, without the flags, that no interruption is
+/// pending and a transfer is left: a host tier the engine picks from its
+/// target ([`Self::for_target`]). Both fall through when the run goes on,
+/// and use no instruction whose cost differs much between vendors, as
+/// LOOP's (7 uops on Intel's cores) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkGate {
+    /// `mov ecx, [rdx]` and JRCXZ on the quiet word, then `movzx ecx,
+    /// r13w` and JRCXZ on the account: any x86-64 host.
+    Jrcxz,
+    /// `pext ecx, r13d, [rdx]`, the account's transfers part under the
+    /// quiet word as a mask ([`QUIET`] or 0), and one JRCXZ: a host whose
+    /// PEXT runs in hardware ([`crate::TargetCpu::FastPdep`]).
+    Pext,
 }
 
-/// [`interruption_gate`] with a 32-bit branch, for the probes' far exits.
-fn far_interruption_gate(
-    asm: &mut crate::x86_64::asm::Asm,
-    policy: Interruption,
-    scratch: Gpr,
-) -> Option<crate::x86_64::asm::Patch> {
-    gate(asm, policy, scratch, true)
+impl LinkGate {
+    /// The tier `target` runs best.
+    pub const fn for_target(target: crate::TargetCpu) -> Self {
+        if target.supports(crate::TargetCpu::Baseline.with_bmi2().with_fast_pdep()) {
+            Self::Pext
+        } else {
+            Self::Jrcxz
+        }
+    }
 }
 
-fn gate(
+/// A tail's or probe's check before its transfer, RCX at the control, which
+/// clobbers the flags: a transfer left and no interruption pending, in one
+/// `test [rcx], r13w`, as the quiet word is the account's transfers part
+/// while quiet and 0 once an interruption is pending. The jump (8-bit
+/// unless `far`) a run that must stop takes, with nothing spent.
+fn stop_check(
     asm: &mut crate::x86_64::asm::Asm,
     policy: Interruption,
-    scratch: Gpr,
     far: bool,
-) -> Option<crate::x86_64::asm::Patch> {
-    let branch = |asm: &mut crate::x86_64::asm::Asm| match far {
-        true => asm.jcc(Cond::Ne),
-        false => asm.jcc8(Cond::Ne),
-    };
+) -> crate::x86_64::asm::Patch {
     match policy {
-        Interruption::Epoch => {
-            // Aligned MOV is an acquire load on x86. The owner never rewrites
-            // this word; a notifier only advances it after publishing sources.
-            asm.mov_load(Qword, scratch, Mem::base(Rcx, INTERRUPT_EPOCH));
-            asm.alu_load(
-                Alu::Cmp,
-                Qword,
-                scratch,
-                Mem::base(Rcx, OBSERVED_INTERRUPT_EPOCH),
-            );
-            Some(branch(asm))
-        }
+        Interruption::Quiet => asm.test(Size::Word, Mem::base(Rcx, QUIET_OFFSET), ACCOUNT),
         #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        Interruption::Flag => {
-            asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 0);
-            Some(branch(asm))
-        }
-        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        Interruption::LockedBudget | Interruption::Legacy => None,
+        Interruption::Legacy => asm.test(Size::Word, ACCOUNT, ACCOUNT),
+    }
+    match far {
+        true => asm.jcc(Cond::E),
+        false => asm.jcc8(Cond::E),
     }
 }
-fn spend_budget(asm: &mut crate::x86_64::asm::Asm, policy: Interruption) {
-    #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-    if policy == Interruption::LockedBudget {
-        asm.lock();
-    }
-    let _ = policy;
-    // This local counter has no foreign writer in the epoch protocol.
-    asm.alu_imm8(Alu::Sub, Qword, Mem::base(Rcx, 0), 1);
+
+/// What a transfer from a block of `ran` instructions adds to the
+/// [`Account`]: its instructions, less one transfer. `None` when it exceeds
+/// a 32-bit displacement.
+fn transfer_change(ran: u32) -> Option<i32> {
+    i32::try_from((i64::from(ran) << ACCOUNT_LANE_BITS) - 1).ok()
 }
+
+/// A link's checks, RDX at the control, without the flags: a transfer
+/// left and, `polled`, no interruption pending, by `gate`. The JRCXZs a run
+/// that must stop takes; the run goes on through them. Clobbers RCX.
+fn link_checks(
+    asm: &mut crate::x86_64::asm::Asm,
+    polled: bool,
+    policy: Interruption,
+    gate: LinkGate,
+) -> Vec<crate::x86_64::asm::Patch> {
+    let mut stops = Vec::new();
+    match (polled, policy, gate) {
+        (true, Interruption::Quiet, LinkGate::Pext) => {
+            asm.pext(Rcx, ACCOUNT, Mem::base(Rdx, QUIET_OFFSET));
+            stops.push(asm.jrcxz());
+            return stops;
+        }
+        (true, Interruption::Quiet, LinkGate::Jrcxz) => {
+            asm.mov_load(Dword, Rcx, Mem::base(Rdx, QUIET_OFFSET));
+            stops.push(asm.jrcxz());
+        }
+        _ => {}
+    }
+    asm.movzx(Dword, Rcx, Size::Word, ACCOUNT);
+    stops.push(asm.jrcxz());
+    stops
+}
+
+/// `lea r13, [r13 + change]`: one transfer and its block's instructions
+/// ([`transfer_change`]), once a check found a transfer left. No flags.
+fn count(asm: &mut crate::x86_64::asm::Asm, change: i32) {
+    asm.lea(Qword, ACCOUNT, Mem::base_disp32(ACCOUNT, change));
+}
+
+/// A probe's transfer, which its [`stop_check`] at its start allowed:
+/// one transfer and the instructions of its block, which come in EDX above
+/// its word. Clobbers EDX.
+fn spend_transfer(asm: &mut crate::x86_64::asm::Asm) {
+    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
+    asm.shift_imm(ShiftOp::Shl, Dword, Rdx, ACCOUNT_LANE_BITS as u8);
+    asm.lea(Qword, ACCOUNT, Mem::indexed(ACCOUNT, Rdx, 1, -1));
+}
+// A tail's `ran` shifted into the account fits EDX.
+const _: () = assert!(u32::BITS - ExitWord::RAN_SHIFT + ACCOUNT_LANE_BITS <= 32);
 struct ThunkPlan {
     at: u64,
     retired: u32,
     block: u32,
     entry: u64,
-    fallback: Fallback,
+    exit: u64,
+    gate: LinkGate,
 }
 
 const _: () = assert!(core::mem::size_of::<LookupEntry>() == 32);
@@ -2123,10 +2735,11 @@ const ENTRY_CODE: i32 = core::mem::offset_of!(LookupEntry, entry) as i32;
 const ENTRY_BLOCK: i32 = core::mem::offset_of!(LookupEntry, block) as i32;
 const ENTRY_TARGETS: i32 = core::mem::offset_of!(LookupEntry, targets) as i32;
 
-/// A direct exit to `target` with `kind` as a block emits it: MOVABS RAX
-/// with the target, then the dynamic exit, unpadded. Code that ends up at
-/// an address its patch point does not suit is aligned before it runs
-/// ([`align_direct_exit`]); [`is_direct_exit`] accepts every padding.
+/// A direct exit to `target` with `kind` as a block emits it, unpadded:
+/// the patch point, MOVABS RAX with the target, MOV EDX with the word and
+/// the return. Code that ends up at an address its patch point does not
+/// suit is aligned before it runs ([`align_direct_exit`]);
+/// [`is_direct_exit`] accepts every padding.
 pub fn direct_exit(target: GuestAddress, kind: impl Into<ExitWord>) -> [u8; DIRECT_EXIT_BYTES] {
     direct_exit_padded(target, kind.into().encoded(), 0)
 }
@@ -2138,38 +2751,75 @@ pub fn direct_exit_at(
     target: GuestAddress,
     kind: impl Into<ExitWord>,
 ) -> [u8; DIRECT_EXIT_BYTES] {
-    direct_exit_padded(target, kind.into().encoded(), patch_pad(at + 15))
+    direct_exit_padded(target, kind.into().encoded(), patch_pad(at))
 }
+
+/// Where a direct exit's MOVABS RAX starts, however it is padded.
+const DIRECT_TARGET: usize = EXIT_POINT_BYTES;
+const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
 
 fn direct_exit_padded(target: GuestAddress, word: u32, pad: usize) -> [u8; DIRECT_EXIT_BYTES] {
-    const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
     let mut bytes = [0; DIRECT_EXIT_BYTES];
-    bytes[..2].copy_from_slice(&MOVABS_RAX);
-    bytes[2..10].copy_from_slice(&target.0.to_le_bytes());
-    bytes[10..].copy_from_slice(&exit_word_bytes(word, pad));
+    bytes[..EXIT_POINT_BYTES].copy_from_slice(&exit_point(pad));
+    bytes[DIRECT_TARGET..DIRECT_TARGET + 2].copy_from_slice(&MOVABS_RAX);
+    bytes[DIRECT_TARGET + 2..DIRECT_TARGET + 10].copy_from_slice(&target.0.to_le_bytes());
+    bytes[DIRECT_TARGET + 10..].copy_from_slice(&word_return(word));
     bytes
 }
 
-/// MOV EDX with `word`, a NOP of `pad` bytes, then the patch point, which
-/// jumps to the [`EXIT_RETURN`] right after it, and INT3s to the exit's end
-/// ([`super::block::exit_kind_with`]).
-fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
+/// A NOP of `pad` bytes, the unlinked patch point ([`RET_ROOM`]) and a NOP
+/// of the rest of [`MAX_PAD`]: the start of every exit.
+pub(crate) const fn exit_point(pad: usize) -> [u8; EXIT_POINT_BYTES] {
+    let mut bytes = [0; EXIT_POINT_BYTES];
+    let mut at = 0;
+    while at < pad {
+        bytes[at] = NOPS[pad][at];
+        at += 1;
+    }
+    while at < pad + PATCH_BYTES {
+        bytes[at] = RET_ROOM[at - pad];
+        at += 1;
+    }
+    let rest = MAX_PAD - pad;
+    while at < EXIT_POINT_BYTES {
+        bytes[at] = NOPS[rest][at - pad - PATCH_BYTES];
+        at += 1;
+    }
+    bytes
+}
+
+/// MOV EDX with `word` and the [`EXIT_RETURN`]: how every exit ends.
+pub(crate) const fn word_return(word: u32) -> [u8; 5 + EXIT_RETURN_BYTES] {
     const MOV_EDX: u8 = 0xba;
-    let mut bytes = [0xcc; DYNAMIC_EXIT_BYTES];
+    let mut bytes = [0; 5 + EXIT_RETURN_BYTES];
     bytes[0] = MOV_EDX;
-    bytes[1..5].copy_from_slice(&word.to_le_bytes());
-    bytes[5..5 + pad].copy_from_slice(NOPS[pad]);
-    let point = 5 + pad;
-    bytes[point..point + PATCH_BYTES].copy_from_slice(&RET_ROOM);
-    let back = point + PATCH_BYTES;
-    bytes[back..back + EXIT_RETURN_BYTES].copy_from_slice(&EXIT_RETURN);
+    let word = word.to_le_bytes();
+    let mut at = 0;
+    while at < 4 {
+        bytes[1 + at] = word[at];
+        at += 1;
+    }
+    while at < 4 + EXIT_RETURN_BYTES {
+        bytes[1 + at] = EXIT_RETURN[at - 4];
+        at += 1;
+    }
     bytes
 }
 
-/// The unpadded dynamic exit of the encoded `word` ([`ExitWord::encoded`]).
+/// The patch point padded by `pad`, MOV EDX with `word` and the return:
+/// the dynamic exit ([`super::block::exit_kind_with`]).
+fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
+    let mut bytes = [0; DYNAMIC_EXIT_BYTES];
+    bytes[..EXIT_POINT_BYTES].copy_from_slice(&exit_point(pad));
+    bytes[EXIT_POINT_BYTES..].copy_from_slice(&word_return(word));
+    bytes
+}
+
+/// The unpadded direct exit to `pc` of the encoded `word`
+/// ([`ExitWord::encoded`]).
 #[cfg(test)]
-pub(crate) fn exit_word(word: u32) -> [u8; DYNAMIC_EXIT_BYTES] {
-    exit_word_bytes(word, 0)
+pub(crate) fn direct_exit_word(pc: GuestAddress, word: u32) -> [u8; DIRECT_EXIT_BYTES] {
+    direct_exit_padded(pc, word, 0)
 }
 
 /// The return to the engine ([`EXIT_RETURN`]).
@@ -2213,14 +2863,23 @@ pub fn patch_word(word: u64, point: u64, instruction: [u8; PATCH_BYTES]) -> u64 
 }
 
 /// The patch point of the dynamic exit at host address `at`, aligned for
-/// it: its `ret`, which a lookup's jump replaces.
+/// it: what a lookup's jump replaces, the exit's first instruction but its
+/// pad.
 pub const fn dynamic_patch(at: u64) -> u64 {
-    at + 5 + patch_pad(at + 5) as u64
+    at + patch_pad(at) as u64
 }
 
 /// The patch point of the direct exit at host address `at`, aligned for it.
 pub const fn direct_patch(at: u64) -> u64 {
-    dynamic_patch(at + 10)
+    dynamic_patch(at)
+}
+
+/// Where the exit whose patch point is `point` returns to the engine
+/// from while unlinked: right after the point, the target loaded (a direct
+/// exit's), the word and the return. A thunk at the point that allows no
+/// transfer goes on there.
+pub const fn unlinked_return(point: u64) -> u64 {
+    point + PATCH_BYTES as u64
 }
 
 /// The link slot of `bytes` at host address `at`'s patch point: the jump
@@ -2231,7 +2890,7 @@ pub const fn slot_patch(at: u64) -> u64 {
 
 /// Whether the direct exit at `offset` of `code`, which runs from host
 /// address `at`, has its patch point where a link patches it: its slot's
-/// point jumping to it when `slot` is nonzero, else its own `ret`.
+/// point jumping to it when `slot` is nonzero, else its own.
 pub fn exit_ready(code: &[u8], offset: usize, at: u64, slot: usize) -> bool {
     let site = at + offset as u64;
     match slot {
@@ -2244,7 +2903,7 @@ pub fn exit_ready(code: &[u8], offset: usize, at: u64, slot: usize) -> bool {
 }
 
 /// Whether the dynamic exit at `offset` of `code`, which runs from host
-/// address `at`, has its patch point's `ret` where a lookup patches it.
+/// address `at`, has its unlinked patch point where a lookup patches it.
 pub fn dynamic_ready(code: &[u8], offset: usize, at: u64) -> bool {
     point_holds(code, at, dynamic_patch(at + offset as u64), RET_ROOM)
 }
@@ -2261,26 +2920,18 @@ fn point_holds(code: &[u8], at: u64, point: u64, instruction: [u8; PATCH_BYTES])
 
 /// The encoded word of the dynamic exit `bytes` is, of any padding.
 fn exit_word_of(bytes: &[u8]) -> Option<u32> {
-    let word = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?);
+    let field = EXIT_POINT_BYTES + 1;
+    let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
     (0..=MAX_PAD)
-        .filter(|&pad| bytes.get(5) == Some(&padded(pad)))
         .any(|pad| bytes == exit_word_bytes(word, pad))
         .then_some(word)
-}
-
-/// The byte after the MOV EDX of a dynamic exit padded by `pad` bytes:
-/// what tells the paddings apart before their exits are compared whole.
-const fn padded(pad: usize) -> u8 {
-    if pad == 0 { RET_ROOM[0] } else { NOPS[pad][0] }
 }
 
 /// Whether `bytes` are the direct exit to `target` of `kind`, of any
 /// padding.
 pub fn is_direct_exit(bytes: &[u8], target: GuestAddress, kind: impl Into<ExitWord>) -> bool {
     let word = kind.into().encoded();
-    (0..=MAX_PAD)
-        .filter(|&pad| bytes.get(15) == Some(&padded(pad)))
-        .any(|pad| bytes == direct_exit_padded(target, word, pad))
+    (0..=MAX_PAD).any(|pad| bytes == direct_exit_padded(target, word, pad))
 }
 
 /// Whether `bytes` are the dynamic exit of `kind`, of any padding.
@@ -2293,20 +2944,38 @@ pub fn is_dynamic_exit_of_any_kind(bytes: &[u8]) -> bool {
     exit_word_of(bytes).is_some()
 }
 
+/// The target and encoded word of the direct exit `bytes` are, of any
+/// padding.
+fn direct_exit_of(bytes: &[u8]) -> Option<(GuestAddress, u32)> {
+    let target = bytes.get(DIRECT_TARGET + 2..DIRECT_TARGET + 10)?;
+    let target = GuestAddress(u64::from_le_bytes(target.try_into().ok()?));
+    let field = DIRECT_TARGET + 10 + 1;
+    let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
+    (0..=MAX_PAD)
+        .any(|pad| bytes == direct_exit_padded(target, word, pad))
+        .then_some((target, word))
+}
+
+/// Whether `bytes` are a direct exit of any target, kind and padding: what
+/// ends a block whose exits are not linked.
+pub fn is_direct_exit_of_any_kind(bytes: &[u8]) -> bool {
+    direct_exit_of(bytes).is_some()
+}
+
 /// Pad the direct exit at `offset` of `code`, which runs at host address
 /// `at + offset`, for its patch point there. Whether it is one.
 pub fn align_direct_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
     let Some(bytes) = code.get_mut(offset..offset + DIRECT_EXIT_BYTES) else {
         return false;
     };
-    let Some(word) = exit_word_of(&bytes[10..]) else {
+    let Some((target, word)) = direct_exit_of(bytes) else {
         return false;
     };
-    if bytes[..2] != [0x48, 0xb8] {
-        return false;
-    }
-    let pad = patch_pad(at + offset as u64 + 15);
-    bytes[10..].copy_from_slice(&exit_word_bytes(word, pad));
+    bytes.copy_from_slice(&direct_exit_padded(
+        target,
+        word,
+        patch_pad(at + offset as u64),
+    ));
     true
 }
 
@@ -2319,7 +2988,7 @@ pub fn align_dynamic_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
     let Some(word) = exit_word_of(bytes) else {
         return false;
     };
-    bytes.copy_from_slice(&exit_word_bytes(word, patch_pad(at + offset as u64 + 5)));
+    bytes.copy_from_slice(&exit_word_bytes(word, patch_pad(at + offset as u64)));
     true
 }
 
@@ -2329,10 +2998,18 @@ pub fn align_link_slot(code: &mut [u8], offset: usize, bytes: usize, at: u64) ->
     let Some(slot) = code.get_mut(offset..offset + bytes) else {
         return false;
     };
-    if !(0..8).any(|residue| is_empty_link_at(slot, residue)) {
+    if bytes > MAX_LINK_BYTES {
         return false;
     }
-    write_empty_link_at(slot, at + offset as u64);
+    let mut empty = [0; MAX_LINK_BYTES];
+    let empty = &mut empty[..bytes];
+    if !(0..8).any(|residue| {
+        empty_link_at(residue, empty);
+        *slot == *empty
+    }) {
+        return false;
+    }
+    empty_link_at(at + offset as u64, slot);
     true
 }
 
@@ -2372,40 +3049,23 @@ pub(super) fn empty_link(asm: &mut crate::x86_64::asm::Asm, bytes: usize) {
     }
 }
 
-/// The empty link slot of `bytes` at host address `at`
-/// ([`write_empty_link_at`]).
-#[cfg(test)]
-fn empty_link_at(at: u64, bytes: usize) -> Vec<u8> {
-    let mut slot = alloc::vec![0; bytes];
-    write_empty_link_at(&mut slot, at);
-    slot
-}
+/// The largest link slot.
+const MAX_LINK_BYTES: usize = if LINK_BYTES > POLLED_LINK_BYTES {
+    LINK_BYTES
+} else {
+    POLLED_LINK_BYTES
+};
 
-/// Make `slot` the empty link slot of its length at host address `at`:
-/// the pad, then the patch point's jump to the exit after the slot, then
-/// INT3s.
-fn write_empty_link_at(slot: &mut [u8], at: u64) {
-    let (pad, jump) = empty_link_parts(at, slot.len());
-    slot[..pad].copy_from_slice(NOPS[pad]);
-    slot[pad..pad + PATCH_BYTES].copy_from_slice(&jump);
-    slot[pad + PATCH_BYTES..].fill(0xcc);
-}
-
-/// Whether `slot` is the empty link slot of its length at host address
-/// `at` ([`write_empty_link_at`]).
-fn is_empty_link_at(slot: &[u8], at: u64) -> bool {
-    let (pad, jump) = empty_link_parts(at, slot.len());
-    slot[..pad] == *NOPS[pad]
-        && slot[pad..pad + PATCH_BYTES] == jump
-        && slot[pad + PATCH_BYTES..].iter().all(|&byte| byte == 0xcc)
-}
-
-/// The pad and the patch point's jump of the empty link slot of `bytes`
-/// at host address `at`.
-fn empty_link_parts(at: u64, bytes: usize) -> (usize, [u8; PATCH_BYTES]) {
+/// Write into `slot` the empty link slot of its length at host address
+/// `at`: the pad, then the patch point's jump to the exit after the slot,
+/// then INT3s.
+fn empty_link_at(at: u64, slot: &mut [u8]) {
+    let bytes = slot.len();
     let pad = patch_pad(at);
+    slot.fill(0xcc);
+    slot[..pad].copy_from_slice(NOPS[pad]);
     let jump = jump(at + pad as u64, at + bytes as u64).expect("an exit right after its slot");
-    (pad, jump)
+    slot[pad..pad + PATCH_BYTES].copy_from_slice(&jump);
 }
 
 /// The patch that undoes the link of the direct exit at host address
@@ -2421,61 +3081,98 @@ pub fn unlinked(site: u64, slot: usize) -> Option<(u64, [u8; PATCH_BYTES])> {
     }
 }
 
-/// The body of the link in the slot of `bytes` at host address `at`, and
-/// where it goes: right after the slot's patch point, which then becomes
-/// [`NOP5`] to fall into it. It chains a block of `retired` instructions
+/// The link in the slot of `bytes` at host address `at`: its body starts
+/// at the slot's patch point, whose instruction becomes the first bytes of
+/// the body's, the control's load. A link writes the
+/// body's bytes past the point first ([`SlotLink::rest`]), which nothing
+/// runs while the point jumps over them, then the point's
+/// ([`SlotLink::point`]). The body chains a block of `retired` instructions
 /// into block `block`, whose code is at `entry`, or goes to the exit after
 /// the slot when the control allows no transfer. `None` when `entry` is out
 /// of a 32-bit jump's reach, an operand exceeds its 32-bit field or `bytes`
 /// is no slot.
-pub fn link(at: u64, bytes: usize, retired: u32, block: u32, entry: u64) -> Option<(u64, Vec<u8>)> {
+pub fn link(
+    at: u64,
+    bytes: usize,
+    retired: u32,
+    block: u32,
+    entry: u64,
+    gate: LinkGate,
+) -> Option<SlotLink> {
     let polled = match bytes {
         LINK_BYTES => false,
         POLLED_LINK_BYTES => true,
         _ => return None,
     };
-    let body = slot_patch(at) + PATCH_BYTES as u64;
+    let point = slot_patch(at);
     let exit = at + bytes as u64;
     let code = link_body(
-        body,
+        point,
         polled,
         retired,
         block,
         entry,
         Fall::After(exit),
-        Interruption::Epoch,
+        Interruption::Quiet,
+        gate,
     )?;
-    debug_assert!(body + code.len() as u64 <= exit);
-    Some((body, code))
+    debug_assert_eq!(point + code.len() as u64, exit);
+    let (first, rest) = code.split_at(PATCH_BYTES);
+    debug_assert_eq!(first, LINKED_SLOT);
+    Some(SlotLink {
+        point: first.try_into().ok()?,
+        rest_at: point + PATCH_BYTES as u64,
+        rest: rest.to_vec(),
+    })
 }
 
-/// Where a link's body goes when the control allows no transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fallback {
-    /// Return to the engine with this word in EDX, which the gate may have
-    /// clobbered: the exit has loaded RAX already, as for a thunk its patch
-    /// point jumps to.
-    Return(ExitWord),
-    /// Jump to the exit at this host address, as for a link slot.
-    Jump(u64),
+/// A slot's [`link`]: the bytes past its patch point, written first, and
+/// the point's instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLink {
+    /// What the patch point becomes: the first bytes of the body's first
+    /// instruction, whose others start [`Self::rest`].
+    pub point: [u8; PATCH_BYTES],
+    /// The host address right after the point, where `rest` goes.
+    pub rest_at: u64,
+    pub rest: Vec<u8>,
+}
+
+impl SlotLink {
+    /// The body whole, from the patch point.
+    pub fn body(&self) -> Vec<u8> {
+        let mut body = self.point.to_vec();
+        body.extend(&self.rest);
+        body
+    }
 }
 
 /// A thunk at host address `at` that chains a block of `retired`
-/// instructions into block `block`, whose code is at `entry`, or takes
-/// `fallback` when the control allows no transfer: what an exit's patch
-/// point jumps to when its slot's body is used or it has none. It always
-/// looks for an interruption. `None` when `entry` or the fallback is out of
-/// a 32-bit jump's reach or an operand exceeds its 32-bit field.
-pub fn thunk(at: u64, retired: u32, block: u32, entry: u64, fallback: Fallback) -> Option<Vec<u8>> {
+/// instructions into block `block`, whose code is at `entry`, or jumps to
+/// `exit` when the control allows no transfer: what an exit's patch point
+/// jumps to when its slot's body is used or it has none. `exit` is the
+/// exit's own unlinked path ([`unlinked_return`]), or for a slot's point
+/// the exit after the slot. It always looks for an interruption. `None`
+/// when `entry` or `exit` is out of a 32-bit jump's reach or an operand
+/// exceeds its 32-bit field.
+pub fn thunk(
+    at: u64,
+    retired: u32,
+    block: u32,
+    entry: u64,
+    exit: u64,
+    gate: LinkGate,
+) -> Option<Vec<u8>> {
     thunk_with_policy(
         ThunkPlan {
             at,
             retired,
             block,
             entry,
-            fallback,
+            exit,
+            gate,
         },
-        Interruption::Epoch,
+        Interruption::Quiet,
     )
 }
 fn thunk_with_policy(plan: ThunkPlan, policy: Interruption) -> Option<Vec<u8>> {
@@ -2484,7 +3181,8 @@ fn thunk_with_policy(plan: ThunkPlan, policy: Interruption) -> Option<Vec<u8>> {
         retired,
         block,
         entry,
-        fallback,
+        exit,
+        gate,
     } = plan;
     link_body(
         at,
@@ -2492,22 +3190,26 @@ fn thunk_with_policy(plan: ThunkPlan, policy: Interruption) -> Option<Vec<u8>> {
         retired,
         block,
         entry,
-        Fall::Thunk(fallback),
+        Fall::Thunk(exit),
         policy,
+        gate,
     )
 }
 
 /// Where a link's body goes when the control allows no transfer.
 #[derive(Debug, Clone, Copy)]
 enum Fall {
-    /// A thunk's [`Fallback`], after its body.
-    Thunk(Fallback),
+    /// A thunk's: a jump to the exit at this host address, after its body.
+    Thunk(u64),
     /// A slot's: the exit at this host address, a few bytes after the body.
     After(u64),
 }
 
-/// The code of a link at host address `at`: count, name and jump, or
-/// `fall`. Only a `polled` one has the interruption gate.
+/// The code of a link at host address `at`, which leaves the flags: the
+/// control in RDX, check ([`link_checks`]), count, name and jump, or `fall`
+/// when the run must stop, nothing spent. Only a `polled` one looks for an
+/// interruption.
+#[allow(clippy::too_many_arguments)]
 fn link_body(
     at: u64,
     polled: bool,
@@ -2516,44 +3218,42 @@ fn link_body(
     entry: u64,
     fall: Fall,
     policy: Interruption,
+    gate: LinkGate,
 ) -> Option<Vec<u8>> {
-    let retired = i32::try_from(retired).ok()?;
     let block = i32::try_from(block).ok()?;
+    let change = transfer_change(retired)?;
     let mut code = Code::new();
     let mut asm = code.asm();
-    asm.place(Rcx, CONTROL);
-    let interrupted = polled
-        .then(|| interruption_gate(&mut asm, policy, Rdx))
-        .flatten();
-    spend_budget(&mut asm, policy);
-    let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), retired);
-    asm.mov_rm_imm32(Qword, Mem::base(Rcx, BLOCK), block);
+    asm.place(Rdx, CONTROL);
+    let stops = link_checks(&mut asm, polled, policy, gate);
+    count(&mut asm, change);
+    asm.mov_rm_imm32(Qword, Mem::base(Rdx, BLOCK), block);
     let transfer = asm.jmp();
     let distance = relative(at + transfer.end() as u64, entry)?;
-    let body = code.len();
     debug_assert_eq!(
-        body,
-        LINK_BODY_BYTES + usize::from(polled) * policy.extra_bytes()
+        code.len(),
+        LINK_BODY_BYTES + usize::from(polled) * policy.link_bytes(gate)
     );
-    let fallen = match fall {
-        Fall::Thunk(Fallback::Return(word)) => {
-            let mut asm = code.asm();
-            asm.mov_imm32(Rdx, word.encoded());
-            exit_return(&mut asm);
-            body
-        }
-        Fall::Thunk(Fallback::Jump(exit)) => {
+    let stop = match fall {
+        Fall::Thunk(exit) => {
+            let stop = code.len();
             let back = code.asm().jmp();
             let back_distance = relative(at + back.end() as u64, exit)?;
             code.patch(back.offset(), back_distance.to_le_bytes());
-            body
+            stop
         }
-        // Past the body's end: the slot's INT3s up to the exit stay.
-        Fall::After(exit) => usize::try_from(exit.checked_sub(at)?).ok()?,
+        // The exit after the slot; INT3s up to it, which nothing runs.
+        Fall::After(exit) => {
+            let stop = usize::try_from(exit.checked_sub(at)?).ok()?;
+            let mut asm = code.asm();
+            for _ in asm.len()..stop {
+                asm.int3();
+            }
+            stop
+        }
     };
-    for patch in core::iter::once(exhausted).chain(interrupted) {
-        crate::x86_64::asm::resolve(&mut code, patch, fallen);
+    for patch in stops {
+        crate::x86_64::asm::resolve(&mut code, patch, stop);
     }
     code.patch(transfer.offset(), distance.to_le_bytes());
     Some(code.into_bytes())
@@ -2635,7 +3335,7 @@ pub(crate) fn paired_call(
 /// the epoch, which every frame of the run then fails, so a return never
 /// enters a retired block's continuation through its frame.
 pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<()> {
-    let ran = i32::try_from(ran).ok()?;
+    let ran = i32::try_from(i64::from(ran) << ACCOUNT_LANE_BITS).ok()?;
     let frame = |word: FrameWord| Mem::base(Gpr::Rsp, word as i32);
     asm.alu_load(
         Alu::Cmp,
@@ -2657,10 +3357,10 @@ pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Opti
         asm.alu_load(Alu::Cmp, Qword, R8, frame(word));
         misses.push(asm.jcc8(Cond::Ne));
     }
-    misses.extend(interruption_gate(asm, Interruption::Epoch, R8));
-    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
-    misses.push(asm.jcc8(Cond::E));
-    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran);
+    // A transfer left and no interruption pending. A return spends none,
+    // and counts the block's instructions.
+    misses.push(stop_check(asm, Interruption::Quiet, false));
+    asm.alu_imm32(Alu::Add, Qword, ACCOUNT, ran);
     // The block's index, entered with BTYPE 0 as a continuation is.
     asm.mov_load(Dword, R8, frame(FrameWord::Block));
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
@@ -2695,10 +3395,12 @@ pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 /// Where a [`lookup_dispatcher`]'s stamping cell probe begins, after the
 /// table probe: a [`stamped_tail`]'s miss takes it.
 pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 640;
-/// Bytes in a [`lookup_tail`]: `mov edx, word` and `jmp probe`.
-pub const TAIL_BYTES: usize = 5 + 5;
-/// Bytes in a [`cell_tail`].
-pub const CELL_TAIL_BYTES: usize = 10 + TAIL_BYTES;
+/// Bytes in a tail's call of a probe: `mov edx, word`, `call probe` and
+/// `jmp r9` into the block the probe found.
+pub const TAIL_BYTES: usize = 5 + 5 + 3;
+/// Bytes in a [`cell_tail`]: the target's and the cell's MOVABS and the
+/// call of the cell probe.
+pub const CELL_TAIL_BYTES: usize = 10 + 10 + TAIL_BYTES;
 
 /// The probes the per-site tails of the exits of branches that set `btype`
 /// jump to ([`lookup_tail`]): the target in RAX, the tail's word in EDX.
@@ -2712,8 +3414,14 @@ pub const CELL_TAIL_BYTES: usize = 10 + TAIL_BYTES;
 /// in R9, and the table when the cell does not hold the target with that
 /// key. Each enters the block it found, the transfer counted and `block`
 /// named, or returns to the engine with RAX and RDX as the exit left them.
-/// Neither touches the stack: R10 and R11, free between blocks, hold what
-/// a probe keeps.
+/// R10 and R11, free between blocks, hold what a probe keeps.
+/// Every tail calls its probe, which returns to it with the block's code in
+/// R9 for the tail's own `jmp r9`: the host predicts that jump per site,
+/// where one shared indirect jump in the probes mispredicted across many
+/// hot sites. The return pops the call's return stack entry, so the stack
+/// stays as the tail found it; a cell probe that goes on to the table probe
+/// jumps there with the return address kept, and an exit to the engine
+/// reloads RSP ([`EXIT_RETURN`]).
 /// Other cores write the table and cells meanwhile: a probe takes an entry
 /// only when its last word, read before its fields, was not busy and is
 /// unchanged after them ([`Slot`]); a cell read torn starts the table
@@ -2722,7 +3430,7 @@ pub const CELL_TAIL_BYTES: usize = 10 + TAIL_BYTES;
 /// and its indirect jump into the found block, are shared: the host's
 /// indirect predictor tells sites apart by the path into it.
 pub fn lookup_dispatcher(btype: u8) -> Option<Vec<u8>> {
-    dispatcher_with_policy(btype, Interruption::Epoch)
+    dispatcher_with_policy(btype, Interruption::Quiet)
 }
 fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     if btype > 3 {
@@ -2740,10 +3448,8 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     // The table probe.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R9) {
-        misses.push(interrupted);
-    }
+    // A run that must stop leaves before the tables, with EDX whole.
+    let mut misses = vec![stop_check(&mut asm, policy, true)];
     translate(&mut asm, &mut misses);
     let table = code.len();
     let mut asm = code.asm();
@@ -2782,10 +3488,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.mov_load(Dword, R8, Mem::base(R10, ENTRY_BLOCK));
     asm.mov_load(Qword, R9, Mem::base(R10, ENTRY_CODE));
     misses.extend(seqlock_check(&mut asm, R10));
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    spend_transfer(&mut asm);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     fill_jump_cache(&mut asm);
     entered_btype(&mut asm, R8, btype);
@@ -2837,10 +3540,7 @@ fn cell_probe(
 ) -> (crate::x86_64::asm::Patch, crate::x86_64::asm::Patch) {
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R8) {
-        misses.push(interrupted);
-    }
+    let mut misses = vec![stop_check(&mut asm, policy, true)];
     asm.mov(Qword, R10, R9);
     translate(&mut asm, &mut misses);
     // The cell is the target's with its page's key, or the table decides.
@@ -2863,10 +3563,7 @@ fn cell_probe(
     let unsampled = asm.jcc8(Cond::Ne);
     asm.mov_store(Qword, Mem::base(Rcx, SAMPLED), R10);
     asm.bind(unsampled);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    spend_transfer(&mut asm);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     if stamping {
@@ -2951,18 +3648,18 @@ fn stamp(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(kept);
 }
 
-/// Bytes in a [`stamped_tail`]: 130 at most, with a 32-bit displacement
+/// Bytes in a [`stamped_tail`]: 132 at most, with a 32-bit displacement
 /// for the stamp of a cell numbered 8 or above.
-pub const STAMPED_TAIL_BYTES: usize = 144;
+pub const STAMPED_TAIL_BYTES: usize = 176;
 
 /// The tail at host address `at` of a hot direct exit to `target` out of
 /// its page, whose stamped cell `number` at `cell` held `block`, entered at
 /// `entry`, when it was linked: while this PE's stamp of the cell names the
 /// context it runs in and its ITLB's drop epoch of the target's half, the
 /// transfer is counted, `block` named and `entry` entered by a direct jump,
-/// without a translation or a probe; else, as for an interruption, it is
-/// the [`cell_tail`] after it, whose cell probe stamps the cell when it
-/// enters its block. A budget spent returns with `word`, as a probe would.
+/// without a translation or a probe; else, as for an interruption or no
+/// transfer left, it is the [`cell_tail`] after it, whose cell probe stamps
+/// the cell when it enters its block, or stops the run.
 ///
 /// A stamp exists only while the cell holds what it held at the link
 /// (`live`, [`put_cell`] clears it and zeroes every PE's stamps first), and
@@ -2994,7 +3691,7 @@ pub fn stamped_tail(
         entry,
         probe,
         0,
-        Interruption::Epoch,
+        Interruption::Quiet,
     )
 }
 
@@ -3032,7 +3729,7 @@ pub fn stamped_branch_tail(
         entry,
         probe,
         btype,
-        Interruption::Epoch,
+        Interruption::Quiet,
     )
 }
 
@@ -3068,21 +3765,14 @@ fn stamped_with_policy(
     asm.mov_load(Qword, R9, Mem::base(Rcx, CONTEXTS + 8 * half));
     asm.alu_load(Alu::Cmp, Qword, R9, Mem::base(R10, stamp));
     let context = asm.jcc8(Cond::Ne);
-    let interrupted = gate(&mut asm, policy, R8, false);
+    let stopped = stop_check(&mut asm, policy, false);
     asm.alu_imm8(
         Alu::Add,
         Qword,
         Mem::base(R10, StampCount::Hits.offset()),
         1,
     );
-    spend_budget(&mut asm, policy);
-    let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(
-        Alu::Add,
-        Qword,
-        Mem::base(Rcx, RETIRED),
-        i32::try_from(ran).ok()?,
-    );
+    count(&mut asm, transfer_change(ran)?);
     if btype == 0 {
         asm.mov_rm_imm32(Qword, Mem::base(Rcx, BLOCK), block);
     } else {
@@ -3094,19 +3784,14 @@ fn stamped_with_policy(
     let distance = relative(at + transfer.end() as u64, entry)?;
     code.patch(transfer.offset(), distance.to_le_bytes());
     let mut asm = code.asm();
-    asm.bind(exhausted);
-    asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    exit_return(&mut asm);
-    // A miss counts its cause and takes the cell tail.
+    // A miss counts its cause and takes the cell tail, whose probe stops a
+    // run that must stop as it would.
     let mut to_tail = Vec::new();
     for (miss, count) in [
-        (Some(epoch), StampCount::Epoch),
-        (Some(context), StampCount::Context),
-        (interrupted, StampCount::Interrupted),
+        (epoch, StampCount::Epoch),
+        (context, StampCount::Context),
+        (stopped, StampCount::Stopped),
     ] {
-        let Some(miss) = miss else {
-            continue;
-        };
         asm.bind(miss);
         asm.alu_imm8(Alu::Add, Qword, Mem::base(R10, count.offset()), 1);
         to_tail.push(asm.jmp8());
@@ -3115,7 +3800,7 @@ fn stamped_with_policy(
     for patch in to_tail {
         crate::x86_64::asm::resolve(&mut code, patch, tail_at);
     }
-    let cell_code = cell_tail(at + tail_at as u64, cell, word, ran, probe)?;
+    let cell_code = cell_tail(at + tail_at as u64, cell, target, word, ran, probe)?;
     code.asm().fixed(&cell_code);
     let padding = STAMPED_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
@@ -3224,9 +3909,10 @@ fn itlb_compare(
     first
 }
 
-/// A probe's transfer, counted: into the block at R9.
+/// A probe's transfer, counted: back to the tail that called it, whose
+/// `jmp r9` enters the block at R9.
 fn found(asm: &mut crate::x86_64::asm::Asm) {
-    asm.jmp_rm(R9);
+    asm.ret();
 }
 
 /// A probe's exit to the engine, with RAX and EDX as the tail left them: the
@@ -3235,8 +3921,8 @@ fn missed(asm: &mut crate::x86_64::asm::Asm) {
     exit_return(asm);
 }
 
-/// Bytes in a [`lookup_tail`]: the jump cache's hit, its exhausted
-/// budget's return, and the plain tail ([`TAIL_BYTES`]) of a miss.
+/// Bytes in a [`lookup_tail`]: the jump cache's hit and the plain tail
+/// ([`TAIL_BYTES`]) of a miss.
 pub const LOOKUP_TAIL_BYTES: usize = 224;
 
 /// The tail at host address `at` that an exit's patch point jumps to once
@@ -3247,7 +3933,8 @@ pub const LOOKUP_TAIL_BYTES: usize = 224;
 /// the exit's `word` with the `ran` instructions of the block it leaves,
 /// which only a probe reads, then a jump to the table probe at `probe`,
 /// which enters the block it finds, filling the cache, or returns to the
-/// engine. An interruption or a spent budget leaves as the probe would.
+/// engine. An interruption or no transfer left takes the plain tail too,
+/// whose probe stops the run.
 /// `None` when `ran` exceeds its field, `btype` is no BTYPE or `probe` is
 /// out of a 32-bit jump's reach.
 ///
@@ -3268,7 +3955,7 @@ pub fn lookup_tail(
     probe: u64,
     btype: u8,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
-    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Epoch)
+    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Quiet)
 }
 
 fn lookup_tail_with_policy(
@@ -3328,7 +4015,7 @@ pub fn paired_tail(
         ran,
         probe,
         0,
-        Interruption::Epoch,
+        Interruption::Quiet,
     )?;
     let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
@@ -3353,7 +4040,7 @@ fn lookup_tail_code(
     let entry = |field: i32| Mem::indexed(R10, R9, 1, JUMP_CACHE + field);
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses: Vec<_> = gate(&mut asm, policy, R8, true).into_iter().collect();
+    let mut misses = Vec::new();
     // R10 = this PE's stamps, R9 = the entry's offset.
     asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
     asm.mov(Dword, R9, Rax);
@@ -3377,18 +4064,14 @@ fn lookup_tail_code(
         asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
         misses.push(asm.jcc(Cond::E));
     }
-    spend_budget(&mut asm, policy);
-    let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran as i32);
+    // A run that must stop takes the plain tail, whose probe stops it.
+    misses.push(stop_check(&mut asm, policy, true));
+    count(&mut asm, transfer_change(ran)?);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     asm.jmp_rm(entry(JUMP_CODE));
-    // A spent budget returns as the probe's would, its word in EDX whole.
-    asm.bind(exhausted);
-    asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    missed(&mut asm);
     for miss in misses {
         asm.bind(miss);
     }
@@ -3460,29 +4143,55 @@ fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(none);
 }
 
-/// The tail at host address `at` of a direct exit out of its page, whose
-/// target the cell at `cell` holds ([`LookupTable::link_cell`]): the cell
-/// probe at `probe` ([`CELL_PROBE_ENTRY`]), then the jump or the exit as in
-/// a [`lookup_tail`]. `None` as for a [`lookup_tail`].
+/// The tail at host address `at` of a direct exit to `target` out of its
+/// page, whose target the cell at `cell` holds ([`LookupTable::link_cell`]):
+/// the target in RAX, which the exit's patch point did not load, the word
+/// in EDX as in a [`lookup_tail`], then a call of the cell probe at `probe`
+/// ([`CELL_PROBE_ENTRY`]), which returns only when it found the block, and
+/// the tail's own jump into it. `None` as for a [`lookup_tail`].
 pub fn cell_tail(
     at: u64,
     cell: u64,
+    target: u64,
     word: impl Into<ExitWord>,
     ran: u32,
     probe: u64,
 ) -> Option<[u8; CELL_TAIL_BYTES]> {
     let mut code = Code::new();
+    code.asm().mov_imm64(Rax, target);
     code.asm().mov_imm64(R9, cell);
     tail(&mut code, at, word.into(), ran, probe)?;
     code.try_into().ok()
 }
 
+/// A [`cell_tail`] that takes the target in RAX as it is: for tests that
+/// send other targets through a cell.
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+fn rax_cell_tail(
+    at: u64,
+    cell: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<Vec<u8>> {
+    let mut code = Code::new();
+    code.asm().mov_imm64(R9, cell);
+    tail(&mut code, at, word.into(), ran, probe)?;
+    Some(code.into_bytes())
+}
+
 /// Where a [`predicted_tail`]'s direct exit to its predicted target begins:
 /// its patch point is [`direct_patch`] of the tail's address plus this.
 pub const PREDICTED_EXIT: usize = 15;
-/// Bytes in a [`predicted_tail`]: the compare, the direct exit and a
-/// [`lookup_tail`].
-pub const PREDICTED_TAIL_BYTES: usize = PREDICTED_EXIT + DIRECT_EXIT_BYTES + TAIL_BYTES;
+/// Where a [`predicted_tail`]'s miss begins, after its direct exit: an
+/// [`open_predicted_tail`]'s is a dynamic exit, whose patch point is
+/// [`dynamic_patch`] of the tail's address plus this.
+pub const PREDICTED_MISS: usize = PREDICTED_EXIT + DIRECT_EXIT_BYTES;
+/// Bytes in a [`predicted_tail`] or an [`open_predicted_tail`]: the
+/// compare, the direct exit and the miss, a lookup's call of the table
+/// probe or a dynamic exit, padded.
+pub const PREDICTED_TAIL_BYTES: usize = PREDICTED_MISS + DYNAMIC_EXIT_BYTES;
+const _: () = assert!(TAIL_BYTES <= DYNAMIC_EXIT_BYTES);
 
 /// The tail at host address `at` of an exit to the target in RAX that the
 /// engine predicts is `target`: a one-target inline cache. When RAX is
@@ -3512,18 +4221,50 @@ pub fn predicted_tail(
     asm.fixed(&direct_exit_at(exit, target, word));
     asm.bind(other);
     tail(&mut code, at, word, ran, probe)?;
+    while code.len() < PREDICTED_TAIL_BYTES {
+        code.asm().int3();
+    }
     code.try_into().ok()
 }
 
+/// A [`predicted_tail`] whose miss is the exit's dynamic exit of `word`
+/// ([`PREDICTED_MISS`]), returning to the engine with RAX and EDX as the
+/// redirected exit did: the engine learns a site's second target from it
+/// and sends its patch point to a [`predicted_tail`] of that target, or to
+/// a lookup. `None` when `target`'s direct exit cannot be made.
+pub fn open_predicted_tail(
+    at: u64,
+    target: GuestAddress,
+    word: impl Into<ExitWord>,
+) -> Option<[u8; PREDICTED_TAIL_BYTES]> {
+    let word = word.into();
+    let mut code = Code::new();
+    let mut asm = code.asm();
+    asm.mov_imm64(R8, target.0);
+    asm.alu(Alu::Cmp, Qword, Rax, R8);
+    let other = asm.jcc8(Cond::Ne);
+    debug_assert_eq!(asm.len(), PREDICTED_EXIT);
+    asm.fixed(&direct_exit_at(at + PREDICTED_EXIT as u64, target, word));
+    asm.bind(other);
+    debug_assert_eq!(asm.len(), PREDICTED_MISS);
+    let miss = at + PREDICTED_MISS as u64;
+    asm.fixed(&exit_word_bytes(word.encoded(), patch_pad(miss)));
+    code.try_into().ok()
+}
+
+/// A tail's call of the probe at `probe`, in `code`, which runs from `at`:
+/// `mov edx` with `word` and `ran`, `call probe` and `jmp r9`, the site's
+/// own jump into the block the probe found ([`lookup_dispatcher`]).
 fn tail(code: &mut Code, at: u64, word: ExitWord, ran: u32, probe: u64) -> Option<()> {
     if ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
     }
     let mut asm = code.asm();
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    let jump = asm.jmp();
-    let relative = relative(at + jump.end() as u64, probe)?;
-    code.patch(jump.offset(), relative.to_le_bytes());
+    let call = asm.call();
+    let relative = relative(at + call.end() as u64, probe)?;
+    code.patch(call.offset(), relative.to_le_bytes());
+    code.asm().jmp_rm(R9);
     Some(())
 }
 
@@ -3536,7 +4277,7 @@ fn lookup_thunk(
     kind: impl Into<ExitWord>,
     btype: u8,
 ) -> Option<Vec<u8>> {
-    lookup_with_policy(ran, target, kind, btype, None, Interruption::Epoch)
+    lookup_with_policy(ran, target, kind, btype, None, Interruption::Quiet)
 }
 /// [`lookup_thunk`] through the cell at `cell` for `target`.
 #[cfg(test)]
@@ -3546,7 +4287,7 @@ fn lookup_thunk_with_cell(
     kind: impl Into<ExitWord>,
     cell: u64,
 ) -> Option<Vec<u8>> {
-    lookup_with_policy(ran, Some(target), kind, 0, Some(cell), Interruption::Epoch)
+    lookup_with_policy(ran, Some(target), kind, 0, Some(cell), Interruption::Quiet)
 }
 #[cfg(test)]
 fn lookup_with_policy(
@@ -3566,12 +4307,14 @@ fn lookup_with_policy(
     if let Some(cell) = cell {
         asm.mov_imm64(R9, cell);
     }
-    let call = asm.jmp();
-    let probes = code.len();
+    // The probe is called, as a tail calls it.
+    let call = asm.call();
+    asm.jmp_rm(R9);
     let entry = match (cell, target) {
         (Some(_), Some(_)) => CELL_PROBE_ENTRY,
         _ => PROBE_ENTRY,
     };
+    let probes = code.len();
     crate::x86_64::asm::resolve(&mut code, call, probes + entry);
     let mut bytes = code.into_bytes();
     bytes.extend(dispatcher_with_policy(btype, policy)?);
@@ -3587,7 +4330,7 @@ pub fn dynamic_exit(kind: ExitKind) -> [u8; DYNAMIC_EXIT_BYTES] {
 /// [`dynamic_exit`] for host address `at`, its patch point
 /// ([`dynamic_patch`]) patchable there.
 pub fn dynamic_exit_at(at: u64, kind: ExitKind) -> [u8; DYNAMIC_EXIT_BYTES] {
-    exit_word_bytes(ExitWord::from(kind).encoded(), patch_pad(at + 5))
+    exit_word_bytes(ExitWord::from(kind).encoded(), patch_pad(at))
 }
 
 /// `code` without the check failures that end a block, after its exits.
@@ -3601,11 +4344,9 @@ pub fn without_failures(code: &[u8]) -> &[u8] {
 
 /// `jmp rel32` at host address `at` to `to`, or `None` out of reach.
 pub fn jump(at: u64, to: u64) -> Option<[u8; JUMP_BYTES]> {
-    const JMP_REL32: u8 = 0xe9;
-    let relative = relative(at + JUMP_BYTES as u64, to)?;
-    let mut bytes = [JMP_REL32; JUMP_BYTES];
-    bytes[1..].copy_from_slice(&relative.to_le_bytes());
-    Some(bytes)
+    let relative = relative(at + JUMP_BYTES as u64, to)?.to_le_bytes();
+    // `jmp rel32`, as `Asm::jmp` emits it.
+    Some([0xe9, relative[0], relative[1], relative[2], relative[3]])
 }
 
 /// The rel32 displacement of a branch ending at host address `end` to
@@ -3623,6 +4364,82 @@ mod tests {
     /// The default block table's slot mask and ITLB's set mask.
     const TABLE_MASK: u32 = LOOKUP_ENTRIES as u32 - 1;
     const ITLB_MASK: u32 = ITLB_ENTRIES as u32 / 2 - 1;
+
+    /// The account in the frame at `frame`, which [`ACCOUNT`] left there.
+    ///
+    /// # Safety
+    /// `frame` must be a live `GuestState`'s address.
+    pub(super) unsafe fn account(frame: u64) -> Account {
+        // SAFETY: the caller's contract.
+        Account(unsafe { (*(frame as *const crate::GuestState)).account })
+    }
+
+    /// Put `account` in the frame at `frame`, for [`ACCOUNT`] to take.
+    ///
+    /// # Safety
+    /// As for [`account`].
+    pub(super) unsafe fn set_account(frame: u64, account: Account) {
+        // SAFETY: the caller's contract.
+        unsafe { (*(frame as *mut crate::GuestState)).account = account.0 };
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    /// The link tier of this host ([`LinkGate::for_target`]).
+    pub(super) fn gate() -> LinkGate {
+        LinkGate::for_target(crate::TargetCpu::detect())
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    /// A control with the account of the runs that use it, which native
+    /// code keeps in [`ACCOUNT`] and the engine apart: comparing two
+    /// compares both.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(super) struct Controlled {
+        pub control: ChainControl,
+        pub account: Account,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    impl core::ops::Deref for Controlled {
+        type Target = ChainControl;
+        fn deref(&self) -> &ChainControl {
+            &self.control
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    impl core::ops::DerefMut for Controlled {
+        fn deref_mut(&mut self) -> &mut ChainControl {
+            &mut self.control
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    impl Controlled {
+        /// Run `run` with a frame that finds the control and holds the
+        /// account, then keep the account it left.
+        pub(super) fn run<T>(&mut self, run: impl FnOnce(&mut crate::GuestState) -> T) -> T {
+            let mut frame = alloc::boxed::Box::new(crate::GuestState::default());
+            frame.anchors[Anchor::Control] = &mut self.control as *mut ChainControl as u64;
+            frame.account = self.account.0;
+            let result = run(&mut frame);
+            self.account = Account(frame.account);
+            result
+        }
+
+        /// Post an interruption ([`interrupt`]).
+        pub(super) fn interrupt(&mut self) {
+            // SAFETY: the control is this one's, which no native code runs on.
+            unsafe { interrupt(&mut self.control) };
+        }
+
+        /// Acknowledge the epoch the control holds ([`acknowledge`]).
+        pub(super) fn acknowledge(&mut self) {
+            let epoch = self.control.interrupt_epoch;
+            // SAFETY: as for `interrupt`.
+            unsafe { acknowledge(&mut self.control, epoch) };
+        }
+    }
 
     fn lookup_slot(pc: u64, key: u64) -> usize {
         super::lookup_slot(pc, key, TABLE_MASK)
@@ -3688,6 +4505,12 @@ mod tests {
         assert_eq!(itlb_entries(720 * MIB), MAX_ITLB_ENTRIES);
         assert_eq!(lookup_entries(0), MIN_LOOKUP_ENTRIES);
         assert_eq!(itlb_entries(0), MIN_ITLB_ENTRIES);
+        // A board's first table: half, which grows as blocks fill it.
+        assert_eq!(first_lookup_entries(512 * MIB), 1 << 20);
+        assert_eq!(first_lookup_entries(640 * MIB), 1 << 21);
+        assert_eq!(first_lookup_entries(976 * MIB), 1 << 21);
+        assert_eq!(first_lookup_entries(16 * MIB), MIN_LOOKUP_ENTRIES);
+        assert_eq!(first_lookup_entries(64 * 1024 * MIB), MAX_LOOKUP_ENTRIES);
     }
 
     /// An arena full of blocks of the size a launch measured (280 bytes a
@@ -3730,6 +4553,274 @@ mod tests {
         let rounded_down = kept(1 << (ARENA / CODE_BYTES_PER_ENTRY).ilog2());
         assert!(sized >= 0.95, "{sized:.3} kept");
         assert!(rounded_down < 0.75, "{rounded_down:.3} kept rounded down");
+    }
+
+    /// The same arena's table, begun at half the size and grown as its
+    /// blocks fill it ([`LookupTable::grow`]), ends at the size the arena
+    /// gives ([`lookup_entries`]) and keeps as many of their entries, once
+    /// the fetches of the entries a full set put off add them again.
+    #[test]
+    fn a_table_grown_with_a_full_arena_keeps_most_of_its_blocks_entries() {
+        const MIB: usize = 1 << 20;
+        const ARENA: usize = 96 * MIB;
+        const BLOCK_BYTES: usize = 280;
+        let blocks = (ARENA / BLOCK_BYTES) as u64;
+        let entry = |block: u64| {
+            let pc = 0x1_0000_0000 + 12 * block;
+            let key = block_key(0x40_0000_0000 + 12 * block, 1);
+            LookupEntry {
+                pc,
+                key,
+                entry: 1,
+                block: block as u32,
+                targets: 1,
+            }
+        };
+        let mut table = LookupTable::with_entries(first_lookup_entries(ARENA));
+        assert_eq!(table.entries(), lookup_entries(ARENA) / 2);
+        let mut most_steps = 0;
+        let mut steps = 0;
+        let held = |table: &LookupTable, block: u64| {
+            let held = entry(block);
+            table.find(table.slot(held.pc, held.key), held.pc, held.key) == held
+        };
+        for pass in 0..2 {
+            for block in 0..blocks {
+                if pass == 1 && held(&table, block) {
+                    continue;
+                }
+                let held = entry(block);
+                table.insert(table.slot(held.pc, held.key), held);
+                let growing = table.growing();
+                table.grow(block as usize + 1);
+                if table.growing() || growing {
+                    steps += 1;
+                } else {
+                    most_steps = most_steps.max(steps);
+                    steps = 0;
+                }
+                if table.holds_retired() {
+                    // SAFETY: no reader.
+                    unsafe { table.release_retired() };
+                }
+            }
+        }
+        assert_eq!(table.entries(), lookup_entries(ARENA));
+        assert_eq!(table.growths(), 1);
+        let sets = lookup_entries(ARENA) / 4;
+        assert_eq!(most_steps, sets.div_ceil(GROW_STEP_SETS));
+        let kept = (0..blocks).filter(|&block| held(&table, block)).count();
+        let kept = kept as f64 / blocks as f64;
+        assert!(kept >= 0.95, "{kept:.3} kept");
+    }
+
+    /// The entry of `pc` with `key` as native code finds it: through the
+    /// host address and slot mask a PE's `ChainControl` holds.
+    fn probe(table: u64, mask: u32, pc: u64, key: u64) -> LookupEntry {
+        let slot = |index: usize| {
+            // SAFETY: a table of `mask + 1` slots the caller keeps alive.
+            unsafe { &*(table as *const Slot).add(index) }.load()
+        };
+        let home = super::lookup_slot(pc, key, mask);
+        let first = slot(home);
+        if first.pc == pc && first.key == key {
+            return first;
+        }
+        let second = slot(neighbour(home));
+        if second.pc == pc { second } else { first }
+    }
+
+    /// An entry of block `block` whose fields check each other, so a
+    /// reader tells it from bytes no writer wrote whole.
+    fn checked(pc: u64, block: u32) -> LookupEntry {
+        LookupEntry {
+            pc,
+            key: block_key(pc ^ 0x55_0000_0000, 1),
+            entry: pc.rotate_left(17) ^ 0x5eed,
+            block,
+            targets: 1,
+        }
+    }
+
+    fn is_checked(entry: &LookupEntry) -> bool {
+        entry.key == 0 || *entry == checked(entry.pc, entry.block)
+    }
+
+    /// While a block table doubles twice under inserts, PEs probing it
+    /// natively through the address and mask they took at their last
+    /// refresh, and lookups without the lock, find every entry no insert
+    /// put out, whole: neither reads a table before its last slot was
+    /// written. The old table goes after both passed a refresh since its
+    /// successor was published (a grace).
+    #[test]
+    fn readers_find_every_entry_while_the_table_grows() {
+        use std::sync::atomic::AtomicBool;
+        let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+        let old_set = |entry: &LookupEntry| {
+            super::lookup_slot(entry.pc, entry.key, MIN_LOOKUP_ENTRIES as u32 - 1) / 2
+        };
+        // Kept entries alone in their sets of the first table, so no
+        // insert puts them out of it or of its successors.
+        let all: Vec<LookupEntry> = (0..200_000u32)
+            .map(|block| checked(0x2_0000_0000 + 28 * u64::from(block), block))
+            .collect();
+        let mut taken = alloc::collections::BTreeSet::new();
+        let kept: Vec<LookupEntry> = all
+            .iter()
+            .step_by(64)
+            .filter(|entry| taken.len() < 512 && taken.insert(old_set(entry)))
+            .copied()
+            .collect();
+        let filler: Vec<LookupEntry> = all
+            .iter()
+            .filter(|entry| !taken.contains(&old_set(entry)))
+            .copied()
+            .collect();
+        for entry in &kept {
+            table.insert(table.slot(entry.pc, entry.key), *entry);
+        }
+        let reader = table.reader();
+        let done = AtomicBool::new(false);
+        let passes = [AtomicU64::new(0), AtomicU64::new(0)];
+        std::thread::scope(|scope| {
+            // A PE's native probes, refreshed at each pass as at each run.
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let (address, mask) = reader.current();
+                    for entry in &kept {
+                        let found = probe(address, mask, entry.pc, entry.key);
+                        assert_eq!(found, *entry, "a kept entry, natively");
+                    }
+                    for entry in filler.iter().step_by(97) {
+                        let found = probe(address, mask, entry.pc, entry.key);
+                        assert!(is_checked(&found), "{found:?} read whole");
+                    }
+                    passes[0].fetch_add(1, Ordering::Release);
+                }
+            });
+            // The engine's lookups without the lock.
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    for entry in &kept {
+                        assert_eq!(reader.lookup(entry.pc, entry.key), *entry);
+                    }
+                    for entry in filler.iter().step_by(89) {
+                        assert!(is_checked(&reader.lookup(entry.pc, entry.key)));
+                    }
+                    passes[1].fetch_add(1, Ordering::Release);
+                }
+            });
+            let mut grace = None;
+            let mut live = kept.len();
+            for entry in &filler {
+                table.insert(table.slot(entry.pc, entry.key), *entry);
+                live += 1;
+                if let Some(then) = &grace {
+                    let now = passes.each_ref().map(|pass| pass.load(Ordering::Acquire));
+                    // A pass begun before the snapshot may hold the old
+                    // table: two passes since.
+                    if now.iter().zip(then).all(|(now, then)| now >= &(then + 2)) {
+                        // SAFETY: each reader read the table again since.
+                        unsafe { table.release_retired() };
+                        grace = None;
+                    }
+                } else if table.grow(live) {
+                    grace = Some(passes.each_ref().map(|pass| pass.load(Ordering::Acquire)));
+                }
+                if table.growths() == 2 && grace.is_none() {
+                    break;
+                }
+            }
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!(table.growths(), 2);
+        assert_eq!(table.entries(), 4 * MIN_LOOKUP_ENTRIES);
+        for entry in &kept {
+            assert_eq!(
+                table.find(table.slot(entry.pc, entry.key), entry.pc, entry.key),
+                *entry
+            );
+        }
+    }
+
+    /// Entries forgotten or put out while a table grows leave its copy,
+    /// and once it is published, the old table that PEs may still probe:
+    /// the old table holds only entries the new one holds alike.
+    #[test]
+    fn a_growing_table_forgets_in_its_copy_and_its_old_table() {
+        let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+        let entries: Vec<LookupEntry> = (0..40_000u32)
+            .map(|block| checked(0x3_0000_0000 + 4 * u64::from(block) * 5, block))
+            .collect();
+        for entry in &entries {
+            table.insert(table.slot(entry.pc, entry.key), *entry);
+        }
+        let in_table = |table: &LookupTable, entry: &LookupEntry| {
+            table.find(table.slot(entry.pc, entry.key), entry.pc, entry.key) == *entry
+        };
+        // Half the copy made: forget entries in sets on either side of it.
+        assert!(!table.grow(entries.len() * 2));
+        assert!(table.growing());
+        let (old, old_mask) = table.reader().current();
+        let forgotten: Vec<LookupEntry> = entries
+            .iter()
+            .step_by(7)
+            .filter(|entry| in_table(&table, entry))
+            .copied()
+            .collect();
+        for entry in &forgotten {
+            table.forget_block(entry.pc, entry.key, entry.block);
+        }
+        while !table.grow(entries.len() * 2) {}
+        let (new, new_mask) = table.reader().current();
+        assert_eq!(new_mask, 2 * old_mask + 1);
+        let absent = |table: u64, mask: u32, entry: &LookupEntry| {
+            let found = probe(table, mask, entry.pc, entry.key);
+            (found.pc, found.key) != (entry.pc, entry.key)
+        };
+        for entry in &forgotten {
+            assert!(
+                absent(new, new_mask, entry),
+                "{entry:?} forgotten in the copy"
+            );
+        }
+        // Every entry of the old table is the new one's too, and stays so
+        // through frames forgotten and entries put out after.
+        let frames: Vec<u64> = entries
+            .iter()
+            .step_by(1000)
+            .map(|entry| key_frame(entry.key))
+            .collect();
+        for &frame in &frames {
+            table.forget_frames(frame..=frame, |_| true);
+        }
+        for block in 0..20_000u32 {
+            let entry = checked(0x7_0000_0000 + 4 * u64::from(block) * 3, block);
+            table.insert(table.slot(entry.pc, entry.key), entry);
+        }
+        let mut held = 0;
+        for index in 0..=old_mask as usize {
+            // SAFETY: the old table is held until `release_retired`.
+            let entry = unsafe { &*(old as *const Slot).add(index) }.load();
+            if entry.key != 0 {
+                held += 1;
+                assert!(in_table(&table, &entry), "{entry:?} in the new table");
+            }
+        }
+        assert!(held > 10_000, "{held} entries left in the old table");
+        for entry in &forgotten {
+            assert!(
+                absent(old, old_mask, entry),
+                "{entry:?} forgotten in the old"
+            );
+        }
+        // SAFETY: no reader.
+        unsafe { table.release_retired() };
+        assert!(!table.holds_retired());
+        assert_eq!(
+            table.table_bytes(),
+            2 * MIN_LOOKUP_ENTRIES * size_of::<LookupEntry>()
+        );
     }
 
     /// A span's ITLB entries go in every context its salts reach, wherever
@@ -4016,58 +5107,141 @@ mod tests {
                 let (undone, jump_back) = unlinked(site, slot).unwrap();
                 assert_eq!(undone, point);
                 assert_eq!(code[offset..offset + PATCH_BYTES], jump_back);
-                let (body, bytes) = link(at, slot, 3, 7, 0x10_8000).unwrap();
-                assert_eq!(body, point + PATCH_BYTES as u64);
-                let start = (body - at) as usize;
-                assert!(start + bytes.len() <= slot);
+                let linking = link(at, slot, 3, 7, 0x10_8000, LinkGate::Jrcxz).unwrap();
+                assert_eq!(linking.rest_at, point + PATCH_BYTES as u64);
+                let start = (linking.rest_at - at) as usize;
+                // The body fills the slot from its point to the exit.
+                assert_eq!(start + linking.rest.len(), slot);
+                // The point's instruction is the first of the body's, the
+                // control's load, whose bytes go on past the point.
+                let mut first = Code::new();
+                first.asm().place(Rdx, CONTROL);
+                let first = first.into_bytes();
+                assert!(first.len() > PATCH_BYTES);
+                assert_eq!(linking.body()[..first.len()], first);
+                assert_eq!(linking.point, LINKED_SLOT);
                 // The body's every way out of the slot: the target, or the
                 // exit right after it.
                 let mut linked = code.clone();
-                linked[start..start + bytes.len()].copy_from_slice(&bytes);
-                linked[offset..offset + PATCH_BYTES].copy_from_slice(&NOP5);
+                linked[start..start + linking.rest.len()].copy_from_slice(&linking.rest);
+                linked[offset..offset + PATCH_BYTES].copy_from_slice(&linking.point);
                 assert_eq!(linked[slot..], code[slot..]);
-                // An exit without a slot is patched at its RET.
+                // An exit without a slot is patched at its point.
                 let (exit_point, ret) = unlinked(site, 0).unwrap();
                 assert_eq!(exit_point, direct_patch(site));
                 let exit = (exit_point - at) as usize;
                 assert_eq!(code[exit..exit + PATCH_BYTES], ret);
             }
         }
-        assert!(link(0, LINK_BYTES + 1, 3, 7, 0).is_none());
+        assert!(link(0, LINK_BYTES + 1, 3, 7, 0, LinkGate::Jrcxz).is_none());
         let word = 0x1122_3344_5566_7788;
-        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_0000_e966_7788);
+        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_441f_0f66_7788);
     }
 
     #[test]
     fn thunks_count_name_and_jump_or_fall_back() {
-        let word = ExitWord::from(ExitKind::Fallthrough);
-        let code = thunk(0x1000, 7, 3, 0x2000, Fallback::Return(word)).unwrap();
-        let mut expected = vec![0x48, 0x8b, 0x8f];
+        let code = thunk(0x1000, 7, 3, 0x2000, 0x800, LinkGate::Jrcxz).unwrap();
+        // mov rdx, [rdi + control]
+        let mut expected = vec![0x48, 0x8b, 0x97];
         expected.extend(824u32.to_le_bytes());
-        expected.extend([0x48, 0x8b, 0x51, 0x40, 0x48, 0x3b, 0x51, 0x48, 0x75, 27]);
-        expected.extend([0x48, 0x83, 0x29, 0x01, 0x72, 21]);
-        expected.extend([0x48, 0x81, 0x41, 0x08, 7, 0, 0, 0]);
-        expected.extend([0x48, 0xc7, 0x41, 0x10, 3, 0, 0, 0]);
-        // The jump ends 0x2c bytes into the thunk.
+        // The gate without the flags: mov ecx, [rdx], the quiet word, whose
+        // JRCXZ goes to the jump back.
+        expected.extend([0x8b, 0x0a, 0xe3, 26]);
+        // movzx ecx, r13w; JRCXZ there too when no transfer is left; then
+        // lea r13, [r13 + (7 << 16) - 1]: one transfer and 7 instructions.
+        expected.extend([0x41, 0x0f, 0xb7, 0xcd, 0xe3, 20]);
+        expected.extend([0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]);
+        expected.extend([0x48, 0xc7, 0x42, 0x08, 3, 0, 0, 0]);
+        // The jump ends 0x25 bytes into the thunk.
         expected.extend([0xe9]);
-        expected.extend((0x2000i32 - 0x102c).to_le_bytes());
-        expected.push(0xba);
-        expected.extend(word.encoded().to_le_bytes());
-        expected.extend(EXIT_RETURN);
-        assert_eq!(code, expected);
+        expected.extend((0x2000i32 - 0x1025).to_le_bytes());
         assert_eq!(code.len(), THUNK_BYTES);
-        let back = thunk(0x1000, 7, 3, 0x2000, Fallback::Jump(0x800)).unwrap();
+        assert_eq!(code[..POLLED_LINK_BODY_BYTES], expected);
+        // The jump back, nothing spent.
+        assert_eq!(code[POLLED_LINK_BODY_BYTES], 0xe9);
         assert_eq!(
-            back[..POLLED_LINK_BODY_BYTES],
-            expected[..POLLED_LINK_BODY_BYTES]
+            code[POLLED_LINK_BODY_BYTES + 1..],
+            (0x800i32 - 0x1000 - code.len() as i32).to_le_bytes()
         );
-        assert_eq!(back.len(), POLLED_LINK_BODY_BYTES + JUMP_BYTES);
-        assert_eq!(back[POLLED_LINK_BODY_BYTES], 0xe9);
+        // The thunk of a memory account took 51 bytes, 39 of them run.
+        const _: () = assert!(THUNK_BYTES <= 46);
+        // A block of more instructions than an 8-bit displacement holds.
+        let long = thunk(0x1000, 200, 3, 0x2000, 0x800, LinkGate::Jrcxz).unwrap();
+        assert_eq!(long.len(), THUNK_BYTES);
+        assert!(thunk(0, 0, 0, 1 << 40, 0x800, LinkGate::Jrcxz).is_none());
+        // The PEXT tier: pext ecx, r13d, [rdx], the transfers part under the
+        // quiet word, and one JRCXZ to the jump back; the rest as above.
+        let code = thunk(0x1000, 7, 3, 0x2000, 0x800, LinkGate::Pext).unwrap();
+        let body = LINK_BODY_BYTES + 1;
+        let mut expected = vec![0x48, 0x8b, 0x97];
+        expected.extend(824u32.to_le_bytes());
+        expected.extend([0xc4, 0xe2, 0x12, 0xf5, 0x0a, 0xe3, 20]);
+        expected.extend([0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]);
+        expected.extend([0x48, 0xc7, 0x42, 0x08, 3, 0, 0, 0, 0xe9]);
+        expected.extend((0x2000i32 - 0x1000 - body as i32).to_le_bytes());
+        assert_eq!(code[..body], expected);
+        assert_eq!(code.len(), body + JUMP_BYTES);
+        // Either tier's slot body fits the slot.
+        for gate in [LinkGate::Jrcxz, LinkGate::Pext] {
+            let linking = link(0x1000, POLLED_LINK_BYTES, 7, 3, 0x2000, gate).unwrap();
+            assert_eq!(linking.body().len(), POLLED_LINK_BYTES - patch_pad(0x1000));
+        }
+    }
+
+    /// The PEXT tier is a fast-PDEP host's: Zen 1 and 2 microcode PEXT.
+    #[test]
+    fn link_gates_follow_the_target() {
+        use crate::TargetCpu;
+        assert_eq!(LinkGate::for_target(TargetCpu::Baseline), LinkGate::Jrcxz);
         assert_eq!(
-            back[POLLED_LINK_BODY_BYTES + 1..],
-            (0x800i32 - 0x1000 - back.len() as i32).to_le_bytes()
+            LinkGate::for_target(TargetCpu::X86_64_V2.with_bmi2()),
+            LinkGate::Jrcxz
         );
-        assert!(thunk(0, 0, 0, 1 << 40, Fallback::Return(word)).is_none());
+        assert_eq!(
+            LinkGate::for_target(TargetCpu::X86_64_V2.with_bmi2().with_fast_pdep()),
+            LinkGate::Pext
+        );
+    }
+
+    /// An account's transfers and instructions are apart: a transfer's LEA,
+    /// which runs only with a transfer left, adds its block's instructions
+    /// less one transfer, and a settle below zero leaves the transfers as
+    /// they were.
+    #[test]
+    fn accounts_keep_transfers_apart_from_instructions() {
+        let transfer = |account: Account, ran: u32| {
+            assert_ne!(account.budget(), 0, "a check stops a run with none left");
+            Account(
+                account
+                    .0
+                    .wrapping_add(transfer_change(ran).unwrap() as i64 as u64),
+            )
+        };
+        let full = Account::new(MAX_BUDGET);
+        assert_eq!((full.budget(), full.retired()), (MAX_BUDGET, 0));
+        let spent = transfer(Account::new(1), 7);
+        assert_eq!(
+            (spent, spent.budget(), spent.retired()),
+            (Account::spent(7), 0, 7)
+        );
+        // A settle 5 below zero, then a transfer of 9: the transfers part
+        // never borrowed.
+        let settled = Account::new(2).with_retired((-5i64) as u64);
+        assert_eq!((settled.budget(), settled.retired() as i64), (2, -5));
+        let after = transfer(settled, 9);
+        assert_eq!((after.budget(), after.retired()), (1, 4));
+        // The most instructions a transfer adds fit its displacement.
+        let ran = (1 << (u32::BITS - ExitWord::RAN_SHIFT)) - 1;
+        assert!(transfer_change(ran).is_some());
+        let most = transfer(Account::new(MAX_BUDGET), ran);
+        assert_eq!(
+            (most.budget(), most.retired()),
+            (MAX_BUDGET - 1, u64::from(ran))
+        );
+        assert_eq!(
+            Account::new(3).with_budget(0).with_retired(11),
+            Account::spent(11)
+        );
     }
 
     #[test]
@@ -4202,7 +5376,12 @@ mod tests {
             assert_eq!(mprotect(page, PAGE, 5), 0);
             let thunk = |at: *const u8| {
                 move |frame: u64, target: u64| {
-                    crate::x86_64::native::enter(at, frame as *mut crate::GuestState, target, 0)
+                    crate::x86_64::native::enter_counted(
+                        at,
+                        frame as *mut crate::GuestState,
+                        target,
+                        0,
+                    )
                 }
             };
             let dynamic = thunk(page as *const u8);
@@ -4220,28 +5399,64 @@ mod tests {
                 targets: 0b0111,
             };
             table.set(lookup_slot(TARGET, KEY), entry);
-            control.budget = 2;
+            set_account(frame, account(frame).with_budget(2));
             // No translation of the target's page yet: the exit returns.
             assert_eq!(
                 exit(dynamic(frame, TARGET)),
                 (TARGET, ExitKind::Return as u64)
             );
-            assert_eq!(control.budget, 2);
+            assert_eq!(account(frame).budget(), 2);
             translate(&mut itlb, TARGET, 7);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
             assert_eq!(
-                (control.budget, control.retired, control.hits, control.block),
+                (
+                    account(frame).budget(),
+                    account(frame).retired(),
+                    control.hits,
+                    control.block
+                ),
                 (1, 9, 1, 42)
             );
             assert_eq!(exit(fixed(frame, 0)), (0x5151, 99));
-            assert_eq!((control.budget, control.retired, control.hits), (0, 12, 2));
-            // No budget left: the budget wraps and the exit is taken.
+            assert_eq!(
+                (
+                    account(frame).budget(),
+                    account(frame).retired(),
+                    control.hits
+                ),
+                (0, 12, 2)
+            );
+            // No budget left: the exit is taken, nothing spent.
             assert_eq!(
                 exit(dynamic(frame, TARGET)),
                 (TARGET, ExitKind::Return as u64)
             );
-            assert_eq!((control.budget, control.retired), (u64::MAX, 12));
-            control.budget = 5;
+            assert_eq!((account(frame).budget(), account(frame).retired()), (0, 12));
+            // A settle before the exit left the count 5 below zero: the
+            // probe's 9 instructions repay it, and the one transfer left,
+            // which the settle never touched, is taken.
+            let hits = control.hits;
+            set_account(frame, Account::new(1).with_retired((-5i64) as u64));
+            assert_eq!(
+                (account(frame).budget(), account(frame).retired()),
+                (1, (-5i64) as u64)
+            );
+            assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
+            assert_eq!((account(frame).budget(), account(frame).retired()), (0, 4));
+            assert_eq!(control.hits, hits + 1);
+            control.hits = hits;
+            // With none left it exits, the count as it was.
+            set_account(frame, Account::new(0).with_retired((-5i64) as u64));
+            assert_eq!(
+                exit(dynamic(frame, TARGET)),
+                (TARGET, ExitKind::Return as u64)
+            );
+            assert_eq!(
+                (account(frame).budget(), account(frame).retired()),
+                (0, (-5i64) as u64)
+            );
+            set_account(frame, account(frame).with_retired(12));
+            set_account(frame, account(frame).with_budget(5));
             // Another PC in the slot misses.
             let other = TARGET ^ (1 << (2 + LOOKUP_BITS) | 1 << 2);
             translate(&mut itlb, other, 7);
@@ -4251,16 +5466,16 @@ mod tests {
                 (other, ExitKind::Return as u64)
             );
             // The set's other entry serves too.
-            let (hits, retired) = (control.hits, control.retired);
+            let (hits, retired) = (control.hits, account(frame).retired());
             table.insert(lookup_slot(TARGET, KEY), LookupEntry { pc: other, ..entry });
             assert_eq!(table.entry(neighbour(lookup_slot(TARGET, KEY))).pc, TARGET);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
             assert_eq!(table.find(lookup_slot(TARGET, KEY), TARGET, KEY).pc, TARGET);
             assert_eq!(exit(dynamic(frame, other)), (0x5151, 99));
             assert_eq!(control.hits, hits + 2);
-            control.retired = retired;
+            set_account(frame, account(frame).with_retired(retired));
             control.hits = hits;
-            control.budget = 5;
+            set_account(frame, account(frame).with_budget(5));
             table.set(neighbour(lookup_slot(TARGET, KEY)), LookupEntry::default());
             // An entry of another key, another frame or fetch state, misses.
             table.set(
@@ -4275,7 +5490,10 @@ mod tests {
                 (TARGET, ExitKind::Return as u64)
             );
             assert_eq!(exit(fixed(frame, 0)), (TARGET, ExitKind::Call as u64));
-            assert_eq!((control.budget, control.hits, control.block), (5, 2, 42));
+            assert_eq!(
+                (account(frame).budget(), control.hits, control.block),
+                (5, 2, 42)
+            );
             table.set(lookup_slot(TARGET, KEY), entry);
             // A new context translates the page anew, and then finds the
             // table's entry, which outlived the old one.
@@ -4287,15 +5505,16 @@ mod tests {
             );
             translate(&mut itlb, TARGET, 9);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
-            assert_eq!((control.budget, control.hits), (4, 3));
+            assert_eq!((account(frame).budget(), control.hits), (4, 3));
             // The lower half's context translates a lower-half target, and
             // the upper half's one the lower half's lacks (a global page).
             let lower = TARGET & !(1 << 55);
             table.set(lookup_slot(lower, KEY), LookupEntry { pc: lower, ..entry });
             translate(&mut itlb, lower, 9);
-            let before = (control.budget, control.retired, control.hits);
+            let before = (account(frame), control.hits);
             assert_eq!(exit(dynamic(frame, lower)), (0x5151, 99));
-            (control.budget, control.retired, control.hits) = before;
+            set_account(frame, before.0);
+            control.hits = before.1;
             itlb.forget_range_where(lower & !0xfff..=lower & !0xfff, |_| true);
             assert_eq!(
                 exit(dynamic(frame, lower)),
@@ -4312,7 +5531,7 @@ mod tests {
             control.salts = [itlb_salt(5), itlb_salt(9)];
             translate(&mut itlb, lower, 5);
             assert_eq!(exit(dynamic(frame, lower)), (0x5151, 99));
-            assert_eq!((control.budget, control.hits), (3, 4));
+            assert_eq!((account(frame).budget(), control.hits), (3, 4));
             // A BR with BTYPE 0b11 needs the entry to accept it, and names
             // the BTYPE beside the block.
             assert_eq!(
@@ -4328,15 +5547,19 @@ mod tests {
             );
             assert_eq!(exit(branch(frame, TARGET)), (0x5151, 99));
             assert_eq!(
-                (control.budget, control.retired, control.hits, control.block),
+                (
+                    account(frame).budget(),
+                    account(frame).retired(),
+                    control.hits,
+                    control.block
+                ),
                 (2, 35, 5, 3 << BLOCK_BTYPE_SHIFT | 42)
             );
-            control.budget = 5;
-            control.interrupt_epoch = 1;
-            control.observed_interrupt_epoch = 0;
+            set_account(frame, account(frame).with_budget(5));
+            interrupt(&mut control);
             let prior = (
-                control.budget,
-                control.retired,
+                account(frame).budget(),
+                account(frame).retired(),
                 control.hits,
                 control.linked,
                 control.block,
@@ -4352,17 +5575,17 @@ mod tests {
             );
             assert_eq!(
                 (
-                    control.budget,
-                    control.retired,
+                    account(frame).budget(),
+                    account(frame).retired(),
                     control.hits,
                     control.linked,
                     control.block
                 ),
                 prior
             );
-            control.observed_interrupt_epoch = 1;
+            acknowledge(&mut control, 1);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
-            assert_eq!(control.budget, 4);
+            assert_eq!((account(frame).budget(), control.block), (4, 42));
             assert_eq!(munmap(page, PAGE), 0);
         }
     }
@@ -4560,17 +5783,20 @@ mod tests {
         assert_eq!(table.sampled_link(cells[0].1), None);
     }
 
-    /// Each tail calls its probe and jumps through R9 itself: the site's own
-    /// indirect jump. A probe set's pieces keep their places in every policy.
+    /// A lookup tail jumps to its probe; a cell tail calls its probe and
+    /// jumps through R9 itself, the site's own indirect jump. A probe set's
+    /// pieces keep their places in every policy.
     #[test]
     fn tails_jump_to_the_probes() {
         let mut plain = Code::new();
         tail(&mut plain, 0x1000, ExitKind::Return.into(), 3, 0x2000).unwrap();
-        // EDX the word with the instructions run, then the jump.
+        // EDX the word with the instructions run, the call, then the jump
+        // into the block the probe found.
         let mut expected = vec![0xba];
         expected.extend((ExitKind::Return as u32 | 3 << ExitWord::RAN_SHIFT).to_le_bytes());
-        expected.push(0xe9);
+        expected.push(0xe8);
         expected.extend((0x2000i32 - 0x100a).to_le_bytes());
+        expected.extend([0x41, 0xff, 0xe1]);
         assert_eq!(plain.to_vec(), expected);
         // The cached tail ends its misses in the same word and jump.
         let cached = lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, 0).unwrap();
@@ -4582,11 +5808,23 @@ mod tests {
             assert!(lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, btype).is_some());
         }
         assert!(lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, 4).is_none());
-        let cell = cell_tail(0x1000, 0xdead_beef_0000, ExitKind::Return, 3, 0x2000).unwrap();
-        assert_eq!(&cell[..2], &[0x49, 0xb9]);
-        assert_eq!(&cell[2..10], &0xdead_beef_0000u64.to_le_bytes());
-        assert_eq!(&cell[10..15], &expected[..5]);
-        assert_eq!(&cell[15..20], &[0xe9, 0xec, 0x0f, 0, 0]);
+        let cell = cell_tail(
+            0x1000,
+            0xdead_beef_0000,
+            0x4000,
+            ExitKind::Return,
+            3,
+            0x2000,
+        )
+        .unwrap();
+        assert_eq!(&cell[..2], &[0x48, 0xb8]);
+        assert_eq!(&cell[2..10], &0x4000u64.to_le_bytes());
+        assert_eq!(&cell[10..12], &[0x49, 0xb9]);
+        assert_eq!(&cell[12..20], &0xdead_beef_0000u64.to_le_bytes());
+        assert_eq!(&cell[20..25], &expected[..5]);
+        // call probe; jmp r9.
+        assert_eq!(&cell[25..30], &[0xe8, 0xe2, 0x0f, 0, 0]);
+        assert_eq!(&cell[30..], &[0x41, 0xff, 0xe1]);
         assert!(lookup_tail(0, ExitKind::Return, 0, 1 << 40, 0).is_none());
         assert!(lookup_tail(0, ExitKind::Return, 1 << 12, 0, 0).is_none());
         for btype in 0..4 {
@@ -4596,13 +5834,7 @@ mod tests {
                 assert_eq!(&probes[at..at + 3], &[0x48, 0x8b, 0x8f]);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            for policy in [
-                Interruption::Legacy,
-                Interruption::LockedBudget,
-                Interruption::Flag,
-            ] {
-                assert!(dispatcher_with_policy(btype, policy).is_some());
-            }
+            assert!(dispatcher_with_policy(btype, Interruption::Legacy).is_some());
         }
     }
 
@@ -4682,7 +5914,7 @@ mod tests {
                 }
                 assert_eq!(mprotect(page, PAGE, 5), 0);
                 let run = |frame: u64| {
-                    crate::x86_64::native::enter(
+                    crate::x86_64::native::enter_counted(
                         page as *const u8,
                         frame as *mut crate::GuestState,
                         0,
@@ -4693,15 +5925,20 @@ mod tests {
                     let word = (result >> 64) as u64;
                     (result as u64, ExitWord::split(word).0)
                 };
-                control.budget = 3;
+                set_account(frame, account(frame).with_budget(3));
                 // The target's page untranslated: the exit returns.
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!(control.budget, 3);
+                assert_eq!(account(frame).budget(), 3);
                 let translated = LookupEntry::page(target & !0xfff, context, KEY);
                 itlb.insert(itlb_slot(target, context), translated);
                 assert_eq!(exit(run(frame)), (0x5111, 99));
                 assert_eq!(
-                    (control.budget, control.retired, control.hits, control.block),
+                    (
+                        account(frame).budget(),
+                        account(frame).retired(),
+                        control.hits,
+                        control.block
+                    ),
                     (2, 5, 0, 42)
                 );
                 // Another key: the table's entry, a lookup hit.
@@ -4714,7 +5951,7 @@ mod tests {
                     (target, ExitKind::Call as u64),
                     "no table entry"
                 );
-                assert_eq!(control.budget, 2);
+                assert_eq!(account(frame).budget(), 2);
                 table.set(lookup_slot(target, KEY), table_entry);
                 // The set filled the cell with the table's entry.
                 assert_eq!(table.site_cell(1), Some(table_entry));
@@ -4724,7 +5961,12 @@ mod tests {
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
                 assert_eq!(
-                    (control.budget, control.retired, control.hits, control.block),
+                    (
+                        account(frame).budget(),
+                        account(frame).retired(),
+                        control.hits,
+                        control.block
+                    ),
                     (1, 10, 1, 43)
                 );
                 // A cell of another PC is never entered.
@@ -4733,17 +5975,17 @@ mod tests {
                     ..cell_entry
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
-                assert_eq!((control.budget, control.hits), (0, 2));
-                // No budget: one spend wraps it, and the exit returns.
+                assert_eq!((account(frame).budget(), control.hits), (0, 2));
+                // No budget: the exit returns, nothing spent.
                 *(cell as *mut LookupEntry) = cell_entry;
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!((control.budget, control.retired), (u64::MAX, 15));
+                assert_eq!((account(frame).budget(), account(frame).retired()), (0, 15));
                 // Another context of the same salt: the page translates
                 // anew, whatever the cell holds.
-                control.budget = 5;
+                set_account(frame, account(frame).with_budget(5));
                 control.contexts[half] = context + LOOKUP_SALTS as u64;
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!(control.budget, 5);
+                assert_eq!(account(frame).budget(), 5);
                 control.contexts[half] = context;
                 // A cell a writer holds (or changed while it was read): the
                 // table probe looks the target up anew by its key and finds
@@ -4753,12 +5995,20 @@ mod tests {
                     ..cell_entry
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
-                assert_eq!((control.budget, control.hits, control.block), (4, 3, 43));
+                assert_eq!(
+                    (account(frame).budget(), control.hits, control.block),
+                    (4, 3, 43)
+                );
                 *(cell as *mut LookupEntry) = cell_entry;
-                control.budget = 5;
+                set_account(frame, account(frame).with_budget(5));
                 // A pending interruption: nothing spent or counted.
-                control.interrupt_epoch = 1;
-                let prior = (control.budget, control.retired, control.hits, control.block);
+                interrupt(&mut control);
+                let prior = (
+                    account(frame).budget(),
+                    account(frame).retired(),
+                    control.hits,
+                    control.block,
+                );
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
                 *(cell as *mut LookupEntry) = LookupEntry {
                     key: 0,
@@ -4766,13 +6016,18 @@ mod tests {
                 };
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
                 assert_eq!(
-                    (control.budget, control.retired, control.hits, control.block),
+                    (
+                        account(frame).budget(),
+                        account(frame).retired(),
+                        control.hits,
+                        control.block
+                    ),
                     prior
                 );
-                control.observed_interrupt_epoch = 1;
+                acknowledge(&mut control, 1);
                 *(cell as *mut LookupEntry) = cell_entry;
                 assert_eq!(exit(run(frame)), (0x5111, 99));
-                assert_eq!(control.budget, 4);
+                assert_eq!((account(frame).budget(), control.block), (4, 42));
                 assert_eq!(munmap(page, PAGE), 0);
             }
         }
@@ -4855,7 +6110,7 @@ mod tests {
             }
             assert_eq!(mprotect(page, PAGE, 5), 0);
             let ret = |frame: u64, target: u64| {
-                crate::x86_64::native::enter(
+                crate::x86_64::native::enter_counted(
                     page as *const u8,
                     frame as *mut crate::GuestState,
                     target,
@@ -4863,7 +6118,7 @@ mod tests {
                 )
             };
             let exit = |result: u128| (result as u64, ExitWord::split((result >> 64) as u64).0);
-            control.budget = 100;
+            set_account(frame, account(frame).with_budget(100));
             // Returns to each caller in turn, through one site's tail.
             for round in 0..3 {
                 for (index, &caller) in callers.iter().enumerate() {
@@ -4875,7 +6130,7 @@ mod tests {
                     assert_eq!(control.block, index as u64);
                 }
             }
-            assert_eq!((control.hits, control.retired), (9, 36));
+            assert_eq!((control.hits, account(frame).retired()), (9, 36));
             // A return past its caller, to where no entry is, and to a
             // poisoned address exit with the target as computed.
             let poisoned = callers[0] ^ 1 << 53;
@@ -4890,7 +6145,7 @@ mod tests {
                 (callers[1], ExitKind::Return as u64)
             );
             assert_eq!(exit(ret(frame, callers[2])), (0x5102, 99));
-            assert_eq!((control.hits, control.budget), (10, 90));
+            assert_eq!((control.hits, account(frame).budget()), (10, 90));
             assert_eq!(munmap(page, PAGE), 0);
         }
     }

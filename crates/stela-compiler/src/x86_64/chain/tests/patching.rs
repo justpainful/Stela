@@ -2,6 +2,7 @@
 //! changes with one aligned 8-byte store, and a core running the exit in a
 //! loop meanwhile only ever takes the old way or the new one.
 use super::super::*;
+use super::gate;
 use crate::GuestState;
 use alloc::boxed::Box;
 use core::ffi::c_void;
@@ -104,19 +105,22 @@ fn run_while_patching(
         let (page, stop, last, runs) = (page.clone(), stop.clone(), last.clone(), runs.clone());
         std::thread::spawn(move || {
             let _page = page;
-            let mut control = Box::new(ChainControl {
-                budget: u64::MAX >> 1,
-                ..ChainControl::default()
-            });
+            let mut control = Box::new(ChainControl::default());
             let mut frame = Box::new(GuestState::default());
             frame.anchors[Anchor::Control] = &mut *control as *mut ChainControl as u64;
             let mut seen = Seen::default();
             while !stop.load(Ordering::Acquire) {
                 control.block = 0;
+                frame.account = Account::new(MAX_BUDGET).0;
                 // SAFETY: the page stays mapped until join; its code has the
                 // block ABI and touches only the frame's control.
                 let result = unsafe {
-                    crate::x86_64::native::enter(entry as usize as *const u8, &mut *frame, 0, 0)
+                    crate::x86_64::native::enter_counted(
+                        entry as usize as *const u8,
+                        &mut *frame,
+                        0,
+                        0,
+                    )
                 };
                 let (value, word) = (result as u64, (result >> 64) as u64);
                 if (value, ExitWord::split(word).0) == (TARGET.0, ExitKind::Direct as u64) {
@@ -157,12 +161,12 @@ fn run_while_patching(
 }
 
 /// The marker block, and thunks into it naming blocks 2 and 3.
-fn install_targets(page: &Page, fallback: Fallback) -> [u64; 2] {
+fn install_targets(page: &Page, fallback: u64) -> [u64; 2] {
     let block = page.address() + BLOCK_AT as u64;
     page.write(block, &[0xb8, 0x51, 0x51, 0, 0, 0xba, 99, 0, 0, 0, 0xc3]);
     [2, 3].map(|named| {
         let at = page.address() + (THUNKS_AT + 64 * named as usize) as u64;
-        page.write(at, &thunk(at, 1, named, block, fallback).unwrap());
+        page.write(at, &thunk(at, 1, named, block, fallback, gate()).unwrap());
         at
     })
 }
@@ -175,14 +179,15 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
     // An address the slot's point needs a pad at.
     let at = page.address() + 5;
     let site = at + POLLED_LINK_BYTES as u64;
-    let mut code = empty_link_at(at, POLLED_LINK_BYTES);
+    let mut code = alloc::vec![0; POLLED_LINK_BYTES];
+    empty_link_at(at, &mut code);
     code.extend(direct_exit_at(site, TARGET, ExitKind::Direct));
     page.write(at, &code);
     let point = slot_patch(at);
     assert_ne!(point, at);
-    let thunks = install_targets(&page, Fallback::Jump(site));
+    let thunks = install_targets(&page, site);
     let block = page.address() + BLOCK_AT as u64;
-    let (body, bytes) = link(at, POLLED_LINK_BYTES, 1, 1, block).unwrap();
+    let linking = link(at, POLLED_LINK_BYTES, 1, 1, block, gate()).unwrap();
     let (unlink_at, unlink) = unlinked(site, POLLED_LINK_BYTES).unwrap();
     assert_eq!(unlink_at, point);
     let seen = run_while_patching(&page, at, |step| {
@@ -194,9 +199,9 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
                 // The body is written once, while the point jumps over it;
                 // later rounds fall into the same bytes again.
                 if step == 0 {
-                    page.write(body, &bytes);
+                    page.write(linking.rest_at, &linking.rest);
                 }
-                page.patch(point, NOP5);
+                page.patch(point, linking.point);
                 1
             }
             1 => {
@@ -224,8 +229,8 @@ fn an_exit_links_relinks_and_unlinks_while_it_runs() {
     for start in [0, 3, 6] {
         let site = page.address() + start;
         page.write(site, &direct_exit_at(site, TARGET, ExitKind::Direct));
-        let thunks = install_targets(&page, Fallback::Return(ExitKind::Direct.into()));
         let (point, unlink) = unlinked(site, 0).unwrap();
+        let thunks = install_targets(&page, unlinked_return(point));
         let seen = run_while_patching(&page, site, |step| {
             if step == 3 * ROUNDS {
                 return None;

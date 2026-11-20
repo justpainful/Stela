@@ -162,6 +162,28 @@ pub fn unmap_under(frames: &dyn Frames, entry: u64, first: u64, last: u64) {
     }
 }
 
+/// Report each table page under the root entry `entry`, every level down
+/// to the page tables, deepest first. Leaves and large pages hold no table.
+pub fn tables_under(frames: &dyn Frames, entry: u64, table: &mut impl FnMut(u64)) {
+    if entry & PRESENT != 0 && entry & HUGE == 0 {
+        tables_of(frames, entry & ADDRESS, layout::top_level() - 1, table);
+    }
+}
+
+fn tables_of(frames: &dyn Frames, physical: u64, level: u32, table: &mut impl FnMut(u64)) {
+    if level > 0 {
+        let entries = frames.table(physical);
+        for slot in 0..ENTRIES as usize {
+            // SAFETY: `physical` is a live table page of these frames.
+            let value = unsafe { entries.wrapping_add(slot).read_volatile() };
+            if value & PRESENT != 0 && value & HUGE == 0 {
+                tables_of(frames, value & ADDRESS, level - 1, table);
+            }
+        }
+    }
+    table(physical);
+}
+
 fn clear(
     frames: &dyn Frames,
     table: u64,

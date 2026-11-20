@@ -7,6 +7,15 @@ use super::*;
 /// and no translation.
 const SCTLR_ENALS: u64 = 1 << 56;
 
+/// SCTLR_ELx.{EnIA, EnIB, EnDA, EnDB} (`pointer_authentication::
+/// key_enable_bit`): PAC's key enables, inputs of PAC alone. SPTM sets all
+/// four at each guarded entry and writes back the value it found before it
+/// returns (sptm.t8112 26A434: `orr` of 0x8000_0000, 0x4000_0000,
+/// 0x800_0000 and 0x2000 into SCTLR_EL1, then the saved value with
+/// SPRR_PERM, MDSCR and APCTL), thousands of times a second while a process
+/// without JOP keys runs, whose switch clears them.
+const SCTLR_POINTER_ENABLES: u64 = 1 << 31 | 1 << 30 | 1 << 27 | 1 << 13;
+
 impl<H: Host, D: Devices> Context for Access<'_, H, D> {
     fn chip(&self) -> Chip {
         self.machine.cpu.registers.chip()
@@ -388,7 +397,19 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
             }
             return Ok(());
         }
-        self.machine.register_written(register);
+        // A change of PAC's key enables alone is a write of PAC's inputs:
+        // no MRS or MSR traps or reads differently, so the mirror cells
+        // stay, and the GENTER and GEXIT records with them, as EL2 and its
+        // guarded level share the register (`forget_pointer_derived`).
+        if !banked && sctlr && changed & !(SCTLR_POINTER_ENABLES | SCTLR_ENALS) == 0 {
+            self.machine.forget_pointer_derived();
+            return Ok(());
+        }
+        if layout(register) {
+            self.machine.layout_written();
+        } else {
+            self.machine.register_written(register);
+        }
         if table_base(register) {
             if self.translation == Translation::Unchanged {
                 self.translation = Translation::TableBase;
@@ -396,6 +417,10 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
         } else if sctlr && (before ^ self.machine.cpu.read(register)) & mmu::SCTLR_TRANSLATION == 0
         {
             self.regime = true;
+        } else if layout(register) {
+            if self.translation == Translation::Unchanged {
+                self.translation = Translation::Layout;
+            }
         } else if translates(register) {
             self.translation = Translation::All;
         }

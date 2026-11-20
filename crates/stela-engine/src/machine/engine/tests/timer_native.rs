@@ -395,6 +395,69 @@ fn control_reads_match_the_engine_in_every_case() {
     }
 }
 
+/// A TVAL write the native thunk leaves to the engine is counted under
+/// step timing by why it left it, and one the thunk completes counts as
+/// native where it reaches the engine.
+#[test]
+fn timer_value_exits_name_why_native_code_left_them() {
+    use step_timing::TimerExit;
+    let clock = count_state();
+    type Setup<'a> = &'a dyn Fn(&mut Machine<FakeHost, NoDevices>);
+    let cases: [(TimerExit, u64, Setup<'_>); 7] = [
+        (TimerExit::Native, 30, &|_| {}),
+        (TimerExit::Now, 0, &|_| {}),
+        (TimerExit::High, 30, &|machine| {
+            at(machine, &clock, 160);
+            machine.mirrors.timer_quiet = register_read::Cell::default();
+        }),
+        (TimerExit::LinesDevices, 30, &|machine| {
+            machine.mirrors.lines_until = 0;
+            machine.device_lines = None;
+        }),
+        (TimerExit::LinesMonitor, 30, &|machine| {
+            machine.mirrors.lines_until = 0;
+            let current = machine.current;
+            assert!(machine.device_lines.is_some_and(|(_, _, pe)| pe == current));
+        }),
+        (TimerExit::Closed, 30, &|machine| {
+            machine.mirrors.close(TIMER_COMPARE)
+        }),
+        (TimerExit::State, 30, &|machine| {
+            machine.cpu.pstate = Pstate::reset(1);
+            machine.derived_changed();
+        }),
+    ];
+    for (reason, value, setup) in cases {
+        let mut machine = armed(&clock);
+        machine.set_step_timing(true);
+        setup(&mut machine);
+        if reason != TimerExit::State {
+            let saved = (stored(&machine), machine.mirrors.lines_until);
+            let completed = native(&mut machine, TimerAccess::WriteValue, value);
+            assert_eq!(completed, reason == TimerExit::Native, "{reason:?}");
+            if completed {
+                let (cval, ctl) = saved.0;
+                machine
+                    .cpu
+                    .registers
+                    .set(SystemRegister::CNTHV_CVAL_EL2, 0, cval);
+                machine
+                    .cpu
+                    .registers
+                    .set(SystemRegister::CNTHV_CTL_EL2, 0, ctl);
+                machine.mirrors.lines_until = saved.1;
+            }
+        }
+        machine.cpu.state.x[19] = value;
+        machine.cpu.pc = BASE;
+        machine.system_instruction(TVAL).unwrap();
+        let mut counted = [0; TimerExit::COUNT];
+        counted[reason as usize] = 1;
+        let levels = machine.step_timing().unwrap().levels;
+        assert_eq!(levels.timer_value_exits, counted, "{reason:?}");
+    }
+}
+
 /// `cargo test -p stela-engine --release --lib raised_timer_write_costs --
 /// --ignored --nocapture`: nanoseconds per MSR CNTV_TVAL_EL0 that rearms a
 /// raised timer under its waiting FIQ, as a kernel's timer handler does:

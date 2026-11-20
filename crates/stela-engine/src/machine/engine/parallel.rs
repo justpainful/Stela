@@ -601,6 +601,9 @@ pub struct Counts {
     /// Its installs at EL0 and above by where the block came from
     /// ([`super::Statistics::store_sources`]).
     pub store_sources: [[u64; 5]; 2],
+    /// Of its shared installs, blocks prepared ahead of any fetch
+    /// ([`super::Statistics::ahead_installs`]).
+    pub ahead_installs: [u64; 2],
     /// Blocks it holds, the slots its block table has, the pages its
     /// index finds blocks in, and the parts of its code arena it released
     /// for heap pressure.
@@ -674,6 +677,11 @@ pub struct Counts {
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
     pub itlb_sources: [u64; super::ItlbSource::COUNT],
+    /// The guest PCs of its own TLBIs of everything
+    /// ([`super::Statistics::whole_tlbi_sites`]).
+    pub whole_tlbi_sites: super::WholeTlbiSites,
+    /// ([`super::Statistics::whole_tlbi_times`]).
+    pub whole_tlbi_times: [u64; 3],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail and its probe
@@ -2421,33 +2429,43 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if until > start.saturating_add(self.idle_poll) {
                 return None;
             }
-            loop {
-                let hub = self.parallel.as_ref()?;
+            // The spin is idle time, as the passes' halt-poll is.
+            self.profile_idle(true);
+            let ended = 'spin: loop {
+                let Some(hub) = self.parallel.as_ref() else {
+                    break 'spin Some(None);
+                };
                 if hub.woken(pe, self.lines_epoch) {
                     if let Err(stop) = self.read_mail() {
-                        return Some(Err(stop));
+                        break 'spin Some(Some(Err(stop)));
                     }
                     let now = self.now();
-                    let hub = self.parallel.as_ref()?;
+                    let Some(hub) = self.parallel.as_ref() else {
+                        break 'spin Some(None);
+                    };
                     if hub.woken(pe, self.lines_epoch) || !self.ready(pe, now) {
                         self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                        return None;
+                        break 'spin Some(None);
                     }
-                    break;
+                    break 'spin None;
                 }
                 if self.host.poll_interrupt() {
                     self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                    return None;
+                    break 'spin Some(None);
                 }
                 if self.host.counter() >= until {
                     let now = self.now();
                     if !self.ready(pe, now) {
                         self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                        return None;
+                        break 'spin Some(None);
                     }
-                    break;
+                    break 'spin None;
                 }
                 self.host.relax();
+            };
+            self.profile_idle(false);
+            if let Some(ended) = ended {
+                return ended;
             }
         }
         self.statistics.waits += 1;
@@ -2726,6 +2744,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 [statistics.self_loops, entries, iterated]
             },
             store_sources: statistics.store_sources,
+            ahead_installs: statistics.ahead_installs,
             live_blocks: self.code.blocks.live() as u64,
             block_slots: self.code.blocks.len() as u64,
             indexed_pages: self.code.indexed_pages() as u64,
@@ -2761,6 +2780,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             itlb_drops: statistics.itlb_drops,
             lookup_forgets: statistics.lookup_forgets,
             itlb_sources: statistics.itlb_sources,
+            whole_tlbi_sites: statistics.whole_tlbi_sites,
+            whole_tlbi_times: statistics.whole_tlbi_times,
             transitions: [
                 statistics.native_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],
                 statistics.engine_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],

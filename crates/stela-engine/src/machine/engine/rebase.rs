@@ -187,6 +187,11 @@ impl Rebases {
         self.bound.load(Ordering::Relaxed)
     }
 
+    /// Whether its parts keep less than half their bound in all.
+    pub(super) fn under_half(&self) -> bool {
+        self.counts().bytes < self.bound() * PARTS / 2
+    }
+
     fn part(&self, key: &Digest) -> crate::platform::sync::MutexGuard<'_, Part> {
         self.parts[usize::from(key.0[0]) % PARTS]
             .lock()

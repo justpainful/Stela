@@ -145,6 +145,9 @@ pub(super) struct Mirrors {
     /// entered, which the engine takes when it returns
     /// ([`Machine::take_event_spins`]).
     pub(super) spin: register_read::EventSpin,
+    /// The event stream native WFEs sample, as the engine published it
+    /// ([`Machine::enter_events`]) and they moved it.
+    pub(super) stream: register_read::EventStream,
     /// The board's fast-IPI table as this PE's native IPI writes use it,
     /// all 0 until the engine installs one ([`Machine::enter_fast_ipi`]),
     /// and the PEs they found halted, which the engine wakes when native
@@ -320,6 +323,7 @@ pub(super) const EVENT_WAIT: register_read::EventWaitPlaces = register_read::Eve
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     count: Place::new(Anchor::Count, 0),
     spin: Place::new(Anchor::Mirrors, offset_of!(Mirrors, spin)),
+    stream: Place::new(Anchor::Mirrors, offset_of!(Mirrors, stream)),
 };
 
 /// The cell open where MSR IPI_RR_LOCAL, IPI_RR_GLOBAL and IPI_SR
@@ -466,6 +470,7 @@ impl Default for Mirrors {
             cycles: register_read::CycleCounter::default(),
             instructions: register_read::InstructionCounter::default(),
             spin: register_read::EventSpin::default(),
+            stream: register_read::EventStream::default(),
             fast_ipi: register_read::FastIpi::default(),
             device_reads: [register_read::DeviceRead::default(); register_read::DEVICE_READS],
         }
@@ -576,6 +581,17 @@ impl Mirrors {
             }
         }
         self.entered = 1 << self.state;
+    }
+
+    /// The open cells [`Self::close_all`] would close.
+    pub(super) fn open_cells(&self) -> u64 {
+        self.banks
+            .iter()
+            .enumerate()
+            .filter(|&(state, _)| self.entered >> state & 1 != 0)
+            .flat_map(|(_, cells)| cells)
+            .filter(|cell| cell.readable != 0)
+            .count() as u64
     }
 
     /// Whether every cell is closed.

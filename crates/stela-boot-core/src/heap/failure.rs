@@ -79,7 +79,7 @@ impl fmt::Display for Report {
         }
         f.write_str(" classes")?;
         for (class, &bytes) in self.classes.iter().enumerate() {
-            write!(f, " {}:{}M", 16 << class, bytes >> 20)?;
+            write!(f, " {}:{}M", super::class_bytes(class), bytes >> 20)?;
         }
         f.write_str(" cores")?;
         for &own in &self.cores[..self.tagged] {

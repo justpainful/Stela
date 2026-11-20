@@ -462,6 +462,8 @@ pub struct Layer {
     pub dva: u64,
     pub source: Rect,
     pub destination: Rect,
+    /// The surface's IOSurface ID, as the swap's IDs name it.
+    pub id: u32,
 }
 
 /// A parsed `swap_submit_dcp` input.
@@ -518,6 +520,7 @@ impl Submission {
                 dva,
                 source: rect_at(input, SOURCE_RECTS + index * 16),
                 destination: rect_at(input, DESTINATION_RECTS + index * 16),
+                id: u32_at(input, SURFACE_IDS + index * 4),
             });
         }
         Ok(Self {

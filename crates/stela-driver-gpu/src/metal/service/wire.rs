@@ -444,6 +444,11 @@ records! {
 
     /// A new texture: its `gpuResourceID`, `allocatedSize`, `heapOffset`
     /// and, when `sparse`, `firstMipmapInTail` and `tailSizeInBytes`.
+    /// `copied`: the service keeps the texture's rows in device memory as
+    /// well, which it refreshes only where it learns that they changed: the
+    /// guest reports the surface's seed changes of such an IOSurface
+    /// texture with every command buffer, used or not
+    /// ([`SurfaceUse::SEED_ONLY`](commands::SurfaceUse::SEED_ONLY)).
     pub struct TextureResponse {
         pub handle: u64,
         pub resource_id: u64,
@@ -452,7 +457,7 @@ records! {
         pub first_mipmap_in_tail: u64,
         pub tail_size: u64,
         pub sparse: u32,
-        pub reserved: u32,
+        pub copied: u32,
     }
 
     /// `newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`;

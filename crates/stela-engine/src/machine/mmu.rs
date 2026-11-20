@@ -586,6 +586,7 @@ impl TableMemory for ThroughStage2<'_> {
 
 /// Stage 1 with its table walk translated through `stage2` when that
 /// applies, and the stage-1 SH field of a mapped result.
+#[allow(clippy::too_many_arguments)]
 fn first_stage(
     controls: &Controls,
     stage2: Option<Stage2>,
@@ -594,16 +595,29 @@ fn first_stage(
     requester: Requester,
     shape: Option<alignment::MemoryCheck>,
     memory: &mut dyn TableMemory,
+    start: Option<&stage1::Point>,
+    reached: &mut Option<stage1::Point>,
 ) -> (Outcome, u8) {
     let Some(stage2) = stage2 else {
-        return stage1::walk(controls, address, access, requester, shape, memory);
+        return stage1::walk_from(
+            controls, address, access, requester, shape, memory, start, reached,
+        );
     };
     let mut tables = ThroughStage2 {
         stage2,
         memory,
         stop: None,
     };
-    let walked = stage1::walk(controls, address, access, requester, shape, &mut tables);
+    let walked = stage1::walk_from(
+        controls,
+        address,
+        access,
+        requester,
+        shape,
+        &mut tables,
+        start,
+        reached,
+    );
     match tables.stop {
         Some(stop) => (stop.into(), 0),
         None => walked,
@@ -627,6 +641,74 @@ pub fn translate(
         requester,
         full(controls, address, access, requester, None, memory),
     )
+}
+
+/// The last table a walk read a descriptor from ([`stage1::Point`]): the
+/// other entries of that table translate from it without the descriptors
+/// above, as a walk cache entry lets hardware walk them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkTable(stage1::Point);
+
+impl WalkTable {
+    /// A walk of `address` under the same controls reaches this table.
+    pub fn holds(&self, address: u64) -> bool {
+        self.0.holds(address)
+    }
+}
+
+/// [`translate`], and the last table its stage-1 walk read, if it walked
+/// (stage 1 enabled). Walks of the table's other entries may start there
+/// ([`translate_from`]).
+pub fn translate_noting(
+    controls: &Controls,
+    address: u64,
+    access: Access,
+    requester: Requester,
+    memory: &mut dyn TableMemory,
+) -> (Outcome, Option<WalkTable>) {
+    let mut reached = None;
+    let outcome = full_from(
+        controls,
+        address,
+        access,
+        requester,
+        None,
+        memory,
+        None,
+        &mut reached,
+    );
+    (
+        limited(controls, access, requester, outcome),
+        reached.map(WalkTable),
+    )
+}
+
+/// [`translate`] with stage 1 starting at `table`, which a walk under the
+/// same `controls` noted ([`translate_noting`]), when it holds `address`;
+/// from the translation table base otherwise. The outcome equals
+/// [`translate`]'s while the descriptors above the table are those that
+/// walk read, as a walk cache entry's would. A caller that keeps a table
+/// across a TLBI that reaches its addresses walks with stale descriptors,
+/// so the fills of one fault use it and drop it.
+pub fn translate_from(
+    controls: &Controls,
+    table: &WalkTable,
+    address: u64,
+    access: Access,
+    requester: Requester,
+    memory: &mut dyn TableMemory,
+) -> Outcome {
+    let outcome = full_from(
+        controls,
+        address,
+        access,
+        requester,
+        None,
+        memory,
+        Some(&table.0),
+        &mut None,
+    );
+    limited(controls, access, requester, outcome)
 }
 
 /// [`translate`] as the translation tables alone decide it, for AT: CTRR
@@ -705,12 +787,31 @@ fn full(
     shape: Option<alignment::MemoryCheck>,
     memory: &mut dyn TableMemory,
 ) -> Outcome {
+    full_from(
+        controls, address, access, requester, shape, memory, None, &mut None,
+    )
+}
+
+/// [`full`] with stage 1 from `start` and noting its last table in
+/// `reached` ([`stage1::walk_from`]).
+#[allow(clippy::too_many_arguments)]
+fn full_from(
+    controls: &Controls,
+    address: u64,
+    access: Access,
+    requester: Requester,
+    shape: Option<alignment::MemoryCheck>,
+    memory: &mut dyn TableMemory,
+    start: Option<&stage1::Point>,
+    reached: &mut Option<stage1::Point>,
+) -> Outcome {
     let stage2 = match second_stage(controls) {
         Ok(stage2) => stage2,
         Err(unsupported) => return Outcome::Unsupported(unsupported),
     };
-    let (outcome, shareability) =
-        first_stage(controls, stage2, address, access, requester, shape, memory);
+    let (outcome, shareability) = first_stage(
+        controls, stage2, address, access, requester, shape, memory, start, reached,
+    );
     let (Some(stage2), Outcome::Mapped(first)) = (stage2, outcome) else {
         return outcome;
     };
@@ -757,7 +858,12 @@ pub fn translate_stage1(
     memory: &mut dyn TableMemory,
 ) -> Outcome {
     match second_stage(controls) {
-        Ok(stage2) => first_stage(controls, stage2, address, access, requester, None, memory).0,
+        Ok(stage2) => {
+            first_stage(
+                controls, stage2, address, access, requester, None, memory, None, &mut None,
+            )
+            .0
+        }
         Err(unsupported) => Outcome::Unsupported(unsupported),
     }
 }

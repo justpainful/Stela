@@ -8,9 +8,7 @@
 //! published completion, holding no turn, and copies the band to its caller
 //! outside every lock; a band after it starts in the call's next turn. No
 //! other process's call waits for the copy or for the CPU's.
-use super::{
-    POLL_UNAVAILABLE, SharedService, Spin, answer, answer_pending, read_call, read_record,
-};
+use super::{SharedService, Spin, answer, answer_pending, read_call, read_record};
 use crate::metal::{
     device::resources::ReadBack,
     service::{Service, StartedReadBack, wire::Status},
@@ -191,34 +189,9 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         Ok(Step::Answered(status))
     }
 
-    /// Whether `read_back`'s copy completed: from the published completion
-    /// when it shows, else from a turn's poll unless a call holds the
-    /// service. `None` once its device was lost or replaced.
+    /// Whether `read_back`'s copy completed ([`Self::serial_done`]).
     fn read_back_done(&self, epoch: u64, read_back: &ReadBack) -> Option<bool> {
-        if self.read_backs.generation.current() != epoch {
-            return None;
-        }
-        self.publish_marker();
-        let reached = self.reached.load(Ordering::Acquire);
-        if reached != POLL_UNAVAILABLE && reached >= read_back.serial() {
-            return Some(true);
-        }
-        // A waiter publishes it, with no driver query here.
-        if reached != POLL_UNAVAILABLE && self.publishable.load(Ordering::Acquire) {
-            return Some(false);
-        }
-        let Some(mut turn) = self.try_turn() else {
-            return Some(false);
-        };
-        if self.read_backs.generation.current() != epoch {
-            return None;
-        }
-        let mut done = Ok(false);
-        (self.host.run)(self.host.stack, &mut || {
-            done = turn.device().read_back_complete(read_back);
-        });
-        drop(turn);
-        done.ok()
+        self.serial_done(epoch, read_back.serial())
     }
 
     /// Keeps the call of `key` waiting in `state`: past [`WAITING`] calls

@@ -107,6 +107,8 @@ static void report_open(io_service_t accelerator, NSString *step)
 	 * still applies it, in order, and each completion publishes it. */
 	NSMutableArray *_settling;
 	NSMutableArray *_indirect;
+	NSHashTable *_copied;
+	os_unfair_lock _copiedLock;
 	uint64_t _seen;
 	/* Whether the kext holds this device's notification; only `_completions`
 	 * raises it, and the kext's delivery ends it. */
@@ -146,6 +148,8 @@ static void report_open(io_service_t accelerator, NSString *step)
 	_inFlight = [NSMutableArray arrayWithCapacity:64];
 	_settling = [NSMutableArray arrayWithCapacity:2];
 	_indirect = [NSMutableArray arrayWithCapacity:4];
+	_copied = [NSHashTable weakObjectsHashTable];
+	_copiedLock = OS_UNFAIR_LOCK_INIT;
 	_deferred = [NSMutableArray arrayWithCapacity:64];
 	for (NSUInteger i = 0; i < POOL_KINDS; i++) {
 		_slabs[i] = [NSMutableArray arrayWithCapacity:4];
@@ -653,6 +657,21 @@ static void completed(void *reference, int result, void *count)
 		[(StelaGPUIndirectCommandBuffer *)[[noted objectAtIndex:i] nonretainedObjectValue] flush];
 	}
 	os_unfair_lock_unlock(&_lock);
+}
+
+- (void)noteCopied:(StelaGPUTexture *)texture
+{
+	os_unfair_lock_lock(&_copiedLock);
+	[_copied addObject:texture];
+	os_unfair_lock_unlock(&_copiedLock);
+}
+
+- (NSArray *)copiedTextures
+{
+	os_unfair_lock_lock(&_copiedLock);
+	NSArray *live = _copied.count ? _copied.allObjects : nil;
+	os_unfair_lock_unlock(&_copiedLock);
+	return live.count ? live : nil;
 }
 
 - (void)releaseHandle:(uint64_t)handle

@@ -576,7 +576,9 @@ impl Host for System {
         // (bindgen's libclang search through LIBCLANG_PATH, lld's
         // `--ld-path`): the plain drive path names the same file.
         if cfg!(windows)
-            && let Some(plain) = resolved.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
+            && let Some(plain) = resolved
+                .to_str()
+                .and_then(|text| text.strip_prefix(r"\\?\"))
             && plain.as_bytes().get(1) == Some(&b':')
         {
             return PathBuf::from(plain);

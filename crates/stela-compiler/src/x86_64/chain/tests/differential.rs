@@ -1,11 +1,13 @@
-//! Today's probes against the ones before them (a probe that kept what it
-//! needed on the stack and returned to a tail that called it): for random
-//! ITLB, block table, cell and control states, with entries put in, taken
-//! out, rekeyed and emptied between runs, both take the same transfer into
-//! the same block or the same exit, and leave the control the same.
+//! Every native transfer path against the reference's rule, and today's
+//! probes against the ones before them (a probe that kept what it needed
+//! on the stack and returned to a tail that called it): for random ITLB,
+//! block table, cell and control states, with entries put in, taken out,
+//! rekeyed and emptied between runs, over several seeds, each path of each
+//! BTYPE takes the transfer into the block the reference enters or the
+//! exit it takes, and leaves the control as the reference would.
 use super::super::*;
-use crate::GuestState;
-use alloc::{boxed::Box, vec::Vec};
+use super::Controlled;
+use alloc::{format, vec::Vec};
 use core::ffi::c_void;
 unsafe extern "C" {
     fn mmap(
@@ -58,10 +60,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     // The cell probe, R9 at the cell.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R8) {
-        misses.push(interrupted);
-    }
+    let misses = vec![stop_check(&mut asm, policy, true)];
     asm.push(R9);
     let mut untranslated = Vec::new();
     translate(&mut asm, &mut untranslated);
@@ -80,10 +79,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.pop(R8);
     asm.mov(Dword, R8, R8);
     asm.place(Rcx, CONTROL);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    spend_transfer(&mut asm);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     legacy_found(&mut asm);
     for miss in misses {
@@ -115,10 +111,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     // The table probe.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R9) {
-        misses.push(interrupted);
-    }
+    let mut misses = vec![stop_check(&mut asm, policy, true)];
     translate(&mut asm, &mut misses);
     let table = code.len();
     let mut asm = code.asm();
@@ -159,10 +152,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let torn = legacy_seqlock_check(&mut asm);
     asm.pop(R9);
     asm.place(Rcx, CONTROL);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    spend_transfer(&mut asm);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     for bit in 0..2 {
         if btype & 1 << bit != 0 {
@@ -207,6 +197,26 @@ const CONTEXTS: [u64; 3] = [
     13 << LOOKUP_SALT_BITS,
 ];
 const KEYS: [u64; 2] = [block_key(0x8_0040_0000, 1), block_key(0x8_0040_0000, 2)];
+/// Instructions of the block every transfer leaves.
+const RAN: u32 = 5;
+
+/// The BTYPEs a block's first instruction accepts in its entry's targets,
+/// by landing pad: none or a plain BTI in a guarded page; BTI c, or PACIASP
+/// or PACIBSP with SCTLR_ELx.BT set; BTI j; BTI jc, PACIASP or PACIBSP with
+/// BT clear, BRK, HLT, or any instruction outside a guarded page.
+const LANDINGS: [u32; 4] = [0b0001, 0b0111, 0b1011, 0b1111];
+
+/// Each seed draws its own order of table changes and transfers.
+const SEEDS: [u64; 6] = [
+    0x2545_f491_4f6c_dd1d,
+    0x9e37_79b9_7f4a_7c15,
+    0xd1b5_4a32_d192_ed03,
+    0x8cb9_2ba7_2f3d_8dd7,
+    0x5851_f42d_4c95_7f2d,
+    0x1405_7b7e_f767_814f,
+];
+/// Transfers each seed runs.
+const TRIALS: u32 = 60_000;
 
 fn marker(block: usize) -> u64 {
     0x7700 + block as u64
@@ -260,21 +270,136 @@ fn put(pages: &Pages, offset: usize, bytes: &[u8]) {
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), pages.0.add(offset), bytes.len()) };
 }
 
-/// Run the stub at `region` (`mov rax, rsi`, then the tail) with `control`:
-/// what it returned.
-fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    let mut frame = Box::new(GuestState::default());
-    frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+/// Run the stub at `region` (`mov rax, rsi`, then the tail) with `control`
+/// and its account: what it returned.
+fn run(region: &Pages, control: &mut Controlled, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result =
-        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
+    let result = control.run(|frame| unsafe {
+        crate::x86_64::native::enter_counted(region.0 as *const u8, frame, target, 0)
+    });
     (result as u64, (result >> 64) as u64)
 }
 
+/// The native paths of a transfer that a tail starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path {
+    /// A plain tail's call of the table probe.
+    Table,
+    /// A lookup tail: its jump cache, else the table probe.
+    Lookup,
+    /// A cell tail's call of the cell probe.
+    Cell,
+    /// A cell tail's call of the stamping cell probe, as a stamped tail's
+    /// miss calls it.
+    Stamping,
+    /// A stamped branch tail of the cell's entry where the linker gives
+    /// one, for an entry that accepts the BTYPE, else the cell tail.
+    Stamped,
+}
+const PATHS: [Path; 5] = [
+    Path::Table,
+    Path::Lookup,
+    Path::Cell,
+    Path::Stamping,
+    Path::Stamped,
+];
+
+/// What the engine's reference path does with a transfer to a target by a
+/// branch that set a BTYPE: Arm's Branch Target check of the entered
+/// block's first instruction, through the entry's targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reference {
+    /// No transfer left, or an interruption pending.
+    Stopped,
+    /// No translation of the target's page in the contexts the control
+    /// names.
+    Untranslated,
+    /// No entry of the target with its page's key.
+    Absent,
+    /// The block refuses the BTYPE: the engine takes the exception.
+    Refused(LookupEntry),
+    Entered(LookupEntry),
+}
+
+/// The block key the ITLB holds for the page of `target` in its half's
+/// context, or for a lower-half page in the upper half's.
+fn translated(itlb: &LookupTable, contexts: [u64; 2], target: u64) -> Option<u64> {
+    let page = target & !0xfff;
+    let candidates = match half(target) {
+        0 => &contexts[..],
+        _ => &contexts[1..],
+    };
+    candidates
+        .iter()
+        .filter(|&&context| context != 0)
+        .find_map(|&context| {
+            let resident = itlb.find(itlb.page_slot(target, context), page, context);
+            (resident.pc == page && resident.key == context).then_some(resident.entry)
+        })
+}
+
+/// The reference's answer, with the entry a cell holds first: a cell keeps
+/// its entry while the block lives, after the table put it out.
+fn reference(
+    itlb: &LookupTable,
+    table: &LookupTable,
+    cell: Option<LookupEntry>,
+    control: &Controlled,
+    target: u64,
+    btype: u8,
+) -> Reference {
+    if control.quiet.0 & control.account.budget() == 0 {
+        return Reference::Stopped;
+    }
+    let Some(key) = translated(itlb, control.contexts, target) else {
+        return Reference::Untranslated;
+    };
+    let entry = cell
+        .filter(|cell| cell.pc == target && cell.key == key)
+        .unwrap_or_else(|| table.find(table.slot(target, key), target, key));
+    if entry.pc != target || entry.key != key {
+        Reference::Absent
+    } else if entry.targets & 1 << btype == 0 {
+        Reference::Refused(entry)
+    } else {
+        Reference::Entered(entry)
+    }
+}
+
+/// Every native transfer path, for each BTYPE and landing pad, against the
+/// reference's rule (an entry the target's page translates to, which
+/// accepts the BTYPE, else an exit), and the table and cell probes also
+/// against the probes before them, over several seeds: random ITLB, block
+/// table, cell and control states, with entries put in, put out, rekeyed
+/// and emptied between runs. A jump cache or stamp may still enter the
+/// block of a translation the ITLB put out for capacity (no drop), as a
+/// TLB keeps an entry; never a block the table no longer names for the
+/// target, nor one that refuses the BTYPE, and never exit where the
+/// reference enters.
 #[test]
-fn probes_without_the_stack_transfer_as_the_probes_before_them() {
+fn transfers_enter_where_the_reference_enters() {
+    let mut seen = alloc::collections::BTreeSet::new();
+    for seed in SEEDS {
+        differential(seed, &mut seen);
+    }
+    for (path, path_index) in PATHS.iter().zip(0..) {
+        for btype in 0..4u8 {
+            // Entered where the landing pad accepts the BTYPE, refused
+            // where it does not.
+            for (landing, targets) in LANDINGS.iter().enumerate() {
+                let entered = targets & 1 << btype != 0;
+                assert!(
+                    seen.contains(&(path_index, btype, landing, entered)),
+                    "{path:?} btype {btype} landing {targets:#06b} entered {entered}"
+                );
+            }
+        }
+    }
+}
+
+fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, usize, bool)>) {
     let pcs = pcs();
     let blocks = pages(PAGE);
     let new = pages(REGION);
@@ -287,16 +412,17 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
     }
     for btype in 0..4u8 {
         let offset = PROBES + DISPATCHER_BYTES * btype as usize;
-        let fresh = dispatcher_with_policy(btype, Interruption::Epoch).unwrap();
-        let before = legacy_dispatcher(btype, Interruption::Epoch).unwrap();
+        let fresh = dispatcher_with_policy(btype, Interruption::Quiet).unwrap();
+        let before = legacy_dispatcher(btype, Interruption::Quiet).unwrap();
         assert!(fresh.len() <= DISPATCHER_BYTES && before.len() <= DISPATCHER_BYTES);
         put(&new, offset, &fresh);
         put(&old, offset, &before);
     }
     let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
     let stamps = table.new_stamps();
+    let cells = table.stamped_cells();
     let mut itlb = LookupTable::itlb();
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut rng = Rng(seed);
     let (mut entered, mut exited, mut cached) = (0u32, 0u32, 0u32);
     // What the page tables map each page to in each context: a key changes
     // only after a drop of the page, as a TLBI precedes a remap.
@@ -316,18 +442,19 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
             key: KEYS[0],
             entry: blocks.0 as u64 + 64 * block as u64,
             block: block as u32,
-            targets: 0b1111,
+            targets: LANDINGS[block % LANDINGS.len()],
         };
         table.insert(table.slot(pc, KEYS[0]), entry);
     }
+    // Hot exits' stamped cells, each linked to an entry the table holds.
     let mut sites: Vec<(u64, u64)> = (0..4)
         .map(|site| (0x1000 + site, pcs[site as usize]))
         .collect();
     for &(site, pc) in &sites {
         let held = table.find(table.slot(pc, KEYS[0]), pc, KEYS[0]);
-        table.link_cell(site, pc, Some(held));
+        table.link_hot_cell(site, pc, Some(held)).unwrap();
     }
-    for trial in 0..120_000u32 {
+    for trial in 0..TRIALS {
         // Change the tables as the engine does between transfers.
         match rng.below(10) {
             0..=2 => {
@@ -349,6 +476,8 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
                 );
             }
             3..=5 => {
+                // A block of the PC put in, or the PC's block again with
+                // the targets of another landing pad.
                 let pc = pcs[rng.below(8) as usize];
                 let block = rng.below(BLOCKS as u64) as usize;
                 let entry = LookupEntry {
@@ -356,13 +485,16 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
                     key: KEYS[usize::from(rng.below(4) == 0)],
                     entry: blocks.0 as u64 + 64 * block as u64,
                     block: block as u32,
-                    targets: rng.below(16) as u32,
+                    targets: LANDINGS[rng.below(LANDINGS.len() as u64) as usize],
                 };
                 table.insert(table.slot(entry.pc, entry.key), entry);
             }
             6 => {
+                // The engine forgets a frame's entries by block, in the
+                // table and in the cells alike.
                 let frame = key_frame(KEYS[0]);
-                table.forget_frames(frame..=frame, |_| rng.below(2) == 0);
+                let parity = rng.below(2) as u32;
+                table.forget_frames(frame..=frame, |entry| entry.block % 2 == parity);
             }
             7 => {
                 let pc = pcs[rng.below(8) as usize] & !0xfff;
@@ -376,7 +508,7 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
                 let held = table.find(table.slot(pc, key), pc, key);
                 let current =
                     (held.pc == pc && held.key == key && rng.below(4) != 0).then_some(held);
-                table.link_cell(sites[index].0, pc, current);
+                table.link_hot_cell(sites[index].0, pc, current).unwrap();
                 sites[index].1 = pc;
             }
             _ => {
@@ -385,62 +517,86 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
                 }
             }
         }
-        // A transfer: through a site's cell or the table probe of a BTYPE.
-        let through_cell = rng.below(2) == 0;
+        // A transfer: every path with every BTYPE in turn.
+        let path = PATHS[(trial / 4) as usize % PATHS.len()];
+        let path_index = PATHS.iter().position(|&each| each == path).unwrap();
+        let btype = (trial % 4) as u8;
+        let through_cell = matches!(path, Path::Cell | Path::Stamping | Path::Stamped);
         let (site, cell_pc) = sites[rng.below(sites.len() as u64) as usize];
         let target = match rng.below(8) {
+            _ if path == Path::Stamped => cell_pc,
             0 => pcs[rng.below(8) as usize] + 4,
             1..=3 if through_cell => cell_pc,
             _ => pcs[rng.below(8) as usize],
         };
-        let btype = if through_cell { 0 } else { rng.below(4) as u8 };
-        let word = ExitWord::from(ExitKind::Direct).encoded()
-            | (1 + rng.below(9) as u32) << ExitWord::RAN_SHIFT;
-        let cell =
-            LookupTable::cell_slot(&table.cells, table.cell_sites[&site]) as *const Slot as u64;
-        let probe = PROBES
-            + DISPATCHER_BYTES * btype as usize
-            + if through_cell {
-                CELL_PROBE_ENTRY
-            } else {
-                PROBE_ENTRY
-            };
-        let stub = [0x48, 0x89, 0xf0]; // mov rax,rsi
-        let ran = word >> ExitWord::RAN_SHIFT;
-        let kind = ExitWord::from(ExitKind::Direct);
-        let fresh = match through_cell {
-            true => cell_tail(
-                new.0 as u64 + 3,
+        let kind = ExitWord::from(match btype {
+            0 => ExitKind::Direct,
+            _ => ExitKind::Indirect,
+        });
+        let word = kind.encoded() | RAN << ExitWord::RAN_SHIFT;
+        let number = table.site_cell_number(site).unwrap();
+        let cell = LookupTable::cell_slot(&table.cells, number) as *const Slot as u64;
+        let held = LookupTable::cell_slot(&table.cells, number).load();
+        let dispatcher = new.0 as u64 + (PROBES + DISPATCHER_BYTES * btype as usize) as u64;
+        let at = new.0 as u64 + 3;
+        let fresh = match path {
+            Path::Table => {
+                let mut code = Code::new();
+                tail(&mut code, at, kind, RAN, dispatcher + PROBE_ENTRY as u64).unwrap();
+                code.into_bytes()
+            }
+            Path::Lookup => lookup_tail(at, kind, RAN, dispatcher + PROBE_ENTRY as u64, btype)
+                .unwrap()
+                .to_vec(),
+            Path::Cell => {
+                rax_cell_tail(at, cell, kind, RAN, dispatcher + CELL_PROBE_ENTRY as u64).unwrap()
+            }
+            Path::Stamping => rax_cell_tail(
+                at,
                 cell,
                 kind,
-                ran,
-                new.0 as u64 + probe as u64,
+                RAN,
+                dispatcher + STAMPING_PROBE_ENTRY as u64,
             )
-            .unwrap()
-            .to_vec(),
-            false => lookup_tail(
-                new.0 as u64 + 3,
+            .unwrap(),
+            // As the engine relinks a hot exit: a stamped tail of the entry
+            // its cell holds, live again, where the entry accepts the BTYPE.
+            Path::Stamped
+                if held.key != 0 && held.pc == cell_pc && held.targets & 1 << btype != 0 =>
+            {
+                table.note_stamped(number);
+                assert!(table.revive_stamped(number, held));
+                stamped_branch_tail(
+                    at,
+                    cell,
+                    number,
+                    cell_pc,
+                    kind,
+                    RAN,
+                    held.block,
+                    held.entry,
+                    dispatcher + STAMPING_PROBE_ENTRY as u64,
+                    btype,
+                )
+                .unwrap()
+                .to_vec()
+            }
+            Path::Stamped => cell_tail(
+                at,
+                cell,
+                cell_pc,
                 kind,
-                ran,
-                new.0 as u64 + probe as u64,
-                btype,
+                RAN,
+                dispatcher + CELL_PROBE_ENTRY as u64,
             )
             .unwrap()
             .to_vec(),
         };
-        let before = legacy_tail(
-            old.0 as u64 + 3,
-            through_cell.then_some(cell),
-            word,
-            old.0 as u64 + probe as u64,
-        );
+        let stub = [0x48, 0x89, 0xf0]; // mov rax,rsi
         put(&new, 0, &stub);
         put(&new, 3, &fresh);
-        put(&old, 0, &stub);
-        put(&old, 3, &before);
+        let budget = rng.below(4) as usize;
         let base = ChainControl {
-            budget: [0, 1, 2, 5][rng.below(4) as usize],
-            retired: 100,
             block: 7,
             contexts: match rng.below(4) {
                 0 => [
@@ -451,75 +607,155 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
             },
             table: table.address(),
             hits: 3,
-            interrupt_epoch: u64::from(rng.below(10) == 0),
             salts: [0; 2],
             itlb: itlb.address(),
             masks: [table.mask(), itlb.mask()],
             stamps,
+            cells,
             ..ChainControl::default()
         };
-        let mut base = base;
-        base.salts = base.contexts.map(|context| itlb.salt(context));
-        let (mut a, mut b) = (base, base);
-        // The one difference the jump cache makes, as a stamp does: its
-        // entry holds in the half's context and ITLB drop epoch while the
-        // probe misses a page this ITLB put out for another (a capacity
-        // eviction, not a drop), or finds it in another upper context than
-        // the lower-half page's entry was filled in, and the entry enters
-        // the block of the key the page tables still map the page to.
-        let page = target & !0xfff;
-        let candidates = match half(target) {
-            0 => &base.contexts[..],
-            _ => &base.contexts[1..],
+        let mut base = Controlled {
+            control: base,
+            account: Account::new([0, 1, 2, 5][budget]).with_retired(100),
         };
-        let translated = candidates.iter().find_map(|&context| {
-            let resident = itlb.find(itlb.page_slot(target, context), page, context);
-            (resident.pc == page && resident.key == context).then_some(resident.entry)
-        });
-        let at = jump_entry(stamps, target);
-        // SAFETY: an entry of the stamps' jump cache and a drop epoch of
-        // the ITLB, which live; no native code runs meanwhile.
-        let field = |offset: i32| unsafe { ((at as i64 + i64::from(offset)) as *const u64).read() };
-        let drops = itlb.address() as i64 + i64::from(ITLB_DROPS) + 8 * half(target) as i64;
-        // SAFETY: as above.
-        let drops = unsafe { (drops as *const u64).read() };
-        let cached_block = field(JUMP_BLOCK) as u32;
-        let held = !through_cell
-            && field(JUMP_PC) == target
-            && field(JUMP_CONTEXT) == base.contexts[half(target)]
-            && field(JUMP_EPOCH) == drops
-            && KEYS.into_iter().any(|key| {
-                let entry = table.find(table.slot(target, key), target, key);
-                entry.pc == target
-                    && entry.key == key
-                    && entry.block == cached_block
-                    && translated != Some(key)
-                    && CONTEXTS
-                        .into_iter()
-                        .any(|context| keys.get(&(page, context)) == Some(&key))
-            });
-        let ra = run(&new, &mut a, target);
-        let rb = run(&old, &mut b, target);
-        // Only today's cell probes count and sample their transfers.
-        (a.heat, a.sampled) = (0, 0);
-        if held && (ra != rb || a != b) {
-            cached += 1;
-            continue;
+        base.salts = base.contexts.map(|context| itlb.salt(context));
+        if rng.below(10) == 0 {
+            base.interrupt();
         }
-        assert_eq!(
-            ra, rb,
-            "trial {trial}: target {target:#x} cell {through_cell} btype {btype}"
+        let expected = reference(
+            &itlb,
+            &table,
+            through_cell.then_some(held),
+            &base,
+            target,
+            btype,
         );
-        assert_eq!(a, b, "trial {trial}: the controls differ");
-        if ra.1 == 99 {
-            entered += 1;
-        } else {
-            assert_eq!(ra, (target, u64::from(word)));
-            exited += 1;
+        let mut a = base;
+        let ra = run(&new, &mut a, target);
+        // The probes before, with the same tables, for the table probe of
+        // every BTYPE and the cell probe of BTYPE 0, which they had.
+        if path == Path::Table || path == Path::Cell && btype == 0 {
+            let before = legacy_tail(
+                old.0 as u64 + 3,
+                through_cell.then_some(cell),
+                word,
+                old.0 as u64
+                    + (PROBES + DISPATCHER_BYTES * btype as usize) as u64
+                    + if through_cell {
+                        CELL_PROBE_ENTRY
+                    } else {
+                        PROBE_ENTRY
+                    } as u64,
+            );
+            put(&old, 0, &stub);
+            put(&old, 3, &before);
+            let mut b = base;
+            let rb = run(&old, &mut b, target);
+            let mut fresh = a;
+            // Only today's cell probes count and sample their transfers.
+            (fresh.heat, fresh.sampled) = (0, 0);
+            assert_eq!(ra, rb, "trial {trial}: {path:?} btype {btype} {target:#x}");
+            assert_eq!(fresh, b, "trial {trial}: the controls differ");
+        }
+        let context = || {
+            format!(
+                "seed {seed:#x} trial {trial}: {path:?} btype {btype} target {target:#x} \
+                 {expected:?}"
+            )
+        };
+        let named = |block: u32| u64::from(block) | u64::from(btype) << BLOCK_BTYPE_SHIFT;
+        let spent = base
+            .account
+            .with_budget(base.account.budget().saturating_sub(1))
+            .with_retired(base.account.retired() + u64::from(RAN));
+        // The table probe counts its transfers apart; a cell of the target
+        // with its page's key spares it.
+        let cell_holds = translated(&itlb, base.contexts, target)
+            .is_some_and(|key| held.pc == target && held.key == key);
+        let hits = base.hits + u64::from(!(through_cell && cell_holds));
+        match expected {
+            Reference::Entered(entry) if ra.1 == 99 && ra.0 == marker(entry.block as usize) => {
+                assert_eq!(a.block, named(entry.block), "{}", context());
+                assert_eq!(a.account, spent, "{}", context());
+                assert_eq!(a.hits, hits, "{}", context());
+                entered += 1;
+            }
+            _ if ra.1 != 99 => {
+                // An exit where the reference exits, untouched.
+                assert!(
+                    !matches!(expected, Reference::Entered(_)),
+                    "{}: exited where the reference enters",
+                    context()
+                );
+                assert_eq!(ra, (target, u64::from(word)), "{}", context());
+                assert_eq!(
+                    (a.block, a.account, a.hits),
+                    (base.block, base.account, base.hits),
+                    "{}",
+                    context()
+                );
+                exited += 1;
+            }
+            _ => {
+                // Entered otherwise: only a jump cache's or stamp's entry
+                // of a translation the ITLB put out without a drop, whose
+                // block the table or cell still names for the target with a
+                // key the page tables map, and which accepts the BTYPE.
+                let block = (ra.0 - marker(0)) as u32;
+                let translation = translated(&itlb, base.contexts, target);
+                let page = target & !0xfff;
+                let named_here = |key: u64| {
+                    let entry = match through_cell {
+                        true => held,
+                        false => table.find(table.slot(target, key), target, key),
+                    };
+                    entry.pc == target
+                        && entry.key == key
+                        && entry.block == block
+                        && entry.targets & 1 << btype != 0
+                        && translation != Some(key)
+                        && CONTEXTS
+                            .into_iter()
+                            .any(|context| keys.get(&(page, context)) == Some(&key))
+                };
+                assert!(
+                    matches!(path, Path::Lookup | Path::Stamped)
+                        && !matches!(expected, Reference::Stopped)
+                        && KEYS.into_iter().any(named_here),
+                    "{}: entered block {block}",
+                    context()
+                );
+                assert_eq!(a.block, named(block), "{}", context());
+                assert_eq!(a.account, spent, "{}", context());
+                cached += 1;
+            }
+        }
+        if let Reference::Entered(entry) | Reference::Refused(entry) = expected {
+            let landing = LANDINGS
+                .iter()
+                .position(|&each| each == entry.targets)
+                .unwrap();
+            seen.insert((path_index, btype, landing, ra.1 == 99));
         }
     }
-    assert!(entered > 8000 && exited > 8000, "{entered} {exited}");
-    assert!(cached < 1200, "{cached}");
+    // SAFETY: the table's stamps, which live.
+    let counts = unsafe { stamp_counts(stamps) };
+    assert!(
+        counts[StampCount::Hits as usize] > 0,
+        "seed {seed:#x}: no stamped hit"
+    );
+    assert!(
+        counts[StampCount::Filled as usize] > 0,
+        "seed {seed:#x}: no jump cache fill"
+    );
+    // Most transfers exit: no budget, a BTYPE refused, a page or entry
+    // the tables lack.
+    let trials = TRIALS / 20;
+    assert!(
+        entered > trials && exited > trials,
+        "seed {seed:#x}: {entered} {exited}"
+    );
+    assert!(cached < trials / 4, "seed {seed:#x}: {cached}");
 }
 
 /// A lower-half page the ITLB lacks in the lower half's context is
@@ -535,7 +771,7 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
     code.extend(marker(0).to_le_bytes());
     code.extend([0xba, 99, 0, 0, 0, 0xc3]);
     put(&blocks, 0, &code);
-    let dispatcher = dispatcher_with_policy(0, Interruption::Epoch).unwrap();
+    let dispatcher = dispatcher_with_policy(0, Interruption::Quiet).unwrap();
     assert!(dispatcher.len() <= DISPATCHER_BYTES);
     put(&region, PROBES, &dispatcher);
     let tail = lookup_tail(
@@ -568,14 +804,16 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
     let control = |itlb: &LookupTable| {
         let stamps = fresh[next.get()];
         next.set(next.get() + 1);
-        let mut control = ChainControl {
-            budget: 5,
-            contexts: [CONTEXTS[0], CONTEXTS[1]],
-            table: table.address(),
-            itlb: itlb.address(),
-            masks: [table.mask(), itlb.mask()],
-            stamps,
-            ..ChainControl::default()
+        let mut control = Controlled {
+            control: ChainControl {
+                contexts: [CONTEXTS[0], CONTEXTS[1]],
+                table: table.address(),
+                itlb: itlb.address(),
+                masks: [table.mask(), itlb.mask()],
+                stamps,
+                ..ChainControl::default()
+            },
+            account: Account::new(5),
         };
         control.salts = control.contexts.map(|context| itlb.salt(context));
         control

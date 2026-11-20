@@ -38,7 +38,7 @@ use stela_drivers::block::BlockDevice;
 use stela_engine::machine::Offer;
 use stela_engine::machine::Translations;
 use stela_engine::machine::engine::StoreEvent;
-use stela_engine::machine::engine::ahead::{AheadEvent, AheadJob, AheadQueue, Pushed};
+use stela_engine::machine::engine::ahead;
 use stela_engine::translations;
 use stela_engine::translations::Digest;
 use stela_engine::translations::pack;
@@ -208,6 +208,9 @@ pub struct Opened {
     pub region: Region,
     pub writable: bool,
     pub pack: PackRead,
+    /// The previous translator's pack, for a first boot's refill
+    /// ([`previous::FILE`]).
+    pub previous: Option<Region>,
 }
 
 /// The store on the first volume with `store.cfg`, as the handoff file's
@@ -236,10 +239,24 @@ pub fn read(budget: u64) -> Option<Opened> {
         }
         // A read-only volume's pack is read and never written; a missing
         // one leaves the boot's translations in memory.
-        let opened = open(&mut root, &path, FileMode::ReadWrite)
+        let mut opened = open(&mut root, &path, FileMode::ReadWrite)
             .map(|file| (file, true))
             .or_else(|| open(&mut root, &path, FileMode::Read).map(|file| (file, false)));
         let partition = partition(handle);
+        // A pack that commits nothing is its translator's first boot: the
+        // previous translator's pack, within a share of the budget, is read
+        // to refill from, and the arena gives up as much.
+        let first = opened.as_mut().is_none_or(|(file, _)| {
+            let size = file
+                .get_boxed_info::<FileInfo>()
+                .map_or(0, |info| info.file_size());
+            !previous::committed(file, &translator, size)
+        });
+        let previous = match first && limit >= PACK_FLOOR {
+            true => previous::read(&mut root, &translator, limit / previous::PREVIOUS_SHARE),
+            false => None,
+        };
+        let previous_bytes = previous.as_ref().map_or(0, |(_, bytes)| *bytes);
         let reading = output::now();
         let (loaded, size, allocated) = match opened {
             Some((mut file, writable)) => {
@@ -250,7 +267,13 @@ pub fn read(budget: u64) -> Option<Opened> {
                 // A pack the boot may write gets the rest of its limit as
                 // the arena its new segments' records move to.
                 let arena = allocated && partition.is_some() && limit >= PACK_FLOOR;
-                let loaded = read_journal(&mut file, &translator, size, limit, arena)?;
+                let loaded = read_journal(
+                    &mut file,
+                    &translator,
+                    size,
+                    limit.saturating_sub(previous_bytes),
+                    arena,
+                )?;
                 (loaded, size, allocated)
             }
             None => (blank()?, 0, false),
@@ -292,6 +315,7 @@ pub fn read(budget: u64) -> Option<Opened> {
             region: loaded.region,
             writable,
             pack: loaded.pack,
+            previous: previous.map(|(region, _)| region),
         });
     }
     None
@@ -684,8 +708,16 @@ fn bounds(heap: usize) -> (pack::Bounds, usize) {
 
 /// Make `parts` the store's, over the segments read, sharing up to
 /// `shared` bytes of blocks across PEs.
-fn install_parts(translator: Digest, segments: Vec<Pack<'static>>, shared: usize) {
-    let (bounds, kept_pages) = bounds(crate::ALLOCATOR.usage().total);
+fn install_parts(
+    translator: Digest,
+    segments: Vec<Pack<'static>>,
+    shared: usize,
+    decoded: Option<usize>,
+) {
+    let (mut bounds, kept_pages) = bounds(crate::ALLOCATOR.usage().total);
+    if let Some(decoded) = decoded {
+        bounds.decoded = decoded.max(pack::Bounds::default().decoded);
+    }
     AVAILABLE.kept_pages.store(kept_pages, Ordering::Release);
     let filters = pack::KeyFilters::new(&segments);
     for lock in &STORES {
@@ -698,83 +730,6 @@ fn install_parts(translator: Digest, segments: Vec<Pack<'static>>, shared: usize
         });
         drop(evicted);
     }
-}
-
-/// Blocks to translate ahead of execution ([`stela_engine::machine::engine::ahead`]):
-/// the static successors in its page of each block a PE compiles, for the
-/// compile workers to compile and share ([`translate_ahead`]). A job holds
-/// its page's 4 KiB, which the jobs of one page share: 128 hold at most
-/// half a MiB.
-static AHEAD: AheadQueue<128> = AheadQueue::new();
-/// Compile workers run and take [`AHEAD`]'s jobs ([`translate_ahead_with`]).
-static AHEAD_ON: AtomicBool = AtomicBool::new(false);
-
-/// Let the compile workers translate ahead of execution, or not: only
-/// while any runs, so a boot without them compiles as before.
-pub fn translate_ahead_with(workers: bool) {
-    AHEAD_ON.store(workers, Ordering::Release);
-}
-
-/// Whether a job to translate ahead waits: a worker that finds one does not
-/// sleep.
-pub fn ahead_pending() -> bool {
-    AHEAD_ON.load(Ordering::Relaxed) && AHEAD.pending()
-}
-
-/// Translate the oldest job of [`AHEAD`], on a compile worker, and share
-/// its block for the PEs: whether one was taken. The store's part lock is
-/// held only to look and to admit, as a PE's offer holds it; the compile
-/// runs with no lock held. A job whose block the store already shares, or
-/// whose page the store would not take now, is dropped.
-pub fn translate_ahead() -> bool {
-    if !AHEAD_ON.load(Ordering::Relaxed) {
-        return false;
-    }
-    let Some(job) = AHEAD.take() else {
-        return false;
-    };
-    let lock = part(job.key());
-    let present = AVAILABLE.shed.load(Ordering::Relaxed)
-        || !available(SHARE_BLOCKS)
-        || lock.with(|store| {
-            store
-                .as_ref()
-                .is_none_or(|store| store.holds_shared(job.key(), job.pc(), job.context()))
-        });
-    if present {
-        AHEAD.note(AheadEvent::Present);
-        AHEAD.finish(&job);
-        return true;
-    }
-    let started = output::now();
-    let translated = job.translate();
-    let ticks = output::now().wrapping_sub(started);
-    let Some(offer) = translated else {
-        AHEAD.note(AheadEvent::Refused);
-        AHEAD.finish(&job);
-        return true;
-    };
-    AHEAD.note(AheadEvent::Translated { ticks });
-    let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / PARTS;
-    let published = StagedOffer::new(offer, bound).is_some_and(|mut staged| {
-        // A PE's offer of the block since takes the place it would.
-        let (published, retired) = lock.with(|store| match store.as_mut() {
-            Some(store) if !store.holds_shared(job.key(), job.pc(), job.context()) => {
-                let retired = store.accept_shared(&mut staged);
-                (!staged.pending(), retired)
-            }
-            _ => (false, None),
-        });
-        drop(retired);
-        published
-    });
-    AHEAD.note(if published {
-        AheadEvent::Published
-    } else {
-        AheadEvent::Unpublished
-    });
-    AHEAD.finish(&job);
-    true
 }
 
 /// The engine's view of the boot's store, from any PE's machine.
@@ -890,10 +845,39 @@ impl Translations for Shared {
 
     fn offer(&mut self, offer: Offer) {
         let capabilities = AVAILABLE.capabilities.load(Ordering::Acquire);
-        if capabilities & WRITE_PACK != 0 {
+        // Its successors, for a waiting PE or a compile worker to prepare.
+        if capabilities & SHARE_BLOCKS != 0 {
+            let queued = AHEAD.with(|queue| {
+                let queue = queue.get_or_insert_with(ahead::Queue::new);
+                let before = queue.counts().queued;
+                queue.offered(&offer);
+                queue.counts().queued != before
+            });
+            // A sleeping worker takes them at once.
+            if queued {
+                super::workers::nudge();
+            }
+        }
+        // A block prepared ahead is only shared: the PE that installs it
+        // first offers it again for the pack.
+        if offer.ahead() {
+            if capabilities & SHARE_BLOCKS != 0 {
+                Self::publish_shared(offer);
+            }
+        } else if capabilities & WRITE_PACK != 0 {
             Self::publish_writable(offer);
         } else if capabilities & SHARE_BLOCKS != 0 {
             Self::publish_shared(offer);
+        }
+    }
+
+    fn refilled(&mut self, key: &Digest, entry: translations::Entry) {
+        if available(WRITE_PACK) {
+            part(key).with(|store| {
+                if let Some(store) = store.as_mut() {
+                    store.refilled(*key, entry);
+                }
+            });
         }
     }
 
@@ -906,55 +890,7 @@ impl Translations for Shared {
             StoreEvent::SharedRejected => {
                 COSTS.shared_rejected.fetch_add(1, Ordering::Relaxed);
             }
-            StoreEvent::AheadStale => AHEAD.note(AheadEvent::Stale),
         }
-    }
-
-    fn translates_ahead(&mut self) -> bool {
-        AHEAD_ON.load(Ordering::Relaxed)
-            && !AVAILABLE.shed.load(Ordering::Relaxed)
-            && available(SHARE_BLOCKS)
-    }
-
-    /// Queue `jobs` and wake a sleeping worker for them: a full queue drops
-    /// them, and the PE compiles them when it gets there.
-    fn ahead(&mut self, jobs: &mut dyn Iterator<Item = AheadJob>) {
-        // Every job is offered: one queued does not end the others.
-        let mut queued = false;
-        for job in jobs {
-            queued |= AHEAD.push(job) == Pushed::Queued;
-        }
-        if queued {
-            super::workers::nudge();
-        }
-    }
-
-    /// Keep the stored form of a block translated ahead once a PE ran it,
-    /// as the PE's own offer would have: the pack holds only blocks that
-    /// ran.
-    fn used_ahead(
-        &mut self,
-        shared: &alloc::sync::Arc<stela_engine::machine::engine::SharedTranslation>,
-    ) {
-        AHEAD.note(AheadEvent::Hit);
-        let offer = shared.offer();
-        // Ran: no longer speculation, so it keeps its place as PEs' blocks do.
-        part(&offer.key()).with(|store| {
-            if let Some(store) = store {
-                store.promote_shared(&offer.key(), offer.pc(), &offer.context());
-            }
-        });
-        if AVAILABLE.capabilities.load(Ordering::Acquire) & WRITE_PACK == 0
-            || AVAILABLE.shed.load(Ordering::Relaxed)
-        {
-            return;
-        }
-        let entry = offer.entry();
-        part(&offer.key()).with(|store| {
-            if let Some(store) = store {
-                store.keep(&offer, entry);
-            }
-        });
     }
 
     fn kept_pages(&mut self) -> Option<usize> {
@@ -979,12 +915,113 @@ impl Translations for Shared {
     }
 }
 
+/// The blocks waiting to be prepared ahead of any fetch
+/// ([`stela_engine::machine::engine::ahead`]).
+static AHEAD: Lock<Option<ahead::Queue>> = Lock::new(None);
+
+/// How long one [`prepare_ahead`] call may take, in microseconds.
+const AHEAD_MICROS: u64 = 500;
+
+/// Whether a block waits to be prepared ahead: a compile worker that finds
+/// one does not sleep (`workers`).
+pub fn ahead_pending() -> bool {
+    available(SHARE_BLOCKS)
+        && AHEAD.with(|queue| queue.as_ref().is_some_and(|queue| !queue.is_empty()))
+}
+
+/// Prepare blocks ahead of any fetch, newest job first, for at most
+/// [`AHEAD_MICROS`] or until `stop` says the caller has other work: a PE
+/// whose guest waits calls it until its guest has work, and a compile
+/// worker until a GPU job waits (`workers`), which runs no PE and holds no
+/// guest time. `read` reads a guest-physical frame. A job
+/// whose block the store holds (in a pack record or among its shared
+/// blocks) or whose frame no longer holds its page's bytes is skipped; the
+/// others' blocks join the shared blocks.
+pub fn prepare_ahead(read: &mut dyn FnMut(u64, &mut [u8]) -> bool, stop: &dyn Fn() -> bool) {
+    if !available(SHARE_BLOCKS) {
+        return;
+    }
+    let started = super::host::fresh_counter();
+    let deadline = started + super::host::COUNTER_HZ * AHEAD_MICROS / 1_000_000;
+    let mut page = [0u8; translations::PAGE_BYTES];
+    // The frame read last and the key its bytes hashed to.
+    let mut verified: Option<(u64, Digest)> = None;
+    while super::host::fresh_counter() < deadline && !stop() {
+        let Some(job) = AHEAD.with(|queue| queue.as_mut()?.pop()) else {
+            break;
+        };
+        let outcome = ahead_job(&job, read, &mut page, &mut verified);
+        AHEAD.with(|queue| {
+            if let Some(queue) = queue {
+                queue.note(outcome);
+            }
+        });
+    }
+}
+
+fn ahead_job(
+    job: &ahead::Job,
+    read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    page: &mut [u8; translations::PAGE_BYTES],
+    verified: &mut Option<(u64, Digest)>,
+) -> ahead::Outcome {
+    // A job for another page than its naming block's takes the key of the
+    // bytes its frame holds now.
+    let key = match job.key() {
+        Some(key) => *key,
+        None => match *verified {
+            Some((frame, key)) if frame == job.frame() => key,
+            _ => {
+                *verified = None;
+                if !read(job.frame(), page) {
+                    return ahead::Outcome::Stale;
+                }
+                let key = Digest::of(page);
+                *verified = Some((job.frame(), key));
+                key
+            }
+        },
+    };
+    let held = part(&key).with(|store| {
+        store
+            .as_ref()
+            .is_some_and(|store| store.holds_shared(&key, job.pc(), job.context()))
+    });
+    if held
+        || Shared
+            .record(&key)
+            .is_some_and(|record| record.contains(job.offset(), job.context()))
+    {
+        return ahead::Outcome::Present;
+    }
+    if *verified != Some((job.frame(), key)) {
+        *verified = None;
+        if !read(job.frame(), page) || !ahead::page_matches(job, page) {
+            return ahead::Outcome::Stale;
+        }
+        *verified = Some((job.frame(), key));
+    }
+    match ahead::prepare(job, key, page) {
+        Ok(offer) => {
+            Shared.offer(offer);
+            ahead::Outcome::Prepared
+        }
+        Err(outcome) => outcome,
+    }
+}
+
+mod previous;
+pub use previous::{FILE as PREVIOUS_FILE, install as install_previous, step as refill};
+
 /// The store the engine uses, if the loader read one or the PEs share one.
 pub fn store() -> Option<&'static mut Shared> {
     available(READ_PACK | WRITE_PACK | SHARE_BLOCKS).then(|| Box::leak(Box::new(Shared)))
 }
 
-/// Keep up to `bound` bytes of compiled code for the PEs: a quarter for
+/// Keep up to `bound` bytes of compiled code for the PEs, the planner's
+/// share of the code budget beside the window (`host_memory::Sizes::kept`):
+/// a third for the pack's decoded records, which held a sixty-fourth of
+/// the heap before the budget held them, a quarter for
 /// blocks shared as they are compiled (buffers and cache metadata in the
 /// loader's store or a store for this boot), the rest for stored forms of
 /// blocks the ring took away and the guest runs again, which the board
@@ -994,7 +1031,8 @@ pub fn store() -> Option<&'static mut Shared> {
 /// 20261116-111302: 447 K hits, 28.6 M misses). Allocator overhead and
 /// shared immutable preparation storage are outside this budget.
 pub fn share(bound: usize) {
-    let kept = bound - bound / 4;
+    let decoded = bound / 3;
+    let kept = bound - bound / 4 - decoded;
     AVAILABLE.kept_entries.store(kept, Ordering::Release);
     let bound = bound / 4;
     BOOT.with(|boot| {
@@ -1004,7 +1042,7 @@ pub fn share(bound: usize) {
                 partition: None,
             })
             .translator;
-        install_parts(translator, Vec::new(), bound);
+        install_parts(translator, Vec::new(), bound, Some(decoded));
         AVAILABLE.shared_bound.store(bound, Ordering::Release);
         if bound != 0 {
             AVAILABLE
@@ -1114,7 +1152,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             let old = lock.with(Option::take);
             drop(old);
         }
-        install_parts(translator, segments, 0);
+        install_parts(translator, segments, 0, None);
         *boot = Some(Boot {
             translator,
             partition: None,
@@ -1211,6 +1249,22 @@ fn millis(ticks: u64) -> u64 {
 /// Report what the store did and cost this boot: lookups and their causes,
 /// shared misses by reason, stored forms kept and checked, and lock waits.
 fn report(counters: &pack::Counters) {
+    previous::report_now();
+    let ahead = AHEAD.with(|queue| queue.as_ref().map(ahead::Queue::counts));
+    let ahead = ahead.unwrap_or_default();
+    output::arguments(format_args!(
+        "TRANSLATIONS ahead queued={} elsewhere={} unwalked={} repeated={} dropped={} \
+         prepared={} present={} stale={} refused={}\n",
+        ahead.queued,
+        ahead.elsewhere,
+        ahead.unwalked,
+        ahead.repeated,
+        ahead.dropped,
+        ahead.prepared,
+        ahead.present,
+        ahead.stale,
+        ahead.refused,
+    ));
     let costs = &COSTS;
     let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     output::arguments(format_args!(
@@ -1234,24 +1288,6 @@ fn report(counters: &pack::Counters) {
         counters.shared_other_context,
         counters.shared_evicted,
         counters.shared_in_flight,
-    ));
-    let ahead = AHEAD.counts();
-    output::arguments(format_args!(
-        "TRANSLATIONS ahead on={} queued={} repeated={} dropped={} present={} compiled={} refused={} published={} unpublished={} hits={} stale={} ns/block={}\n",
-        AHEAD_ON.load(Ordering::Relaxed),
-        ahead.queued,
-        ahead.repeated,
-        ahead.dropped,
-        ahead.present,
-        ahead.translated,
-        ahead.refused,
-        ahead.published,
-        ahead.unpublished,
-        ahead.hits,
-        ahead.stale,
-        (u128::from(ahead.ticks) * 1_000_000_000
-            / u128::from(output::counter_hz().max(1))
-            / u128::from(ahead.translated.max(1))) as u64,
     ));
     let (mut acquired, mut contended, mut spun) = (0, 0, 0);
     for lock in &STORES {
@@ -1346,6 +1382,21 @@ impl Entries for Parts {
             .iter()
             .map(|lock| lock.with(|store| store.as_ref().map_or(0, |store| store.added_bytes())))
             .sum::<usize>() as u64
+    }
+
+    fn uses(&mut self) -> BTreeMap<Digest, u32> {
+        let mut uses = BTreeMap::<Digest, u32>::new();
+        for lock in &STORES {
+            lock.with(|store| {
+                if let Some(store) = store {
+                    for (key, count) in store.uses() {
+                        let held = uses.entry(*key).or_default();
+                        *held = held.saturating_add(*count);
+                    }
+                }
+            });
+        }
+        uses
     }
 
     fn shed(&mut self, shed: bool) {

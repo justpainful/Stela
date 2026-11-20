@@ -13,10 +13,15 @@
 //! block's direct exits end its code. The service call clobbers what a SysV
 //! call may but RSI and RDI, which it saves; between instructions a block
 //! keeps nothing else live but the pinned registers, which the call
-//! preserves. The branch forms (BRA*, BLRA* and RETA*) still end their
-//! block, whose thunk completes them.
-use super::{Finish, Form, Lookup, Routine, call_service, lookup};
-use crate::x86_64::asm::{Code, Gpr, Patch, Size, resolve};
+//! preserves.
+//!
+//! The branch forms (BRA*, BLRA* and RETA*) end their block: the block
+//! authenticates the target in line ([`authenticate_transfer`]) and then
+//! takes the exit BR, BLR or RET takes to a target in RAX, linking X30 first
+//! for BLRA* ([`transfer`]). What it does not complete leaves at the
+//! instruction with the PAC exit the block ended with before.
+use super::{Finish, Form, Lookup, Routine, call_service, lookup, unopened};
+use crate::x86_64::asm::{Code, Patch, Size, resolve};
 use crate::{
     Anchor, GuestAddress, Place,
     aarch64::Register,
@@ -50,12 +55,63 @@ pub fn inlines(operation: Operation) -> bool {
     }
 }
 
+/// The exit a block ending with `operation` takes to its authenticated
+/// target, as RET, BR or BLR takes it: `None` for what does not branch, or
+/// that a block does not complete (loads, FEAT_PAuth_LR forms).
+pub fn transfer(operation: Operation) -> Option<ExitKind> {
+    match Form::of(operation)?.completion {
+        Finish::Register => None,
+        Finish::Return => Some(ExitKind::Return),
+        Finish::Branch { link: true } => Some(ExitKind::Call),
+        Finish::Branch { link: false } => Some(ExitKind::Indirect),
+    }
+}
+
+/// The authentication of `operation` at `pc`, a branch form [`transfer`]
+/// admits, at the end of a block: its target in RAX at the end of the code,
+/// where the caller emits the transfer. The service completes a memo miss
+/// or what the cipher leaves to it; what it does not complete leaves at
+/// the instruction with a PAC exit, the instructions before it retired.
+/// The service call lies between the computation and the end, behind a
+/// jump.
+pub(crate) fn authenticate_transfer(
+    code: &mut Code,
+    operation: Operation,
+    pc: GuestAddress,
+    cells: Cells,
+) {
+    let form = Form::of(operation)
+        .filter(|form| form.completion != Finish::Register)
+        .expect("a branch form");
+    let mut asm = code.asm();
+    let tags = Place::new(Anchor::Pointer, cells.tags as usize);
+    let computed = match cells.cipher {
+        Some(cipher) => {
+            let cipher = Place::new(Anchor::Pointer, cipher as usize);
+            super::cipher::compute(&mut asm, form, tags, cipher)
+        }
+        None => lookup(&mut asm, form, tags),
+    };
+    let complete = asm.jmp();
+    let (disabled, modifier) = unopened(&mut asm, computed);
+    let failed = call_service(&mut asm, form, Routine::Cell(cells.routine), modifier);
+    let serviced = asm.jmp();
+    asm.bind(failed);
+    super::super::block::direct_exit_with(&mut asm, pc, ExitKind::PointerAuthentication);
+    for patch in [Some(complete), Some(serviced), disabled]
+        .into_iter()
+        .flatten()
+    {
+        asm.bind(patch);
+    }
+}
+
 /// What [`emit`] leaves to [`place`] out of line.
 pub(crate) struct Slow {
     pc: GuestAddress,
     /// The service call of a memo miss, which returns to the completion,
-    /// and the modifier's register.
-    service: Option<(Form, Vec<Patch>, usize, Gpr)>,
+    /// what the computation left to it and the completion's offset.
+    service: Option<(Form, Lookup, usize)>,
     /// The jumps to the exit at the instruction.
     exits: Vec<Patch>,
 }
@@ -85,7 +141,7 @@ pub(crate) fn emit(code: &mut Code, operation: Operation, pc: GuestAddress, cell
         .filter(|form| form.completion == Finish::Register)
         .expect("a form that completes into its register");
     let tags = Place::new(Anchor::Pointer, cells.tags as usize);
-    let Lookup { misses, modifier } = match cells.cipher {
+    let computed = match cells.cipher {
         Some(cipher) => {
             let cipher = Place::new(Anchor::Pointer, cipher as usize);
             super::cipher::compute(&mut asm, form, tags, cipher)
@@ -94,10 +150,10 @@ pub(crate) fn emit(code: &mut Code, operation: Operation, pc: GuestAddress, cell
     };
     let complete = asm.len();
     let result = asm.guest(Register::X(form.result)).expect("X0..X30");
-    asm.mov_store(Size::Qword, result, Gpr::Rax);
+    asm.mov_store(Size::Qword, result, crate::x86_64::asm::Gpr::Rax);
     Slow {
         pc,
-        service: Some((form, misses, complete, modifier)),
+        service: Some((form, computed, complete)),
         exits: vec![],
     }
 }
@@ -107,10 +163,9 @@ pub(crate) fn place(code: &mut Code, slow: Slow, cells: Cells) {
     let mut asm = code.asm();
     let mut exits = slow.exits;
     let mut back = vec![];
-    if let Some((form, misses, complete, modifier)) = slow.service {
-        for miss in misses {
-            asm.bind(miss);
-        }
+    if let Some((form, computed, complete)) = slow.service {
+        let (disabled, modifier) = unopened(&mut asm, computed);
+        back.extend(disabled.map(|patch| (patch, complete)));
         let routine = Routine::Cell(cells.routine);
         exits.push(call_service(&mut asm, form, routine, modifier));
         back.push((asm.jmp(), complete));
@@ -213,6 +268,56 @@ mod tests {
             modifier: crate::block::PointerAuthenticationModifier::Register(16),
             link: true,
         }));
+    }
+
+    /// Given the cells, a block ending with RETA* or BRA* authenticates in
+    /// line and ends with the exit RET and BR end with, the service call
+    /// behind it; without them it ends with the PAC exit at the instruction.
+    #[test]
+    fn blocks_given_the_cells_end_branch_forms_with_their_transfer() {
+        use crate::x86_64::chain::{self, DIRECT_EXIT_BYTES, DYNAMIC_EXIT_BYTES};
+        const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+        for (word, kind) in [
+            (0xd65f_0fff, ExitKind::Return),   // retab
+            (0xd71f_0865, ExitKind::Indirect), // braa x3, x5
+            (0xd61f_087f, ExitKind::Indirect), // braaz x3
+        ] {
+            assert_eq!(transfer(decoded(word)), Some(kind));
+            let plain = compile(&[ADD, word], None).native.x86_64_code;
+            assert!(chain::is_direct_exit(
+                &plain[plain.len() - DIRECT_EXIT_BYTES..],
+                GuestAddress(PC + 4),
+                ExitKind::PointerAuthentication
+            ));
+            let block = compile(&[ADD, word], Some(CELLS));
+            assert_eq!(block.source_bytes, 8);
+            let code = chain::without_failures(&block.native.x86_64_code);
+            assert!(
+                chain::is_dynamic_exit(&code[code.len() - DYNAMIC_EXIT_BYTES..], kind),
+                "{word:#x}"
+            );
+            let [cell, _] = super::super::service_call_ends(CELLS.routine, 0);
+            assert!(code.windows(cell.len()).any(|bytes| bytes == cell));
+            // The PAC exit for what the service leaves lies before the
+            // transfer.
+            assert!(
+                code.windows(DIRECT_EXIT_BYTES)
+                    .any(|bytes| chain::is_direct_exit(
+                        bytes,
+                        GuestAddress(PC + 4),
+                        ExitKind::PointerAuthentication
+                    ))
+            );
+        }
+        assert_eq!(transfer(decoded(0xd73f_0910)), Some(ExitKind::Call));
+        assert_eq!(transfer(decoded(0xd503_237f)), None);
+    }
+
+    fn decoded(word: u32) -> Operation {
+        crate::block::decode_pointer_authentication(GuestAddress(PC), word)
+            .unwrap()
+            .unwrap()
+            .operation
     }
 
     /// The block completes a memo hit, a service completion and a strip,

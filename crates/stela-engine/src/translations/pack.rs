@@ -39,14 +39,23 @@ use stela_formats::journal;
 pub const MAGIC: [u8; 8] = *b"STLTPACK";
 pub const SCHEMA: u32 = 1;
 const MIXED_SCHEMA: u32 = 2;
+/// The schemas of packs whose index counts each record's uses
+/// ([`USES_SHIFT`]): [`SCHEMA`] and [`MIXED_SCHEMA`] this much higher. A
+/// pack of the first two loads, its records counted as unused.
+const COUNTED: u32 = 2;
+const COUNTED_SCHEMA: u32 = SCHEMA + COUNTED;
+const COUNTED_MIXED_SCHEMA: u32 = MIXED_SCHEMA + COUNTED;
 /// Magic, schema, record count and translator id.
 pub const HEADER_BYTES: usize = MAGIC.len() + 4 + 4 + DIGEST_BYTES;
 const DIGEST_BYTES: usize = 32;
 /// Page key, offset and length. The length field's top byte holds the
-/// record's age ([`MAX_UNUSED_BOOTS`]), the rest its length.
+/// record's age ([`MAX_UNUSED_BOOTS`]), the byte below it, in a counted
+/// pack, the most uses a boot made of it ([`Merge::by_use`], saturating),
+/// the rest its length.
 const INDEX_ENTRY_BYTES: usize = DIGEST_BYTES + 8 + 8;
 const AGE_SHIFT: u32 = 56;
-pub const LENGTH_MASK: u64 = (1 << AGE_SHIFT) - 1;
+const USES_SHIFT: u32 = 48;
+pub const LENGTH_MASK: u64 = (1 << USES_SHIFT) - 1;
 /// A record no boot looked up for more boots in a row than this leaves the
 /// next pack: the pack keeps what boots use, and what they stopped using
 /// costs no read time for long. Every boot reads the whole pack.
@@ -109,11 +118,25 @@ impl PackFormat {
                 .try_into()
                 .expect("a schema word"),
         ) {
-            SCHEMA => Ok(Self::Raw),
-            MIXED_SCHEMA => Ok(Self::Mixed),
+            SCHEMA | COUNTED_SCHEMA => Ok(Self::Raw),
+            MIXED_SCHEMA | COUNTED_MIXED_SCHEMA => Ok(Self::Mixed),
             _ => Err(PackError::Schema),
         }
     }
+
+    /// The schema a pack of this format is written with: counted.
+    fn schema(self) -> u32 {
+        self as u32 + COUNTED
+    }
+}
+
+/// Whether the pack whose header starts `header` counts its records' uses.
+fn counted(header: &[u8]) -> bool {
+    u32::from_le_bytes(
+        header[MAGIC.len()..][..4]
+            .try_into()
+            .expect("a schema word"),
+    ) > MIXED_SCHEMA
 }
 
 /// The bytes of the header, index and index checksum of the pack whose
@@ -264,6 +287,12 @@ impl<'a> Pack<'a> {
             format: self.format,
             checked: false,
         }
+    }
+
+    /// Every record's page key and the most uses a boot made of it (none
+    /// in a pack of a schema before the count), in key order.
+    pub fn uses(&self) -> impl Iterator<Item = (Digest, u8)> + '_ {
+        (0..self.count).map(|index| (entry(self.bytes, index).0, entry_uses(self.bytes, index)))
     }
 
     /// Every record's page key and bytes, in key order.
@@ -445,6 +474,17 @@ fn entry_age(bytes: &[u8], index: usize) -> u8 {
     (index_field(bytes, at) >> AGE_SHIFT) as u8
 }
 
+/// Index entry `index`'s uses: the byte below its age in a counted pack,
+/// none in an older one.
+fn entry_uses(bytes: &[u8], index: usize) -> u8 {
+    let at = HEADER_BYTES + index * INDEX_ENTRY_BYTES + DIGEST_BYTES + 8;
+    if counted(bytes) {
+        (index_field(bytes, at) >> USES_SHIFT) as u8
+    } else {
+        0
+    }
+}
+
 fn index_field(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a field"))
 }
@@ -490,6 +530,10 @@ impl<'a> Segment<'a> {
 
     fn age(&self, index: usize) -> u8 {
         entry_age(self.index(), index)
+    }
+
+    fn uses(&self, index: usize) -> u8 {
+        entry_uses(self.index(), index)
     }
 
     /// The record of index entry `index`, to decode.
@@ -737,7 +781,7 @@ impl<'a> Layout<'a> {
         let count = records.len();
         let mut prefix = Vec::with_capacity(prefix_length(count));
         prefix.extend(MAGIC);
-        prefix.extend((format as u32).to_le_bytes());
+        prefix.extend(format.schema().to_le_bytes());
         prefix.extend((count as u32).to_le_bytes());
         prefix.extend(translator.0);
         for (key, offset, piece) in &records {
@@ -1050,6 +1094,13 @@ pub struct Merge<'a> {
     /// those the running boot did not use when it names those it did
     /// ([`Merge::protect`]), so they are kept first.
     by_age: [(u64, usize); RANKS],
+    /// The running boot's uses of each key ([`Merge::by_use`]), and the
+    /// records of the rank that does not fit whole that are kept: those
+    /// used most, until the bound is full.
+    uses: BTreeMap<Digest, u32>,
+    chosen: Vec<bool>,
+    /// Per record taken, the most uses its segments counted.
+    counted: Vec<u8>,
     phase: Phase<'a>,
     evicted: u64,
     expired: u64,
@@ -1128,6 +1179,9 @@ impl<'a> Merge<'a> {
             scratch: DecodeScratch::default(),
             records: Vec::new(),
             by_age: [(0, 0); RANKS],
+            uses: BTreeMap::new(),
+            chosen: Vec::new(),
+            counted: Vec::new(),
             phase: Phase::Taking,
             evicted: 0,
             expired: 0,
@@ -1147,12 +1201,56 @@ impl<'a> Merge<'a> {
         self
     }
 
+    /// Of the rank that does not fit whole, keep the records the running
+    /// boot used most (`uses`, by page key), not the first in key order:
+    /// a merge that ran while a boot had used part of its pack left out
+    /// pages by their hash, those a session runs among them.
+    pub fn by_use(mut self, uses: BTreeMap<Digest, u32>) -> Self {
+        self.uses = uses;
+        self
+    }
+
+    /// Which records of rank `oldest` fit after `count` records of `bytes`
+    /// kept whole: the most used first, ties in key order.
+    fn choose(&self, oldest: Option<usize>, mut count: usize, mut bytes: u64) -> Vec<bool> {
+        let Some(oldest) = oldest else {
+            return Vec::new();
+        };
+        let mut order: Vec<(u32, u8, usize)> = self
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, rank))| usize::from(*rank) == oldest)
+            .map(|(at, (key, _, _))| {
+                (
+                    self.uses.get(key).copied().unwrap_or(0),
+                    self.counted[at],
+                    at,
+                )
+            })
+            .collect();
+        order.sort_by_key(|&(uses, counted, at)| {
+            (core::cmp::Reverse(uses), core::cmp::Reverse(counted), at)
+        });
+        let mut chosen = alloc::vec![false; self.records.len()];
+        for (_, _, at) in order {
+            let more = self.records[at].1.bytes().len() as u64;
+            if count < MAX_RECORDS && layout_bytes(count + 1, bytes + more) <= self.bound {
+                chosen[at] = true;
+                count += 1;
+                bytes += more;
+            }
+        }
+        chosen
+    }
+
     /// Add a record of age 0 after those taken, its key past theirs.
     fn push(&mut self, key: Digest, piece: Piece<'a>) {
         debug_assert!(self.records.last().is_none_or(|last| last.0 < key));
         self.by_age[0].0 += piece.bytes().len() as u64;
         self.by_age[0].1 += 1;
         self.records.push((key, piece, 0));
+        self.counted.push(0);
     }
 
     /// The rank a record of `age` is kept by: its age, one more when the
@@ -1245,6 +1343,12 @@ impl<'a> Merge<'a> {
         slot.0 += piece.bytes().len() as u64;
         slot.1 += 1;
         self.records.push((key, piece, rank));
+        let counted = holders
+            .iter()
+            .map(|&(index, at)| self.segments[index].uses(at))
+            .max()
+            .unwrap_or(0);
+        self.counted.push(counted);
         true
     }
 
@@ -1272,6 +1376,7 @@ impl<'a> Merge<'a> {
                 Phase::Taking => {
                     if !self.take() {
                         let (oldest, count, bytes) = self.whole_ages();
+                        self.chosen = self.choose(oldest, count, bytes);
                         self.phase = Phase::Choosing {
                             oldest,
                             at: 0,
@@ -1290,7 +1395,7 @@ impl<'a> Merge<'a> {
                         let count = *count;
                         let mut prefix = Vec::with_capacity(prefix_length(count));
                         prefix.extend(MAGIC);
-                        prefix.extend((self.format as u32).to_le_bytes());
+                        prefix.extend(self.format.schema().to_le_bytes());
                         prefix.extend((count as u32).to_le_bytes());
                         prefix.extend(self.translator.0);
                         self.phase = Phase::Indexing {
@@ -1303,14 +1408,14 @@ impl<'a> Merge<'a> {
                         };
                         continue;
                     };
+                    let index = *at;
                     *at += 1;
                     let keep = match *oldest {
                         None => true,
                         Some(oldest) if usize::from(*age) < oldest => true,
                         Some(oldest) if usize::from(*age) == oldest => {
                             let more = piece.bytes().len() as u64;
-                            let fits = *count < MAX_RECORDS
-                                && layout_bytes(*count + 1, *bytes + more) <= self.bound;
+                            let fits = self.chosen[index];
                             if fits {
                                 *bytes += more;
                                 *count += 1;
@@ -1342,12 +1447,17 @@ impl<'a> Merge<'a> {
                         self.records = Vec::new();
                         return true;
                     };
+                    let index = *at;
                     *at += 1;
                     if *age == DROPPED {
                         *piece = Piece::Kept(&[]);
                         continue;
                     }
                     let length = piece.bytes().len() as u64;
+                    // The most uses a boot made of it: this boot's, or an
+                    // earlier one's.
+                    let boot = self.uses.get(key).copied().unwrap_or(0);
+                    let uses = u64::from(self.counted[index].max(boot.min(255) as u8));
                     // The rank less the step for records the running boot
                     // did not use ([`Merge::rank`]).
                     let unused = self
@@ -1357,7 +1467,9 @@ impl<'a> Merge<'a> {
                     let age = *age - u8::from(unused);
                     prefix.extend(key.0);
                     prefix.extend(offset.to_le_bytes());
-                    prefix.extend((length | u64::from(age) << AGE_SHIFT).to_le_bytes());
+                    prefix.extend(
+                        (length | uses << USES_SHIFT | u64::from(age) << AGE_SHIFT).to_le_bytes(),
+                    );
                     // Hash the index in pieces, so the checksum costs no
                     // step more than its share.
                     if prefix.len() - *hashed >= INDEX_HASH_BYTES {
@@ -1619,18 +1731,7 @@ struct SharedEntry {
     translation: Arc<SharedTranslation>,
     /// Immutable owner charge, computed once before admission.
     bytes: usize,
-    /// Charged to the blocks translated ahead of execution
-    /// ([`Store::ahead_bytes`]) until a PE runs it ([`Store::promote_shared`]).
-    ahead: bool,
 }
-
-/// The part of the shared bound blocks translated ahead of execution may
-/// take, as one in this many: speculation never takes the room of blocks
-/// PEs ran, and the oldest of them are not evicted for it. A quarter left
-/// 73% of a desktop session's blocks translated ahead unpublished; half
-/// still left 71% unpublished while the code cache churned five times as
-/// many new blocks a minute: a quarter.
-pub const AHEAD_SHARE: usize = 4;
 
 /// One local producer's shared offer, allocated and charged before the
 /// producer acquires the store lock.
@@ -1645,11 +1746,6 @@ impl StagedOffer {
     pub fn new(offer: Offer, bound: usize) -> Option<Self> {
         let (key, bytes) = Self::charge(&offer, bound)?;
         Some(Self::entry(key, bytes, offer.shared()))
-    }
-
-    /// Whether a store has yet to take it ([`Store::accept_shared`]).
-    pub fn pending(&self) -> bool {
-        self.entry.is_some()
     }
 
     fn charge(offer: &Offer, bound: usize) -> Option<(SharedKey, usize)> {
@@ -1670,11 +1766,7 @@ impl StagedOffer {
     fn entry(key: SharedKey, bytes: usize, translation: Arc<SharedTranslation>) -> Self {
         Self {
             key,
-            entry: Some(SharedEntry {
-                ahead: translation.ahead(),
-                translation,
-                bytes,
-            }),
+            entry: Some(SharedEntry { translation, bytes }),
         }
     }
 }
@@ -1823,6 +1915,10 @@ pub struct Store<'a> {
     /// each. The records themselves are the engine's to keep: decoded, they
     /// take several times the pack's bytes.
     loaded: BTreeMap<Digest, bool>,
+    /// This boot's uses of each page key: its records handed out (decoded
+    /// or from the cache) and its blocks offered. A full merge that must
+    /// leave records out keeps those used most ([`Merge::by_use`]).
+    uses: BTreeMap<Digest, u32>,
     decoded: DecodedCache,
     decode_scratch: DecodeScratch,
     /// Entries added during the run, by page key, and their retained bytes.
@@ -1843,9 +1939,6 @@ pub struct Store<'a> {
     shared_order: VecDeque<SharedKey>,
     shared_bytes: usize,
     shared_bound: usize,
-    /// Of `shared_bytes`, the blocks translated ahead no PE ran yet, at most
-    /// a [`AHEAD_SHARE`]th of the bound.
-    ahead_bytes: usize,
     misses: MissTables,
     pub counters: Counters,
 }
@@ -1915,6 +2008,7 @@ impl<'a> Store<'a> {
             segments,
             filters,
             loaded: BTreeMap::new(),
+            uses: BTreeMap::new(),
             decoded: DecodedCache::new(bounds.decoded),
             decode_scratch: DecodeScratch::default(),
             added: BTreeMap::new(),
@@ -1924,7 +2018,6 @@ impl<'a> Store<'a> {
             shared_order: VecDeque::new(),
             shared_bytes: 0,
             shared_bound: 0,
-            ahead_bytes: 0,
             misses: MissTables::default(),
             taken: SeenFilter::default(),
             refused: SeenFilter::default(),
@@ -1946,6 +2039,10 @@ impl<'a> Store<'a> {
     pub fn absorb(&mut self, other: Self) {
         for (key, valid) in other.loaded {
             self.loaded.entry(key).or_insert(valid);
+        }
+        for (key, uses) in other.uses {
+            let held = self.uses.entry(key).or_default();
+            *held = held.saturating_add(uses);
         }
         for (key, record) in other.added {
             match self.added.entry(key) {
@@ -1976,13 +2073,6 @@ impl<'a> Store<'a> {
         }
     }
 
-    /// Whether it shares a block at `pc` of the page whose bytes hash to
-    /// `key`, in `context`, without counting a lookup: a block translated
-    /// ahead of execution would only take its place.
-    pub fn holds_shared(&self, key: &Digest, pc: u64, context: &Digest) -> bool {
-        self.shared.contains_key(&shared_key(key, pc, context))
-    }
-
     fn shared_usage(&self) -> usize {
         self.shared_bytes
             .saturating_add(self.shared_order.capacity() * size_of::<SharedKey>())
@@ -1992,25 +2082,11 @@ impl<'a> Store<'a> {
         while let Some(oldest) = self.shared_order.pop_front() {
             if let Some(evicted) = self.shared.remove(&oldest) {
                 self.shared_bytes -= evicted.bytes;
-                if evicted.ahead {
-                    self.ahead_bytes -= evicted.bytes;
-                }
                 self.misses.evicted(oldest);
                 return Some(evicted);
             }
         }
         None
-    }
-
-    /// A PE ran the shared block at `pc` of the page `key` in `context`, which
-    /// a compile worker translated ahead: it is charged as any block PEs
-    /// ran from now on, and no longer to the speculative share.
-    pub fn promote_shared(&mut self, key: &Digest, pc: u64, context: &Digest) {
-        if let Some(entry) = self.shared.get_mut(&shared_key(key, pc, context))
-            && core::mem::replace(&mut entry.ahead, false)
-        {
-            self.ahead_bytes -= entry.bytes;
-        }
     }
 
     /// Admit a preallocated shared block. The producer can drop a displaced
@@ -2021,34 +2097,8 @@ impl<'a> Store<'a> {
 
         let key = staged.key;
         self.misses.offered(key);
-        let (bytes, ahead) = staged
-            .entry
-            .as_ref()
-            .map(|entry| (entry.bytes, entry.ahead))?;
+        let bytes = staged.entry.as_ref()?.bytes;
         if bytes > self.shared_bound {
-            return None;
-        }
-        // A block translated ahead takes only free room in its share, and
-        // never a block's another offer or PEs' runs put there: the
-        // producer keeps it, declined.
-        if ahead {
-            if self.shared.contains_key(&key)
-                || self.ahead_bytes.saturating_add(bytes) > self.shared_bound / AHEAD_SHARE
-                || self.shared_usage().saturating_add(bytes) > self.shared_bound
-                || self.shared_order.try_reserve(1).is_err()
-            {
-                return None;
-            }
-            // A FIFO allocation can itself exceed the budget.
-            let fifo = self.shared_order.capacity() * size_of::<SharedKey>();
-            if self.shared_bytes.saturating_add(fifo).saturating_add(bytes) > self.shared_bound {
-                return None;
-            }
-            self.shared
-                .insert(key, staged.entry.take().expect("staged entry"));
-            self.shared_order.push_back(key);
-            self.shared_bytes += bytes;
-            self.ahead_bytes += bytes;
             return None;
         }
         let mut deferred = None;
@@ -2060,9 +2110,6 @@ impl<'a> Store<'a> {
                         <= self.shared_bound =>
                 {
                     self.shared_bytes = self.shared_bytes - slot.get().bytes + bytes;
-                    if slot.get().ahead {
-                        self.ahead_bytes -= slot.get().bytes;
-                    }
                     let old = slot.insert(staged.entry.take().expect("staged entry"));
                     retire(old, &mut deferred);
                     return deferred;
@@ -2092,6 +2139,12 @@ impl<'a> Store<'a> {
         }
     }
 
+    /// Whether the shared blocks hold one at `pc` of the page `key` in
+    /// `context`, without counting a lookup.
+    pub fn holds_shared(&self, key: &Digest, pc: u64, context: &Digest) -> bool {
+        self.shared.contains_key(&shared_key(key, pc, context))
+    }
+
     /// Keep no offer while `shed`, the heap being short, or keep them again:
     /// the writer sheds the store's work before anything else's.
     pub fn shed(&mut self, shed: bool) {
@@ -2116,6 +2169,7 @@ impl<'a> Store<'a> {
     /// bound has room.
     pub fn keep(&mut self, offer: &Offer, entry: Option<Entry>) {
         let key = offer.key();
+        self.used(&key);
         self.misses
             .offered(shared_key(&key, offer.pc(), &offer.context()));
         if self.shedding {
@@ -2126,6 +2180,24 @@ impl<'a> Store<'a> {
             self.counters.unstorable += 1;
             return;
         };
+        self.add(key, entry);
+    }
+
+    /// Keep `entry`, this translator's stored form of a block of the
+    /// previous translator's pack, of the page `key` names
+    /// (the engine's `refill.rs`), as an offer's, within half
+    /// the bound of the entries added: the blocks this boot compiles keep
+    /// the rest. Unused yet, a merge keeps it only while boots use it.
+    pub fn refilled(&mut self, key: Digest, entry: Entry) {
+        if self.shedding || self.added_bytes + entry.retained_bytes() > self.added_bound / 2 {
+            return;
+        }
+        self.add(key, entry);
+    }
+
+    /// Add `entry` to the entries of `key` added this boot, within their
+    /// bound.
+    fn add(&mut self, key: Digest, entry: Entry) {
         if self
             .added
             .get(&key)
@@ -2163,7 +2235,19 @@ impl<'a> Store<'a> {
         let record = self.decoded.get(key)?;
         self.counters.cached += 1;
         self.counters.repeated += 1;
+        self.used(key);
         Some(record)
+    }
+
+    /// Count a use of `key` this boot.
+    fn used(&mut self, key: &Digest) {
+        let uses = self.uses.entry(*key).or_default();
+        *uses = uses.saturating_add(1);
+    }
+
+    /// This boot's uses of each page key so far ([`Merge::by_use`]).
+    pub fn uses(&self) -> &BTreeMap<Digest, u32> {
+        &self.uses
     }
 
     /// The pack's slot for `key`, unless an earlier lookup found it invalid.
@@ -2225,6 +2309,7 @@ impl<'a> Store<'a> {
             {
                 self.counters.decoded += 1;
                 self.looked_up(key, true, true);
+                self.used(key);
                 self.decoded.insert(&decoded.record, decoded.retained_bytes)
             }
             Err(DecodeError::Invalid) => {
@@ -2349,6 +2434,22 @@ mod tests {
             .collect();
         preparation.admit(&mut input);
         Offer::compile(key, page, pc, preparation.context(page), input, preparation).unwrap()
+    }
+
+    #[test]
+    fn a_shared_block_is_held_without_a_lookup_counted() {
+        let key = Digest([7; 32]);
+        let mut store = Store::new(translator_id(), None).0;
+        store.share(1 << 20);
+        let offer = offer(0x1000, key);
+        let context = offer.context();
+        assert!(!store.holds_shared(&key, 0x1000, &context));
+        store.offer(offer);
+        assert!(store.holds_shared(&key, 0x1000, &context));
+        assert!(!store.holds_shared(&key, 0x1004, &context));
+        assert_eq!(store.counters.shared_hits, 0);
+        assert!(store.prepared(&key, 0x1000, &context).is_some());
+        assert_eq!(store.counters.shared_hits, 1);
     }
 
     #[test]
@@ -2627,52 +2728,6 @@ mod tests {
     }
 
     #[test]
-    fn blocks_translated_ahead_take_only_free_room_in_their_share_until_a_pe_runs_them() {
-        let key = Digest::of(b"page");
-        let ran = offer(0x1000, key);
-        let bytes = ran.clone().retained_bytes() + size_of::<(SharedKey, SharedEntry)>();
-        let (mut store, _) = Store::new(Digest::of(b"translator"), None);
-        // Room for two blocks per share part: two of them speculative, the
-        // FIFO's own charge left over.
-        store.share(2 * AHEAD_SHARE * bytes + 8 * size_of::<SharedKey>());
-        store.offer(ran.clone());
-        for pc in [0x1008, 0x1010, 0x1018] {
-            store.offer(offer(pc, key).marked_ahead());
-        }
-        let held = |store: &Store, pc| store.holds_shared(&key, pc, &ran.context());
-        assert!(held(&store, 0x1000));
-        assert!(held(&store, 0x1008) && held(&store, 0x1010));
-        // The share is full: the third waits rather than take more room.
-        assert!(!held(&store, 0x1018));
-        assert_eq!(store.ahead_bytes, 2 * bytes);
-        // A PE ran one: it is charged as PEs' blocks are, and the share has
-        // room again.
-        store.promote_shared(&key, 0x1008, &ran.context());
-        assert_eq!(store.ahead_bytes, bytes);
-        store.offer(offer(0x1018, key).marked_ahead());
-        assert!(held(&store, 0x1018));
-        // A block translated ahead never replaces one already shared, and
-        // a PE's own offer replaces one translated ahead.
-        store.offer(offer(0x1000, key).marked_ahead());
-        assert_eq!(store.ahead_bytes, 2 * bytes);
-        store.offer(offer(0x1010, key));
-        assert_eq!(store.ahead_bytes, bytes);
-        // Full of PEs' blocks, the store forgets its oldest for a PE's
-        // offer, never for speculation.
-        for pc in (0x1020..0x1060).step_by(8) {
-            store.offer(offer(pc, key));
-        }
-        let before = store.shared.len();
-        store.offer(offer(0x1060, key).marked_ahead());
-        assert!(store.shared.len() <= before);
-        assert!(!held(&store, 0x1060));
-        assert_eq!(
-            store.shared.values().filter(|entry| entry.ahead).count() * bytes,
-            store.ahead_bytes
-        );
-    }
-
-    #[test]
     fn a_shared_store_hands_offered_blocks_to_other_machines_and_forgets_the_oldest_when_full() {
         let translator = Digest::of(b"translator");
         let key = Digest::of(b"page");
@@ -2864,6 +2919,124 @@ mod tests {
         assert_eq!(error, Some(PackError::Truncated));
         assert_eq!(empty.record(&first), None);
         assert_eq!(empty.counters.absent, 1);
+    }
+
+    /// A merge that cannot keep every record of a rank keeps those the
+    /// boot used most, not the first in key order.
+    #[test]
+    fn a_merge_short_of_room_keeps_the_records_used_most() {
+        let translator = translator_id();
+        let pages: Vec<Digest> = (0u8..6).map(|page| Digest::of(&[page])).collect();
+        let mut store = Store::new(translator, None).0;
+        for (at, &key) in pages.iter().enumerate() {
+            store.offer(offer(0x1_0000_4008 + 0x4000 * at as u64, key));
+        }
+        let bytes = Delta::new(translator, store.take_added())
+            .finish()
+            .unwrap()
+            .to_vec();
+        let mut keys = pages.clone();
+        keys.sort();
+        let mut next = Store::new(translator, Some(&bytes)).0;
+        // The two last in key order are used most, the first once.
+        for (key, uses) in [(keys[5], 3), (keys[4], 2), (keys[0], 1)] {
+            for _ in 0..uses {
+                assert!(next.record(&key).is_some());
+            }
+        }
+        assert_eq!(next.uses().get(&keys[5]), Some(&3));
+        let record = next.segments()[0].get(&keys[0]).unwrap().len() as u64;
+        let bound = layout_bytes(2, 2 * record);
+        let merged = |by_use: bool| {
+            let segments = next.segments().iter().cloned().map(Segment::from).collect();
+            let merge = Merge::new(translator, segments, Vec::new(), bound);
+            let merge = if by_use {
+                merge.by_use(next.uses().clone())
+            } else {
+                merge
+            };
+            let bytes = merge.finish().layout.to_vec();
+            let pack = Pack::parse(&bytes, &translator).unwrap();
+            keys.iter()
+                .map(|key| pack.get(key).is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(merged(false), [true, true, false, false, false, false]);
+        assert_eq!(merged(true), [false, false, false, false, true, true]);
+    }
+
+    /// A pack's index keeps the most uses a boot made of each record, so a
+    /// boot short of room keeps what earlier sessions ran most before it
+    /// used them itself; a pack of the schema before loads, its records
+    /// unused.
+    #[test]
+    fn a_pack_counts_uses_across_boots_and_an_older_pack_loads() {
+        let translator = translator_id();
+        let pages: Vec<Digest> = (0u8..6).map(|page| Digest::of(&[page])).collect();
+        let mut store = Store::new(translator, None).0;
+        for (at, &key) in pages.iter().enumerate() {
+            store.offer(offer(0x1_0000_4008 + 0x4000 * at as u64, key));
+        }
+        let first = Delta::new(translator, store.take_added())
+            .finish()
+            .unwrap()
+            .to_vec();
+        let mut keys = pages.clone();
+        keys.sort();
+        // A boot uses the two last in key order, and merges in full.
+        let mut boot = Store::new(translator, Some(&first)).0;
+        for (key, uses) in [(keys[5], 3), (keys[4], 2)] {
+            for _ in 0..uses {
+                assert!(boot.record(&key).is_some());
+            }
+        }
+        let segments = boot.segments().iter().cloned().map(Segment::from).collect();
+        let counted = Merge::new(translator, segments, Vec::new(), u64::MAX)
+            .by_use(boot.uses().clone())
+            .finish()
+            .layout
+            .to_vec();
+        let record = boot.segments()[0].get(&keys[0]).unwrap().len() as u64;
+        let bound = layout_bytes(2, 2 * record);
+        let kept = |bytes: &[u8]| {
+            let pack = Pack::parse(bytes, &translator).unwrap();
+            keys.iter()
+                .map(|key| pack.get(key).is_some())
+                .collect::<Vec<_>>()
+        };
+        let merged = |store: &Store| {
+            let segments = store
+                .segments()
+                .iter()
+                .cloned()
+                .map(Segment::from)
+                .collect();
+            Merge::new(translator, segments, Vec::new(), bound)
+                .by_use(store.uses().clone())
+                .finish()
+                .layout
+                .to_vec()
+        };
+        // The next boot has used nothing yet: it keeps the two used most.
+        let (next, error) = Store::new(translator, Some(&counted));
+        assert_eq!(error, None);
+        assert_eq!(
+            kept(&merged(&next)),
+            [false, false, false, false, true, true]
+        );
+        // The same pack in the schema before: it loads, and with no uses
+        // counted the first in key order stay, as before.
+        let mut old = counted.clone();
+        old[MAGIC.len()..][..4].copy_from_slice(&SCHEMA.to_le_bytes());
+        let end = prefix_length(keys.len()) - CHECKSUM_BYTES;
+        let checksum = Sha256::digest(&old[..end]);
+        old[end..end + CHECKSUM_BYTES].copy_from_slice(&checksum);
+        let (older, error) = Store::new(translator, Some(&old));
+        assert_eq!(error, None);
+        assert_eq!(
+            kept(&merged(&older)),
+            [true, true, false, false, false, false]
+        );
     }
 
     /// A key several segments hold reads as their records merged, and a

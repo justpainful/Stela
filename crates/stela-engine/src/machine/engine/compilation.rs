@@ -16,18 +16,20 @@ fn shared_part(code: &board::Code, at: NativeCode) -> u8 {
 /// more than a few mean the ring is broken.
 const REDONE_INSTALLS: u32 = 64;
 
-/// Put `target`, block `index`'s entry for a fetch at `pc`, in slot `slot`
-/// of the block table, under the board's lock (`cache`), if the block is
-/// still the indexed one: a retirement or an IC IVAU takes a block out of
-/// the index and its entries out of the table in one hold, so an entry put
-/// in after would outlive its block. Whether the table took it.
+/// Put `target`, block `index`'s entry for a fetch at `pc`, in the block
+/// table, under the board's lock (`cache`), if the block is still the
+/// indexed one: a retirement or an IC IVAU takes a block out of the index
+/// and its entries out of the table in one hold, so an entry put in after
+/// would outlive its block. Its slot is the table's now, which a growth
+/// may have changed since the caller read it. Whether the table took it.
+/// `grace` is the caller's ([`Machine::grace`]), for [`grow_table`].
 fn insert_target(
     code: &board::Code,
     cache: &mut board::Cache,
     pc: u64,
     index: usize,
-    slot: usize,
     target: chain::LookupEntry,
+    grace: (&board::Grace, Option<usize>),
 ) -> bool {
     let block = &code.blocks[index];
     if cache
@@ -38,13 +40,40 @@ fn insert_target(
         cache.targets_raced += 1;
         return false;
     }
+    let slot = cache.targets.slot(pc, target.key);
     cache.targets.insert(slot, target);
     cache.targets_inserted += 1;
+    grow_table(cache, grace, code.blocks.live());
     true
+}
+
+/// A step of the block table's growth as the board's `live` blocks fill
+/// it (`chain::LookupTable::grow`), under the board's lock, or the release of
+/// the table a growth replaced once the grace since its publication
+/// passed: by then every PE inside its section passed its loop's top, and
+/// each PE refreshes its `ChainControl` from the published table before
+/// it runs native code ([`Machine::refresh_table`]), so no PE probes the
+/// old table and no engine read holds it. `grace` is the caller's: one
+/// that skips the caller refreshes at its next native run.
+pub(super) fn grow_table(
+    cache: &mut board::Cache,
+    (grace, skip): (&board::Grace, Option<usize>),
+    live: usize,
+) {
+    if let Some(snapshot) = &cache.table_retired {
+        if grace.passed(snapshot, skip) {
+            // SAFETY: the grace above.
+            unsafe { cache.targets.release_retired() };
+            cache.table_retired = None;
+        }
+    } else if cache.targets.grow(live) {
+        cache.table_retired = Some(grace.snapshot());
+    }
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn fetch_block(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
+        self.linked_at_install = None;
         let context = self.current_variant(single, false);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         let contexts = self.contexts(el, context);
@@ -353,11 +382,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         }
         let held_page = held.pc == page && held.key == context;
-        if !held_page {
+        // A leaf's other pages come back with the page whose take brought
+        // them (`refill_pages` takes its leaf's pages again), which the
+        // log holds: they would only lengthen it, and every TLBI of
+        // everything goes through it.
+        if !held_page && !matches!(taken, Taken::Leaf) {
             self.log_fill(page, context);
-            if shared && half == 0 {
-                self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
-            }
+        }
+        if !held_page && shared && half == 0 {
+            self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
         }
         match taken {
             Taken::Refill if !held_page => {
@@ -452,6 +485,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// An exit from another page links through a cell, which starts with
     /// the block table's entry of its target: the entry goes in first.
     fn remember_or_link(&mut self, pc: u64, index: usize) {
+        // The install's hold linked the exit that waited for it.
+        if self.linked_at_install.take() == Some(pc) {
+            return;
+        }
         let from_another_page = self.direct_exit.is_some_and(|(block, _, target, _)| {
             target == pc
                 && self
@@ -477,7 +514,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// entry: one it holds already, in either place of its set, stays where
     /// it is, and keeps its neighbour.
     pub(super) fn remember_target(&mut self, pc: u64, index: usize) -> bool {
-        let Some((slot, target)) = self.target_entry(pc, index) else {
+        let Some((_, target)) = self.target_entry(pc, index) else {
             return false;
         };
         let block = &self.code.blocks[index];
@@ -502,7 +539,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         }
         let mut cache = code.cache_at(board::LockSite::Target);
-        insert_target(code, &mut cache, pc, index, slot, target)
+        insert_target(code, &mut cache, pc, index, target, self.grace())
     }
 
     /// The block table slot and entry a fetch at `pc` of block `index`
@@ -541,7 +578,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// Remember that the ITLB took `page` in `context` ([`Self::fill_log`]).
-    fn log_fill(&mut self, page: u64, context: u64) {
+    pub(super) fn log_fill(&mut self, page: u64, context: u64) {
         if self.fill_log.len() < FILL_LOG {
             self.fill_log.push((page, context));
         } else {
@@ -558,23 +595,52 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.pending_refills.retain(|&(held, _), _| held != half);
         let spaces = &self.spaces[half];
         let other = &self.spaces[1 - half];
-        let pending = &mut self.pending_refills;
+        // Runs of the log share a context: each context is looked up once,
+        // its pages gathered by key (one live context has a key) and the
+        // lists merged after.
+        let mut seen: Vec<(u64, Fate)> = Vec::new();
+        let mut lists: Vec<(contexts::Key, Vec<u64>)> = Vec::new();
+        let mut last = None;
         // A context's fills are of its half's pages, and for the upper half
         // also of the lower half's global ones (`itlb_context`).
         self.fill_log.retain(|&(page, context)| {
-            if let Some(space) = spaces.live(context) {
-                let pages = pending.entry((half, space.key)).or_default();
-                if pages.len() < REFILLS_PER_CONTEXT {
-                    pages.push(page);
+            let fate = match last {
+                Some((number, fate)) if number == context => fate,
+                _ => {
+                    let fate = match seen.iter().find(|&&(number, _)| number == context) {
+                        Some(&(_, fate)) => fate,
+                        None => {
+                            let fate = match spaces.live(context) {
+                                Some(space) => {
+                                    lists.push((space.key, Vec::new()));
+                                    Fate::Refill(lists.len() - 1)
+                                }
+                                None => Fate::Other(other.live(context).is_some()),
+                            };
+                            seen.push((context, fate));
+                            fate
+                        }
+                    };
+                    last = Some((context, fate));
+                    fate
                 }
-                return false;
+            };
+            match fate {
+                Fate::Refill(list) => {
+                    let pages = &mut lists[list].1;
+                    if pages.len() < REFILLS_PER_CONTEXT {
+                        pages.push(page);
+                    }
+                    false
+                }
+                Fate::Other(live) => live || chain::half(page) != half,
             }
-            other.live(context).is_some() || chain::half(page) != half
         });
         self.fill_next = self.fill_log.len() % FILL_LOG;
-        for pages in self.pending_refills.values_mut() {
+        for (key, mut pages) in lists {
             pages.sort_unstable();
             pages.dedup();
+            self.pending_refills.insert((half, key), pages);
         }
     }
 
@@ -798,11 +864,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if !matches && let Some(translations) = self.host.translations() {
                     translations.note(super::StoreEvent::SharedRejected);
                 }
-                self.note_ahead(&compiled, matches);
                 if matches {
                     self.statistics.shared += 1;
                     self.count_store_source(StoreSource::Shared);
                     self.statistics.shared_ticks += self.host.counter().wrapping_sub(looking);
+                    // Prepared ahead by a waiting PE: the first install
+                    // offers it, so the pack keeps blocks that ran.
+                    if compiled.ahead() {
+                        let level = usize::from(self.cpu.pstate.el != 0);
+                        self.statistics.ahead_installs[level] += 1;
+                        let quiet = self.cpu.pstate.el == 0;
+                        let elsewhere = self.elsewhere(page, compiled.successors());
+                        if let Some(translations) = self.host.translations() {
+                            translations.offer(compiled.offer(quiet, elsewhere));
+                        }
+                    }
                     return self
                         .install(
                             pc,
@@ -909,6 +985,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         self.statistics.compiled += 1;
         self.statistics.self_loops += u64::from(compiled.self_loop);
+        self.statistics.regions += u64::from(compiled.region);
         self.count_store_source(if stored.is_some() {
             StoreSource::Compiled
         } else {
@@ -935,43 +1012,32 @@ impl<H: Host, D: Devices> Machine<H, D> {
             );
             self.code.rebases.keep(key, offset as u16, context, entry);
         }
-        // Its successors in this page, compiled on processors that run no
-        // PE while this one runs it ([`super::ahead`]).
-        if let (Some((key, record)), Some(_)) = (&stored, &context)
-            && !successors.is_empty()
-        {
-            self.translate_ahead(
-                pc,
-                physical,
-                *key,
-                record.as_deref(),
-                &emission.preparation,
-                &successors,
-            );
-        }
         // A store keeps an offer's stored form within its own bound, and its
         // pack writer sheds offers before the heap runs short (writer
         // `govern`): memory low, as the heap rests once
         // the engine's caches have grown, still keeps it, or the pack would
         // miss every block compiled after that. The other PEs take the block
         // either way.
-        if let (Some((key, _)), Some(context)) = (stored, context)
-            && let low = self.host.memory_low()
-            && let Some(translations) = self.host.translations()
-        {
-            let offer = Offer {
-                key,
-                page,
-                pc,
-                context,
-                emission: emission.clone(),
-                successors,
-                quiet: self.cpu.pstate.el == 0,
-                ahead: false,
-            };
-            translations.offer(offer);
-            self.statistics.offered += 1;
-            self.statistics.offered_low += u64::from(low);
+        if let (Some((key, _)), Some(context)) = (stored, context) {
+            let elsewhere = self.elsewhere(page, &successors);
+            let low = self.host.memory_low();
+            if let Some(translations) = self.host.translations() {
+                let offer = Offer {
+                    key,
+                    page,
+                    pc,
+                    context,
+                    emission: emission.clone(),
+                    successors,
+                    elsewhere,
+                    quiet: self.cpu.pstate.el == 0,
+                    frame: physical & !(FETCH_PAGE - 1),
+                    depth: 0,
+                };
+                translations.offer(offer);
+                self.statistics.offered += 1;
+                self.statistics.offered_low += u64::from(low);
+            }
         }
         self.install(
             pc,
@@ -981,6 +1047,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
             recovery::Template::compiled(emission),
         )
         .map(Some)
+    }
+
+    /// The static successors of a block of the fetch page at `page` that lie
+    /// in other pages, each with the frame of its page where this PE's
+    /// fetch cache holds a walk of it for the current EL, else 0, for
+    /// translation ahead ([`Offer::elsewhere`]). A page with device sites
+    /// is left out: the store neither gives nor takes its blocks.
+    fn elsewhere(&self, page: u64, successors: &[u64]) -> Vec<(u64, u64)> {
+        successors
+            .iter()
+            .copied()
+            .filter(|&target| target & !(FETCH_PAGE - 1) != page)
+            .filter_map(|target| match self.cached_fetch(target) {
+                None => Some((target, 0)),
+                Some(entry) if self.page_has_device_sites(entry.physical) => None,
+                Some(entry) => Some((target, entry.physical & !(FETCH_PAGE - 1))),
+            })
+            .collect()
     }
 
     /// Count an install from `source` at the PE's level: EL0, or above.
@@ -1194,7 +1278,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             })
         }));
         // RET, BR and BLR end the code with their exit to the target in
-        // RAX; the PAC thunk of a RETA*, BRA* or BLRA* has one too. Only
+        // RAX, and so do RETA*, BRA* and BLRA* authenticated in line; the
+        // PAC thunk of one that ends with its PAC exit has one too. Only
         // side exits follow a terminal's, and of the direct exits only a
         // terminal that has one precedes them: what a thunk completes has
         // none, whatever a side exit just before it leaves unrun.
@@ -1205,7 +1290,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .unwrap_or(chain::without_failures(code_bytes).len());
         let code_bytes = &code_bytes[..terminal_end];
         let mut dynamic_site = (!single
-            && terminal & 0xff9f_fc1f == 0xd61f_0000
             && dynamic_branch(terminal).is_some_and(|(kind, _)| {
                 let exit = code_bytes.len().saturating_sub(chain::DYNAMIC_EXIT_BYTES);
                 chain::is_dynamic_exit(&code_bytes[exit..], kind)
@@ -1327,18 +1411,33 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // Only indexed blocks are reached, which eviction relies on.
             self.detach(&mut cache, &[replaced as u32]);
         }
-        // The fetch that compiled the block would take the lock again for
-        // its block table entry right after; it takes it in this hold,
-        // unless a direct exit waits to link it instead
-        // ([`Self::remember_or_link`]).
-        if self.publishing_target == Some(pc)
-            && !self
+        // The fetch that compiled the block would take the lock again right
+        // after, to link the direct exit of its page that waits for it or
+        // else for its block table entry ([`Self::remember_or_link`]): it
+        // does either in this hold.
+        if self.publishing_target == Some(pc) {
+            let waiting = self.direct_exit.filter(|&(block, incarnation, target, _)| {
+                target == pc
+                    && shared.blocks.record(block).incarnation() == incarnation
+                    && shared
+                        .blocks
+                        .installed(block)
+                        .is_some_and(|block| (block.pc ^ pc) & !(FETCH_PAGE - 1) == 0)
+            });
+            let linked = waiting.is_some_and(|(block, _, _, word)| {
+                self.direct_exit = None;
+                self.link_held(&shared, &mut cache, block, pc, word)
+            });
+            if linked {
+                self.linked_at_install = Some(pc);
+            } else if !self
                 .direct_exit
                 .is_some_and(|(_, _, target, _)| target == pc)
-            && let Some((at, target)) = self.target_entry(pc, slot)
-            && shared.blocks.record(slot).remember()
-        {
-            insert_target(&shared, &mut cache, pc, slot, at, target);
+                && let Some((_, target)) = self.target_entry(pc, slot)
+                && shared.blocks.record(slot).remember()
+            {
+                insert_target(&shared, &mut cache, pc, slot, target, self.grace());
+            }
         }
         drop(cache);
         self.mirrors.close_code_page();
@@ -1370,9 +1469,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             spans.push((exit.offset as u32, end as u32, Exit));
             terminal_end = terminal_end.min(start);
         }
-        // RET, BR and BLR end their terminal with an exit to RAX.
+        // RET, BR and BLR end their terminal with an exit to RAX; a block
+        // whose exits are not linked ends with its direct exit.
         if let Some(start) = terminal_end.checked_sub(chain::DYNAMIC_EXIT_BYTES)
             && chain::is_dynamic_exit_of_any_kind(&bytes[start..terminal_end])
+        {
+            spans.push((start as u32, terminal_end as u32, Exit));
+        } else if let Some(start) = terminal_end.checked_sub(chain::DIRECT_EXIT_BYTES)
+            && chain::is_direct_exit_of_any_kind(&bytes[start..terminal_end])
         {
             spans.push((start as u32, terminal_end as u32, Exit));
         }
@@ -1460,12 +1564,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let window = 10 * self.profile.counter_frequency;
         let shared = self.code_hub.is_some();
         let census = if shared {
-            &mut cache.census
+            cache
+                .census
+                .get_or_insert_with(|| Box::new(install_census::Census::board()))
         } else {
-            &mut self.census
+            self.census
+                .get_or_insert_with(|| Box::new(install_census::Census::new()))
+        };
+        let (thrash, first, age) = census.installed(identity, now, window);
+        if let Some(age) = age {
+            let second = self.profile.counter_frequency;
+            let bucket = [second, 10 * second, 60 * second]
+                .iter()
+                .position(|&bound| age <= bound)
+                .unwrap_or(3);
+            self.install_causes.reinstall_ages[bucket] += 1;
         }
-        .get_or_insert_with(|| Box::new(install_census::Census::new()));
-        let (thrash, first) = census.installed(identity, now, window);
         let elsewhere = !shared
             && self
                 .parallel
@@ -1497,6 +1611,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some(census) = census else {
             return;
         };
+        let fetches = self.code.blocks.record(index).fetches();
+        self.install_causes.departed[fetches.min(2)] += 1;
         let block = &self.code.blocks[index];
         let variant = &self.variants[block.variant.0 as usize];
         let identity = install_census::identity(block.pc, block.physical, variant);
@@ -2187,6 +2303,15 @@ const LEAF_FILL: u64 = 1 << 14;
 /// more one exit at a time (run 20261115-112116, beat 40: 880 such TLBIs
 /// per PE, `refilled` 427-495 K, `context` misses 430-566 K).
 const REFILLS_PER_CONTEXT: usize = 2048;
+
+/// What [`Machine::refill_after`] does with a context's fills: gather the
+/// pages in the list at this index, or keep the log's entries when the
+/// other half holds the context live or the page is not of the half.
+#[derive(Clone, Copy)]
+enum Fate {
+    Refill(usize),
+    Other(bool),
+}
 /// The contexts whose pages TLBIs by VA dropped that a PE keeps for refill
 /// ([`Machine::keep_dropped`]).
 const DROPPED_CONTEXTS: usize = 64;

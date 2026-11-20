@@ -1,190 +1,296 @@
 use super::super::stored::tests::MemoryStore;
 use super::super::tests::{BASE, machine};
-use super::super::{Fetched, StoreEvent};
+use super::super::{Fetched, Host};
 use super::*;
-use crate::machine::test_preparation;
+use alloc::vec::Vec;
 
-/// `cbz x0, #8; add x0, x0, #1; svc #0`: the first block ends at the CBZ,
-/// whose successors are the ADD and the SVC, both in its page.
-const WORDS: [u32; 3] = [0xb400_0040, 0x9100_0400, 0xd400_0001];
+/// `cbz x0, +12; add x1, x1, #1; add x2, x2, #2; add x3, x3, #3; svc #0`:
+/// one block, whose side exit leaves for the third ADD.
+const WORDS: [u32; 5] = [
+    0xb400_0060,
+    0x9100_0421,
+    0x9100_0842,
+    0x9100_0c63,
+    0xd400_0001,
+];
 
-fn job(pc: u64) -> AheadJob {
-    let preparation = Arc::new(test_preparation());
-    let page = pc & !(FETCH_PAGE - 1);
-    let mut bytes = [0u8; PAGE_BYTES];
-    bytes[..4].copy_from_slice(&0xd65f_03c0u32.to_le_bytes());
-    let context = preparation.context(page);
-    AheadJob::new(
-        Digest([7; 32]),
-        page,
-        pc,
-        context,
-        Arc::new(bytes),
-        preparation,
-    )
-    .unwrap()
+/// The offer the fetch of `pc` makes in a machine with a store.
+fn fetched_offer(pc: u64) -> Offer {
+    offers(&WORDS, &[pc]).pop().unwrap()
 }
 
-#[test]
-fn the_queue_is_bounded_dedupes_what_it_holds_and_never_waits() {
-    let queue = AheadQueue::<2>::new();
-    let [first, second, third] = [0x4000, 0x4004, 0x4008].map(job);
-    assert_eq!(queue.push(first.clone()), Pushed::Queued);
-    assert_eq!(queue.push(first.clone()), Pushed::Repeated);
-    assert_eq!(queue.push(second.clone()), Pushed::Queued);
-    assert_eq!(queue.push(third.clone()), Pushed::Dropped, "full");
-    // A worker holding the queue makes a PE drop, not wait.
-    queue.held.store(true, Ordering::Relaxed);
-    assert_eq!(queue.push(third.clone()), Pushed::Dropped);
-    queue.held.store(false, Ordering::Relaxed);
-    let taken = queue.take().unwrap();
-    assert_eq!(taken.pc(), first.pc());
-    // Taken but not finished: still being translated.
-    assert_eq!(queue.push(first.clone()), Pushed::Repeated);
-    queue.finish(&taken);
-    assert_eq!(queue.push(first.clone()), Pushed::Queued);
-    assert_eq!(queue.take().unwrap().pc(), second.pc());
-    assert_eq!(queue.take().unwrap().pc(), first.pc());
-    assert!(queue.take().is_none() && !queue.pending());
-    let counts = queue.counts();
-    assert_eq!((counts.queued, counts.repeated, counts.dropped), (3, 2, 2));
-    // Neither another page's PC nor another context makes a job.
-    let model = job(0x4000);
-    assert!(
-        AheadJob::new(
-            model.key,
-            model.page,
-            model.page + FETCH_PAGE,
-            model.context,
-            model.bytes.clone(),
-            model.preparation.clone()
-        )
-        .is_none()
-    );
-    assert!(
-        AheadJob::new(
-            model.key,
-            model.page,
-            model.pc,
-            Digest([1; 32]),
-            model.bytes.clone(),
-            model.preparation.clone()
-        )
-        .is_none()
-    );
-}
-
-/// The successors a PE hands on, translated ahead, are the blocks it would
-/// compile, and its fetch of one installs it instead of compiling it.
-#[test]
-fn a_successor_translated_ahead_is_the_pes_block_and_saves_its_compile() {
-    let mut first = machine(&WORDS);
-    first.host.store = Some(MemoryStore {
-        ahead: Some(Vec::new()),
-        ..MemoryStore::default()
-    });
-    assert!(matches!(
-        first.fetch_block(BASE, false),
-        Ok(Fetched::Block(_))
-    ));
-    let jobs = first.host.store.as_mut().unwrap().ahead.take().unwrap();
-    let mut pcs: Vec<u64> = jobs.iter().map(AheadJob::pc).collect();
-    pcs.sort_unstable();
-    // The ADD runs inside the CBZ's block, which runs past a forward
-    // conditional branch: this PE's table holds it, so only the SVC goes.
-    assert_eq!(pcs, [BASE + 8]);
-    let job = jobs.iter().find(|job| job.pc() == BASE + 8).unwrap();
-    let ahead = job.translate().unwrap();
-    assert!(ahead.ahead());
-
-    // The block a PE compiles there itself.
-    let mut compiler = machine(&WORDS);
-    compiler.host.store = Some(MemoryStore::default());
-    assert!(matches!(
-        compiler.fetch_block(BASE + 8, false),
-        Ok(Fetched::Block(_))
-    ));
-    let compiled = compiler.host.store.as_mut().unwrap().offers.pop().unwrap();
-    assert_eq!(
-        (ahead.key(), ahead.pc(), ahead.context()),
-        (compiled.key(), compiled.pc(), compiled.context())
-    );
-    assert_eq!(ahead.input(), compiled.input());
-    assert_eq!(
-        ahead.block().native.x86_64_code,
-        compiled.block().native.x86_64_code
-    );
-
-    // Shared, it is installed, and only its first install is a hit.
-    let shared = ahead.clone().shared();
-    for (install, hits) in [(0, 1), (1, 1)] {
-        let mut store = MemoryStore::default();
-        store
-            .prepared
-            .insert((ahead.key(), ahead.pc(), ahead.context()), shared.clone());
-        let mut receiver = machine(&WORDS);
-        receiver.host.store = Some(store);
+/// The offers the fetches of `pcs`, in order, make in a machine running
+/// `words` with a store.
+fn offers(words: &[u32], pcs: &[u64]) -> Vec<Offer> {
+    let mut fetching = machine(words);
+    fetching.host.store = Some(MemoryStore::default());
+    for &pc in pcs {
         assert!(matches!(
-            receiver.fetch_block(BASE + 8, false),
+            fetching.fetch_block(pc, false),
             Ok(Fetched::Block(_))
         ));
-        assert_eq!(
-            (receiver.statistics.shared, receiver.statistics.compiled),
-            (1, 0),
-            "install {install}"
-        );
-        let store = receiver.host.store.as_ref().unwrap();
-        assert_eq!(store.used_ahead, if install == 0 { hits } else { 0 });
+    }
+    let store = fetching.host.store.as_mut().unwrap();
+    assert_eq!(store.offers.len(), pcs.len());
+    core::mem::take(&mut store.offers)
+}
+
+/// `cbz x0, BASE + 0x1000; svc #0`, NOPs to the next page and `svc #0`
+/// there: a block whose side exit leaves for another page.
+fn two_pages() -> Vec<u32> {
+    let mut words = alloc::vec![0xd503_201f; 0x1000 / 4 + 1];
+    words[0] = 0xb400_0000 | (0x1000 / 4) << 5;
+    words[1] = 0xd400_0001;
+    words[0x1000 / 4] = 0xd400_0001;
+    words
+}
+
+/// The page at `at`, as a machine running `words` holds it.
+fn page_of(words: &[u32], at: u64) -> Box<[u8; PAGE_BYTES]> {
+    let mut reader = machine(words);
+    let mut page = Box::new([0u8; PAGE_BYTES]);
+    assert!(reader.host.read_ram(at, page.as_mut_slice()));
+    page
+}
+
+/// The page holding `BASE`, as the test machine's RAM holds it.
+fn page() -> Box<[u8; PAGE_BYTES]> {
+    let mut reader = machine(&WORDS);
+    let mut page = Box::new([0u8; PAGE_BYTES]);
+    assert!(
+        reader
+            .host
+            .read_ram(BASE & !(FETCH_PAGE - 1), page.as_mut_slice())
+    );
+    page
+}
+
+#[test]
+fn a_fetched_block_names_its_successors_in_its_page_as_jobs() {
+    let offer = fetched_offer(BASE);
+    let mut targets: Vec<u64> = offer.ahead_jobs().map(|job| job.pc()).collect();
+    targets.sort_unstable();
+    assert_eq!(targets, [BASE + 12]);
+    for job in offer.ahead_jobs() {
+        assert_eq!(job.key(), Some(&offer.key()));
+        assert_eq!(job.context(), &offer.context());
+        assert_eq!(job.frame(), BASE & !(FETCH_PAGE - 1));
     }
 }
 
-/// A block translated ahead from a page the guest wrote since is refused
-/// at its install, counted stale, and compiled anew.
 #[test]
-fn a_block_translated_ahead_from_a_page_written_since_is_refused() {
-    let mut first = machine(&WORDS);
-    first.host.store = Some(MemoryStore {
-        ahead: Some(Vec::new()),
-        ..MemoryStore::default()
-    });
-    assert!(matches!(
-        first.fetch_block(BASE, false),
-        Ok(Fetched::Block(_))
-    ));
-    let jobs = first.host.store.as_mut().unwrap().ahead.take().unwrap();
-    let job = jobs.iter().find(|job| job.pc() == BASE + 8).unwrap();
-    let ahead = job.translate().unwrap().shared();
+fn a_block_prepared_ahead_is_the_block_a_fetch_compiles() {
+    let offer = fetched_offer(BASE);
+    let page = page();
+    for job in offer.ahead_jobs() {
+        assert!(page_matches(&job, &page));
+        let prepared = prepare(&job, offer.key(), &page).expect("a block");
+        assert!(prepared.ahead());
+        assert_eq!(prepared.pc(), job.pc());
+        // The same PC fetched in a machine of its own compiles it.
+        let compiled = fetched_offer(job.pc());
+        assert!(!compiled.ahead());
+        assert_eq!(prepared.input(), compiled.input());
+        assert_eq!(prepared.context(), compiled.context());
+        assert_eq!(
+            prepared.block().native.x86_64_code,
+            compiled.block().native.x86_64_code
+        );
+        assert_eq!(
+            prepared.block().native.source_map,
+            compiled.block().native.source_map
+        );
+        assert_eq!(prepared.successors(), compiled.successors());
+    }
+}
 
-    // The ADD became a SUB: the page has another key, whose lookup the
-    // store answers with the old block, as a colliding index would.
-    let written = [WORDS[0], 0xd100_0400, WORDS[2]];
-    let mut probe = machine(&written);
-    probe.host.store = Some(MemoryStore::default());
-    assert!(matches!(
-        probe.fetch_block(BASE + 8, false),
-        Ok(Fetched::Block(_))
-    ));
-    let now = probe.host.store.as_mut().unwrap().offers.pop().unwrap();
-    assert_ne!(now.key(), ahead.offer().key());
+#[test]
+fn a_fetch_installs_a_block_prepared_ahead_and_offers_it_for_the_pack_once() {
+    let offer = fetched_offer(BASE);
+    let page = page();
+    let job = offer
+        .ahead_jobs()
+        .find(|job| job.pc() == BASE + 12)
+        .expect("the CBZ's target");
+    let prepared = prepare(&job, offer.key(), &page).expect("a block");
+    let code = prepared.block().native.x86_64_code.clone();
+    let successors = prepared.successors().to_vec();
     let mut store = MemoryStore::default();
-    store
-        .prepared
-        .insert((now.key(), now.pc(), now.context()), ahead);
-    let mut receiver = machine(&written);
+    store.prepared.insert(
+        (prepared.key(), prepared.pc(), prepared.context()),
+        prepared.shared(),
+    );
+    let mut receiver = machine(&WORDS);
     receiver.host.store = Some(store);
     assert!(matches!(
-        receiver.fetch_block(BASE + 8, false),
+        receiver.fetch_block(BASE + 12, false),
         Ok(Fetched::Block(_))
     ));
+    let level = usize::from(receiver.cpu.pstate.el != 0);
     assert_eq!(
         (receiver.statistics.shared, receiver.statistics.compiled),
-        (0, 1)
+        (1, 0)
     );
-    let store = receiver.host.store.as_ref().unwrap();
-    assert!(store.events.contains(&StoreEvent::AheadStale));
-    assert_eq!(store.used_ahead, 0);
+    assert_eq!(receiver.statistics.ahead_installs[level], 1);
+    assert_eq!(receiver.host.installed.first(), Some(&code));
+    // Offered once, as a block that ran, whose successors are jobs as a
+    // fetched block's are.
+    let store = receiver.host.store.as_mut().unwrap();
+    assert_eq!(store.offers.len(), 1);
+    let kept = &store.offers[0];
+    assert!(!kept.ahead());
+    assert_eq!(kept.pc(), BASE + 12);
+    assert_eq!(kept.successors(), successors);
+    let in_page = successors
+        .iter()
+        .filter(|&&pc| pc != BASE + 12 && pc & !(FETCH_PAGE - 1) == BASE & !(FETCH_PAGE - 1))
+        .count();
+    assert_eq!(kept.ahead_jobs().count(), in_page);
+    assert!(kept.entry().is_some());
+}
+
+#[test]
+fn a_frame_that_changed_is_stale() {
+    let offer = fetched_offer(BASE);
+    let mut page = page();
+    let job = offer.ahead_jobs().next().expect("a job");
+    page[(job.pc() - BASE) as usize] ^= 1;
+    assert!(!page_matches(&job, &page));
+}
+
+#[test]
+fn jobs_stop_at_the_depth_bound() {
+    let offer = fetched_offer(BASE);
+    let page = page();
+    let mut job = offer
+        .ahead_jobs()
+        .find(|job| job.pc() == BASE + 12)
+        .expect("the side exit's target");
+    // Every depth to the bound, by hand.
+    for depth in 1..=DEPTH {
+        job.depth = depth;
+        let prepared = prepare(&job, offer.key(), &page).expect("a block");
+        let successors = prepared
+            .successors()
+            .iter()
+            .filter(|&&pc| pc != job.pc())
+            .count();
+        let jobs = prepared.ahead_jobs().count();
+        if depth < DEPTH {
+            assert_eq!(jobs, successors);
+        } else {
+            assert_eq!(jobs, 0);
+        }
+    }
+}
+
+#[test]
+fn a_queue_hands_out_the_newest_job_skips_repeats_and_drops_the_oldest() {
+    let offer = fetched_offer(BASE);
+    let template = offer.ahead_jobs().next().expect("a job");
+    let job = |pc: u64| Job {
+        pc,
+        ..template.clone()
+    };
+    let mut queue = Queue::new();
+    queue.push(job(BASE + 4));
+    queue.push(job(BASE + 8));
+    queue.push(job(BASE + 8));
+    assert_eq!(queue.counts().queued, 2);
+    assert_eq!(queue.counts().repeated, 1);
+    assert_eq!(queue.pop().map(|job| job.pc()), Some(BASE + 8));
+    assert_eq!(queue.pop().map(|job| job.pc()), Some(BASE + 4));
+    assert!(queue.pop().is_none());
+    for index in 0..CAPACITY as u64 + 3 {
+        queue.push(job(BASE + 0x10_0000 + index * 4));
+    }
+    assert_eq!(queue.len(), CAPACITY);
+    assert_eq!(queue.counts().dropped, 3);
     assert_eq!(
-        store.offers.last().unwrap().block().native.x86_64_code,
-        now.block().native.x86_64_code
+        queue.pop().map(|job| job.pc()),
+        Some(BASE + 0x10_0000 + (CAPACITY as u64 + 2) * 4)
     );
+}
+
+#[test]
+fn a_fetched_block_names_its_targets_in_other_pages_whose_walk_its_pe_holds() {
+    let words = two_pages();
+    let elsewhere = BASE + 0x1000;
+    // The other page fetched first: its walk is in the fetch cache.
+    let mut walked = offers(&words, &[elsewhere, BASE]);
+    let offer = walked.pop().unwrap();
+    assert_eq!(offer.elsewhere, [(elsewhere, elsewhere)]);
+    let jobs: Vec<Job> = offer.elsewhere_jobs().collect();
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[0];
+    assert_eq!(
+        (job.key(), job.pc(), job.frame()),
+        (None, elsewhere, elsewhere)
+    );
+    assert_eq!(job.context(), &offer.preparation().context(elsewhere));
+    // Prepared from the bytes its frame holds, under their key, it is the
+    // block a fetch of that page compiles.
+    let page = page_of(&words, elsewhere);
+    assert!(page_matches(job, &page));
+    let prepared = prepare(job, Digest::of(page.as_slice()), &page).expect("a block");
+    let compiled = walked.pop().unwrap();
+    assert_eq!(prepared.key(), compiled.key());
+    assert_eq!(prepared.context(), compiled.context());
+    assert_eq!(prepared.input(), compiled.input());
+    assert_eq!(
+        prepared.block().native.x86_64_code,
+        compiled.block().native.x86_64_code
+    );
+    // Without the walk, the target is counted and left out.
+    let unwalked = fetched_offer_of(&words, BASE);
+    assert_eq!(unwalked.elsewhere, [(elsewhere, 0)]);
+    assert_eq!(unwalked.elsewhere_jobs().count(), 0);
+    let mut queue = Queue::new();
+    queue.offered(&unwalked);
+    assert_eq!((queue.counts().elsewhere, queue.counts().unwalked), (0, 1));
+    queue.offered(&offer);
+    assert_eq!((queue.counts().elsewhere, queue.counts().unwalked), (1, 1));
+}
+
+fn fetched_offer_of(words: &[u32], pc: u64) -> Offer {
+    offers(words, &[pc]).pop().unwrap()
+}
+
+#[test]
+fn jobs_in_other_pages_wait_behind_those_in_their_naming_blocks_page() {
+    let offer = fetched_offer(BASE);
+    let template = offer.ahead_jobs().next().expect("a job");
+    let mut queue = Queue::new();
+    queue.push(Job {
+        key: None,
+        pc: BASE + 0x2000,
+        ..template.clone()
+    });
+    queue.push(Job {
+        pc: BASE + 4,
+        ..template.clone()
+    });
+    queue.push(Job {
+        key: None,
+        pc: BASE + 0x3000,
+        ..template.clone()
+    });
+    let order: Vec<u64> = core::iter::from_fn(|| queue.pop().map(|job| job.pc())).collect();
+    assert_eq!(order, [BASE + 4, BASE + 0x3000, BASE + 0x2000]);
+    assert_eq!(queue.counts().elsewhere, 2);
+    // Each lane drops its own oldest.
+    for index in 0..ELSEWHERE_CAPACITY as u64 + 2 {
+        queue.push(Job {
+            key: None,
+            pc: BASE + 0x10_0000 + index * 4,
+            ..template.clone()
+        });
+    }
+    queue.push(Job {
+        pc: BASE + 8,
+        ..template.clone()
+    });
+    assert_eq!(queue.len(), ELSEWHERE_CAPACITY + 1);
+    assert_eq!(queue.counts().dropped, 2);
+    assert_eq!(queue.pop().map(|job| job.pc()), Some(BASE + 8));
 }

@@ -148,6 +148,12 @@ pub trait Entries {
     fn shed(&mut self, shed: bool);
     /// The bytes of the entries added since the last take.
     fn added_bytes(&mut self) -> u64;
+    /// This boot's uses of each page key so far: records handed out and
+    /// blocks offered. A full merge keeps the most used of the records it
+    /// cannot keep all of.
+    fn uses(&mut self) -> BTreeMap<Digest, u32> {
+        BTreeMap::new()
+    }
 }
 
 /// Why the store sheds new entries.
@@ -536,7 +542,17 @@ impl<'a> Writer<'a> {
         };
         let heap_eased = heap
             .is_none_or(|Heap { total, room }| room >= total / SHED_SHARE + total / RELEASE_SHARE);
-        self.pack_full = reason == Some(ShedReason::Pack);
+        // The pack stays full from reaching its share until it falls a
+        // sixteenth of the limit under it, as long as the store sheds for
+        // it: a merge of the boot's segments that takes it just under its
+        // share frees no room, and a refill (`refill_due`) must still run.
+        // Run 20261119-052839 shed with its pack at 550 of 566 MB and kept
+        // nothing new for the rest of the boot.
+        self.pack_full = match reason {
+            Some(ShedReason::Pack) => true,
+            Some(ShedReason::Heap) => false,
+            None => self.pack_full && pack >= left.saturating_sub(self.limit / 16),
+        };
         let keep = reason.is_none() && heap_eased && pack < left.saturating_sub(self.limit / 16);
         if let Some(reason) = reason
             && !self.shedding
@@ -723,9 +739,13 @@ impl<'a> Writer<'a> {
     /// Whether a full merge is due to make room for new records, the pack
     /// having reached its share: while the file holds records of earlier
     /// boots, every segment was read, translation does not press, and the
-    /// boot has refills left.
+    /// boot has refills left; and not before the boot's first segment came
+    /// due, when it has used too little of its pack to say which records
+    /// to keep (run 20261119-021855 refilled before sign-in and left out
+    /// 12 320 of the 28 267 records it read).
     fn refill_due(&self) -> bool {
         self.pack_full
+            && self.settled
             && self.read_bytes != 0
             && self.refills != 0
             && !self.partial
@@ -792,7 +812,8 @@ impl<'a> Writer<'a> {
             let bound = self.kept_bytes().min(share).min(self.free());
             let protect = UsedKeys::parse(&self.used_list(entries.found_keys()), &self.translator);
             let segments = core::mem::take(&mut self.segments);
-            let mut merge = Merge::new(self.translator, segments, self.used.clone(), bound);
+            let mut merge = Merge::new(self.translator, segments, self.used.clone(), bound)
+                .by_use(entries.uses());
             if let Some(protect) = protect {
                 merge = merge.protect(protect);
             }

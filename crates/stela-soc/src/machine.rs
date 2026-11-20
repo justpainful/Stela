@@ -1802,9 +1802,8 @@ impl AppleDevices {
                 .filter(|asc| asc.execution_enabled())
                 .and_then(Asc::firmware_mut::<dcp::Coprocessor>)
                 .is_some_and(|coprocessor| {
-                    // A compose that ended, or whose frame the host GPU
-                    // finished, finishes its present first.
-                    finished = coprocessor.finish_compose(now);
+                    // A compose that ended finishes its present first.
+                    finished = coprocessor.finish_compose();
                     coprocessor.refresh(now);
                     coprocessor.frame_ready(now)
                 });

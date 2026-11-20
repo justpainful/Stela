@@ -20,7 +20,9 @@ const TURNOVER: u64 = 20;
 
 /// Live bytes by size class, 16 B doubling to 4 KiB (`classes=` in the
 /// log's `HEAP` line at its busiest beat), in MiB.
-const CLASS_MIB: [usize; CLASSES] = [24, 109, 100, 201, 415, 250, 260, 96, 129];
+/// The log's power-of-two classes, 16 B doubling to 4 KiB.
+const LOG_CLASSES: usize = 9;
+const CLASS_MIB: [usize; LOG_CLASSES] = [24, 109, 100, 201, 415, 250, 260, 96, 129];
 /// Live free-list blocks by bucket, 4 KiB doubling (`4K:39736/105M`...):
 /// count and MiB.
 const BUCKETS: [(usize, usize); LARGE_BUCKETS] = [
@@ -60,7 +62,7 @@ impl Random {
 
 /// A request of size class `class`.
 fn class_size(random: &mut Random, class: usize) -> usize {
-    let top = SMALLEST << class;
+    let top = 16 << class;
     let bottom = if class == 0 { 1 } else { top / 2 + 1 };
     bottom + random.below(top - bottom + 1)
 }
@@ -120,10 +122,10 @@ impl Replay<'_> {
     /// A small block's size: by the classes' live blocks.
     fn small_size(&mut self) -> usize {
         let counts = CLASS_MIB.map(|mib| mib << 10);
-        let blocks = |class: usize| counts[class] / (SMALLEST << class);
-        let total: usize = (0..CLASSES).map(blocks).sum();
+        let blocks = |class: usize| counts[class] / (16 << class);
+        let total: usize = (0..LOG_CLASSES).map(blocks).sum();
         let mut pick = self.random.below(total);
-        let class = (0..CLASSES)
+        let class = (0..LOG_CLASSES)
             .position(|class| {
                 if pick < blocks(class) {
                     true
@@ -158,7 +160,7 @@ impl Replay<'_> {
             let mut bytes = (mib << 20) / SCALE * LONG_PERCENT / 100;
             while bytes > 0 {
                 // The log counts a block by its class.
-                bytes = bytes.saturating_sub(SMALLEST << class);
+                bytes = bytes.saturating_sub(16 << class);
                 wanted.push(class_size(&mut self.random, class));
             }
         }

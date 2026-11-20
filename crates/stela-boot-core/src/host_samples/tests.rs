@@ -148,7 +148,9 @@ fn samples_outside_native_code_go_to_their_phase() {
         EXIT_OTHER
     );
     assert_eq!(charged(OUTSIDE, None, None), HOST);
-    assert!(native(NATIVE_OTHER) && !native(GLUE) && !native(HOST));
+    assert!(native(NATIVE_OTHER) && !native(GLUE) && !native(HOST) && !native(IDLE));
+    // Idle samples never wait for a charge.
+    assert!(IDLE >= PENDING && class_name(IDLE, &NAMES) == "idle");
     // Every class has its own name.
     let mut names: Vec<String> = (0..CLASSES)
         .map(|class| class_name(class, &NAMES))
@@ -176,6 +178,9 @@ fn lines_show_shares_of_instructions_then_cycles() {
         " ins=0M cyc=0M nat_ins=0M nat_cyc=0M native=95.0/90.0 inline=75.0/60.0 \
          pac-call=20.0/30.0 fetch=0.1/0.0 x:e=4.9/10.0"
     );
+    // A waiting PE's polls are `idle`, after every other class.
+    counts[IDLE] = [0, 1000];
+    assert!(shares(&counts, &NAMES).ends_with(" x:e=2.4/10.0 idle=50.0/0.0"));
     assert_eq!(
         shares(&[[0; SAMPLED]; CLASSES], &NAMES),
         " ins=0M cyc=0M nat_ins=0M nat_cyc=0M native=0.0/0.0"

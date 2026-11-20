@@ -58,8 +58,8 @@ pub mod guest_session;
 pub mod guest_timeouts;
 pub mod handoff_records;
 pub mod heap;
-#[cfg(target_arch = "x86_64")]
 pub mod host_audio;
+#[cfg(target_arch = "x86_64")]
 pub mod host_clock;
 pub mod host_identity;
 pub mod host_memory;
@@ -114,6 +114,7 @@ pub mod root_transition;
 pub mod running_record;
 pub mod screen;
 pub mod service_watch;
+pub mod shadow_fills;
 pub mod shutdown;
 pub mod smi;
 pub mod source_health;

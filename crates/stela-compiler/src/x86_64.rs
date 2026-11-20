@@ -212,6 +212,11 @@ pub struct NativeSystem {
     /// profiles.
     #[serde(default)]
     pub loop_counts: bool,
+    /// A block runs on past the branches it would end at, to a terminal
+    /// that is not a branch, when it then holds a loop: its branches into
+    /// itself jump there (`block::region`).
+    #[serde(default)]
+    pub regions: bool,
 }
 
 impl NativeSystem {
@@ -225,6 +230,7 @@ impl NativeSystem {
         amx: false,
         self_loops: false,
         loop_counts: false,
+        regions: false,
     };
 }
 

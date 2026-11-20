@@ -347,6 +347,10 @@ NSUInteger stela_purgeable_state(NSUInteger *slot, NSUInteger state)
 		_heapOffset = response->heap_offset;
 		_resourceID = response->resource_id;
 		_sparse = response->sparse != 0;
+		_copied = response->copied != 0;
+		if (_copied) {
+			[device noteCopied:self];
+		}
 		_firstMipmapInTail = response->first_mipmap_in_tail;
 		_tailSizeInBytes = response->tail_size;
 		_textureType = record->texture_type;

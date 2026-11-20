@@ -1,8 +1,22 @@
 //! The PAC cipher of a system-mode guest, whose hardware's algorithm is
-//! IMPLEMENTATION DEFINED on Apple silicon: six AES rounds of the pointer and modifier under the key, with
-//! the block's halves folded into the code. AES-NI runs them in far less time
-//! than QARMA5 takes in software, and like it indexes no memory with secret
-//! data. Hosts without AES-NI use QARMA5.
+//! IMPLEMENTATION DEFINED on Apple silicon: the pointer and modifier as one
+//! AES block, whitened with the key and taken through six full AES rounds
+//! (each with MixColumns) under round keys the key gives, the state's low
+//! half the code. AES-NI runs them in far less time than QARMA5 takes in
+//! software, and like it indexes no memory with secret data. Hosts without
+//! AES-NI use QARMA5.
+//!
+//! Six rounds, not fewer: one leaves each output byte depending on four
+//! input bytes; two make every output bit depend on every input and key
+//! bit, but from a few signed pointers whose operands differ in one byte a
+//! guest recovers two rounds' key four bytes at a time, in about 2^40 steps
+//! each; and the kernel's thread-state signing (PACGA of a PC that user
+//! code chooses) is a chosen-input oracle that integral attacks turn into
+//! the key of up to five rounds with about 2^11 inputs. Six rounds, of
+//! whose block the modifier half is never the user's to choose, are past
+//! those attacks. Nothing keeps a code across a boot: the guest's keys are
+//! new each boot and the translation store holds no signed value, so the
+//! construction may change between builds.
 
 use super::qarma;
 
@@ -42,7 +56,7 @@ pub(crate) fn native() -> bool {
 }
 
 /// The AES round keys [`compute`] takes `key` through, low quadword first:
-/// the whitening key, the five rounds' keys and the last round's key.
+/// the whitening key and the six rounds' keys.
 pub(crate) fn schedule(key: &[u64; 2]) -> [[u64; 2]; SCHEDULE] {
     let mut schedule = [*key; SCHEDULE];
     for (round, words) in schedule[1..].iter_mut().enumerate() {
@@ -109,12 +123,8 @@ pub(super) mod aes {
             "keyed_round 32",
             "keyed_round 48",
             "keyed_round 64",
-            "pxor xmm1, xmmword ptr [rax + 80]",
-            "aesenclast xmm0, xmm1",
+            "keyed_round 80",
             "movq rax, xmm0",
-            "psrldq xmm0, 8",
-            "movq rcx, xmm0",
-            "xor rax, rcx",
             "ret",
             ".purgem keyed_round",
             constants = sym super::CONSTANTS,

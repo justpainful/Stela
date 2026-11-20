@@ -802,12 +802,14 @@ fn layouts_worked_out_ahead_match_the_regime() {
     }
 }
 
-/// A regime's layout of a signing or an authentication depends on one
-/// pointer bit, the one `Layouts::native` names, under every combination
-/// of TBI0, TBI1, TBID0 and TBID1 and for both domains, with the ranges'
-/// TnSZ equal or not.
+/// Native code completes canonical pointers (extension bits all equal to
+/// bit 55) with the layout bit 55 selects (`Layouts::native`): it is the
+/// authentication's layout, holds bit 55, and is a canonical pointer's
+/// signing layout too, also where signings select by bit 63, under every
+/// combination of TBI0, TBI1, TBID0 and TBID1, for both domains, with the
+/// ranges' TnSZ equal or not.
 #[test]
-fn layouts_depend_on_the_one_bit_native_code_selects_by() {
+fn canonical_pointers_take_the_layout_native_code_selects_by_bit_55() {
     for controls in 0..16u64 {
         let bits = (controls & 1) << 37
             | (controls >> 1 & 1) << 38
@@ -821,21 +823,22 @@ fn layouts_depend_on_the_one_bit_native_code_selects_by() {
                 } else {
                     policy::Domain::Instruction
                 };
-                for signing in [false, true] {
-                    let (select, extension) = layouts.native(data, signing);
-                    assert!(select == 55 || select == 63);
-                    // Authentications always select by bit 55.
-                    assert!(signing || select == 55);
-                    for pointer in [0, 1 << 55, 1 << 63, 1 << 55 | 1 << 63] {
-                        let selected = usize::from(pointer & 1 << select != 0);
-                        assert_eq!(
-                            layouts.get(domain, pointer, signing).extension_mask(),
-                            extension[selected],
-                            "controls={controls:#x} t0sz={t0sz} t1sz={t1sz} data={data} signing={signing} pointer={pointer:#x}"
-                        );
-                        // The select bit is in the extension it selects.
-                        assert_ne!(extension[selected] & 1 << select, 0);
-                        assert_ne!(extension[selected] & 1 << 55, 0);
+                let extension = layouts.native(data);
+                for upper in [false, true] {
+                    let mask = extension[usize::from(upper)];
+                    let what = alloc::format!(
+                        "controls={controls:#x} t0sz={t0sz} t1sz={t1sz} data={data} upper={upper}"
+                    );
+                    assert_ne!(mask & 1 << 55, 0, "{what}");
+                    for low in [0, 0x1234_5670] {
+                        let pointer = low | if upper { mask } else { 0 };
+                        for signing in [false, true] {
+                            assert_eq!(
+                                layouts.get(domain, pointer, signing).extension_mask(),
+                                mask,
+                                "{what} signing={signing}"
+                            );
+                        }
                     }
                 }
             }

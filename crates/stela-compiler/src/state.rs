@@ -120,6 +120,12 @@ pub struct GuestState {
     /// native code left on the host stack between blocks are discarded. Set
     /// by each entry.
     pub exit_rsp: ExitStack,
+    /// The chain's account across a native call, which holds it in a host
+    /// register (`x86_64::chain::ACCOUNT`): the engine sets it before each
+    /// call, takes what the call left (from a fault's capture when one ended
+    /// it: `x86_64::pinned::settled_account`) and clears it, so between
+    /// native calls it is 0.
+    pub account: u64,
 }
 
 /// [`GuestState::exit_rsp`]: a host stack address of the native run in
@@ -183,6 +189,7 @@ impl Default for GuestState {
             lower_limit: Limit(0),
             loop_retired: 0,
             exit_rsp: ExitStack(0),
+            account: 0,
         }
     }
 }
@@ -196,9 +203,9 @@ mod tests {
     #[test]
     fn layout_matches_native_abi() {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
-            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v14-"));
+            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v15-"));
         }
-        assert_eq!(size_of::<GuestState>(), 912);
+        assert_eq!(size_of::<GuestState>(), 920);
         assert_eq!(align_of::<GuestState>(), 8);
         assert_eq!(offset_of!(GuestState, x), 0);
         assert_eq!(offset_of!(GuestState, sp), 248);
@@ -213,6 +220,7 @@ mod tests {
         assert_eq!(offset_of!(GuestState, lower_limit), 888);
         assert_eq!(offset_of!(GuestState, loop_retired), 896);
         assert_eq!(offset_of!(GuestState, exit_rsp), 904);
+        assert_eq!(offset_of!(GuestState, account), 912);
     }
 
     #[test]

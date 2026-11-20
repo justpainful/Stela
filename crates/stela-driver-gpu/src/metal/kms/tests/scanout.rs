@@ -215,3 +215,42 @@ fn the_display_switches_between_the_rates_of_its_size_the_guest_can_be_told_of()
     assert_eq!(display.refresh_millihertz(), 120_000);
     assert_eq!(display.heads[0].mode.vrefresh, 120);
 }
+
+#[test]
+fn the_gpu_composes_into_the_shared_hidden_buffer_and_its_frame_flips() {
+    let mut card = Card::new(vec![mode(2, 4, PREFERRED)]);
+    let mut display = Display::take(&mut card, (2, 4)).unwrap();
+    let shared = display.share_buffers().unwrap().unwrap();
+    let framebuffers: Vec<u32> = display.buffers.iter().map(|b| b.framebuffer).collect();
+    assert_eq!(shared.map(|s| s.framebuffer).to_vec(), framebuffers);
+    assert!(shared.iter().all(|s| s.fd >= 1000 && s.pitch >= 8));
+    // A new display's hidden buffer lacks every row.
+    let (hidden, rows) = display.draw_rows(Some(1..2));
+    assert_eq!((hidden, rows), (framebuffers[2], 0..4));
+    display.present_drawn().unwrap();
+    assert_eq!(display.drm.flips, [framebuffers[2]]);
+    // The next hidden buffer lacks the rows the frames since changed.
+    let (hidden, rows) = display.draw_rows(Some(3..4));
+    assert_eq!(hidden, display.buffers[2].framebuffer);
+    assert_eq!(rows, 0..4);
+    display.present_drawn().unwrap();
+    // The third buffer never held a frame; once each has, only damage.
+    let (_, rows) = display.draw_rows(Some(3..4));
+    assert_eq!(rows, 0..4);
+    display.present_drawn().unwrap();
+    let (_, rows) = display.draw_rows(Some(3..4));
+    assert_eq!(rows, 3..4);
+    // Where a request must wait, nothing is shared, and a frame drawn
+    // waits for its flip until a newer frame drawn over it replaces it.
+    display.drm.immediate = false;
+    assert!(display.share_buffers().is_none());
+    display.present_drawn().unwrap();
+    assert!(display.queued());
+    let (_, rows) = display.draw_rows(Some(0..1));
+    assert_eq!(rows, 0..1, "it holds the frame it replaces whole");
+    assert!(!display.queued(), "no flip while the GPU draws");
+    let flips = display.drm.flips.len();
+    display.drm.immediate = true;
+    display.flush().unwrap();
+    assert_eq!(display.drm.flips.len(), flips);
+}

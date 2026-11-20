@@ -597,9 +597,9 @@ pub struct TexelArguments {
     pub bytes_per_image: u32,
     pub origin: [u32; 3],
     /// A load's pass stamp ([`PassDirty`]): nonzero, the region is the
-    /// whole image from the origin and thread `n` converts texel `n % 64`
-    /// of row `n / 64 % 64` of tile `n / 4096` where the dirty layer holds
-    /// the stamp.
+    /// whole image from the origin and thread `n` converts column `n % 64`
+    /// of tile `n / 64`, row after row, where the dirty layer holds the
+    /// stamp: a workgroup a tile.
     pub stamp: u32,
     /// For the two-plane extended-range encodings, the address of the
     /// alpha plane's byte of the region's first texel, or zero for none,
@@ -609,6 +609,14 @@ pub struct TexelArguments {
     /// `STELA_METAL_TEXELS_MIRROR_*`: whether the view's next layer
     /// mirrors the planes, and whether an encode compares with it.
     pub mirror: u32,
+    /// For the two-plane extended-range encodings, the planes' device copy
+    /// a load writes with the planes, the same texels: the address of the
+    /// region's first codes word, or zero for none, and its bytes per row,
+    /// and those of its alpha plane.
+    pub copy: u64,
+    pub copy_bytes_per_row: u32,
+    pub copy_alpha_bytes_per_row: u32,
+    pub copy_alpha: u64,
 }
 
 impl TexelArguments {
@@ -625,10 +633,16 @@ impl TexelArguments {
     pub const ALPHA_OFFSET: u32 = 56;
     pub const ALPHA_ROW_OFFSET: u32 = 64;
     pub const MIRROR_OFFSET: u32 = 68;
-    pub const BYTES: u32 = 72;
-    /// `STELA_METAL_TEXELS_MIRROR_WRITE` and `_COMPARE`.
+    pub const COPY_OFFSET: u32 = 72;
+    pub const COPY_ROW_OFFSET: u32 = 80;
+    pub const COPY_ALPHA_ROW_OFFSET: u32 = 84;
+    pub const COPY_ALPHA_OFFSET: u32 = 88;
+    pub const BYTES: u32 = 96;
+    /// `STELA_METAL_TEXELS_MIRROR_WRITE` and `_COMPARE`, and `_COPY`: the
+    /// planes' device copy holds what they do in the mirror's place.
     pub const MIRROR_WRITE: u32 = 1;
     pub const MIRROR_COMPARE: u32 = 2;
+    pub const MIRROR_COPY: u32 = 3;
     /// The side of the dirty tiles, and the working image's layer that
     /// holds them (`STELA_METAL_DIRTY_TILE`, `_LAYER`).
     pub const DIRTY_TILE: u32 = 64;
@@ -658,6 +672,10 @@ impl TexelArguments {
         writer.u64(self.alpha);
         writer.u32(self.alpha_bytes_per_row);
         writer.u32(self.mirror);
+        writer.u64(self.copy);
+        writer.u32(self.copy_bytes_per_row);
+        writer.u32(self.copy_alpha_bytes_per_row);
+        writer.u64(self.copy_alpha);
         bytes
     }
 }
@@ -720,6 +738,123 @@ impl AverageArguments {
         writer.u32(0);
         writer.u64(self.depth);
         bytes
+    }
+}
+
+/// A pixel format of a display layer the compose kernel reads (`enum
+/// stela_metal_compose_format`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ComposeFormat {
+    /// 8:8:8:8, blue in the low byte.
+    #[default]
+    Bgra8,
+    /// 8:8:8:8, red in the low byte.
+    Rgba8,
+    /// 2:10:10:10, blue in the low bits.
+    Argb2101010,
+    /// `RGB10A8_2P_XR10`: extended-range codes, alpha in a second plane.
+    Xr10A8,
+}
+
+impl ComposeFormat {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// One layer of a [`ComposeArguments`]: the GPU address of its color
+/// plane's first pixel and, for [`ComposeFormat::Xr10A8`], of its alpha
+/// plane's, their bytes per row, and its source and destination rectangles
+/// as `[x, y, width, height]`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ComposeLayer {
+    pub color: u64,
+    pub alpha: u64,
+    pub stride: u32,
+    pub alpha_stride: u32,
+    pub format: ComposeFormat,
+    pub premultiplied: bool,
+    pub source: [u32; 4],
+    pub destination: [u32; 4],
+}
+
+impl ComposeLayer {
+    pub const COLOR_OFFSET: u32 = 0;
+    pub const ALPHA_OFFSET: u32 = 8;
+    pub const STRIDE_OFFSET: u32 = 16;
+    pub const ALPHA_STRIDE_OFFSET: u32 = 20;
+    pub const FORMAT_OFFSET: u32 = 24;
+    pub const FLAGS_OFFSET: u32 = 28;
+    pub const SOURCE_OFFSET: u32 = 32;
+    pub const DESTINATION_OFFSET: u32 = 48;
+    pub const BYTES: u32 = 64;
+    pub const PREMULTIPLIED: u32 = 1;
+}
+
+/// What the backend's compose kernel reads at the push constants'
+/// `arguments`: the display coprocessor's composition, which the display
+/// model otherwise does on the CPU. Thread `n` below `count` writes pixel
+/// `n % width` of row `first_row + n / width` of the frame at
+/// `destination`, `pitch` bytes a row, as 8-bit BGRX: black, then each of
+/// `layers` that holds the pixel, bottom first, source-over, its source
+/// pixel the one under the destination pixel's centre.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComposeArguments {
+    pub destination: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub first_row: u32,
+    pub count: u32,
+    pub layers: Vec<ComposeLayer>,
+}
+
+impl ComposeArguments {
+    pub const DESTINATION_OFFSET: u32 = 0;
+    pub const PITCH_OFFSET: u32 = 8;
+    pub const WIDTH_OFFSET: u32 = 12;
+    pub const FIRST_ROW_OFFSET: u32 = 16;
+    pub const COUNT_OFFSET: u32 = 20;
+    pub const LAYER_COUNT_OFFSET: u32 = 24;
+    pub const LAYERS_OFFSET: u32 = 32;
+    pub const MAX_LAYERS: u32 = 4;
+    pub const BYTES: u32 = Self::LAYERS_OFFSET + Self::MAX_LAYERS * ComposeLayer::BYTES;
+    pub const ALIGNMENT: u64 = 16;
+    /// Threads per workgroup of the kernel.
+    pub const WORKGROUP_SIZE: u32 = 64;
+
+    /// The record, or `None` with more layers than the kernel takes.
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        if self.layers.len() > Self::MAX_LAYERS as usize {
+            return None;
+        }
+        let mut bytes = alloc::vec![0; Self::BYTES as usize];
+        let mut writer = Writer {
+            bytes: &mut bytes,
+            offset: 0,
+        };
+        writer.u64(self.destination);
+        writer.u32(self.pitch);
+        writer.u32(self.width);
+        writer.u32(self.first_row);
+        writer.u32(self.count);
+        writer.u32(self.layers.len() as u32);
+        writer.u32(0);
+        for layer in &self.layers {
+            writer.u64(layer.color);
+            writer.u64(layer.alpha);
+            writer.u32(layer.stride);
+            writer.u32(layer.alpha_stride);
+            writer.u32(layer.format.raw());
+            writer.u32(if layer.premultiplied {
+                ComposeLayer::PREMULTIPLIED
+            } else {
+                0
+            });
+            for value in layer.source.into_iter().chain(layer.destination) {
+                writer.u32(value);
+            }
+        }
+        Some(bytes)
     }
 }
 
@@ -1334,6 +1469,43 @@ mod tests {
     }
 
     #[test]
+    fn compose_arguments_encode_each_layer_in_order() {
+        let layer = ComposeLayer {
+            color: 0x1_0000_1000,
+            alpha: 0x2000,
+            stride: 16,
+            alpha_stride: 4,
+            format: ComposeFormat::Xr10A8,
+            premultiplied: true,
+            source: [1, 2, 3, 4],
+            destination: [5, 6, 7, 8],
+        };
+        let arguments = ComposeArguments {
+            destination: 0x9000,
+            pitch: 32,
+            width: 4,
+            first_row: 1,
+            count: 4,
+            layers: alloc::vec![ComposeLayer::default(), layer],
+        };
+        let bytes = arguments.encode().unwrap();
+        let word =
+            |at: u32| u32::from_le_bytes(bytes[at as usize..at as usize + 4].try_into().unwrap());
+        assert_eq!(bytes.len(), ComposeArguments::BYTES as usize);
+        assert_eq!(word(ComposeArguments::LAYER_COUNT_OFFSET), 2);
+        let second = ComposeArguments::LAYERS_OFFSET + ComposeLayer::BYTES;
+        assert_eq!(word(second + ComposeLayer::COLOR_OFFSET + 4), 1);
+        assert_eq!(word(second + ComposeLayer::FORMAT_OFFSET), 3);
+        assert_eq!(word(second + ComposeLayer::FLAGS_OFFSET), 1);
+        assert_eq!(word(second + ComposeLayer::DESTINATION_OFFSET + 12), 8);
+        let five = ComposeArguments {
+            layers: alloc::vec![layer; 5],
+            ..arguments
+        };
+        assert_eq!(five.encode(), None);
+    }
+
+    #[test]
     fn compiler_header_matches_the_layouts() {
         let header = include_str!("../compiler/metal_abi.h");
         let define = |name: &str| -> u32 {
@@ -1475,6 +1647,19 @@ mod tests {
                 TexelArguments::ALPHA_ROW_OFFSET,
             ),
             ("STELA_METAL_TEXELS_MIRROR", TexelArguments::MIRROR_OFFSET),
+            ("STELA_METAL_TEXELS_COPY", TexelArguments::COPY_OFFSET),
+            (
+                "STELA_METAL_TEXELS_COPY_ROW",
+                TexelArguments::COPY_ROW_OFFSET,
+            ),
+            (
+                "STELA_METAL_TEXELS_COPY_ALPHA_ROW",
+                TexelArguments::COPY_ALPHA_ROW_OFFSET,
+            ),
+            (
+                "STELA_METAL_TEXELS_COPY_ALPHA",
+                TexelArguments::COPY_ALPHA_OFFSET,
+            ),
             (
                 "STELA_METAL_TEXELS_MIRROR_WRITE",
                 TexelArguments::MIRROR_WRITE,
@@ -1482,6 +1667,10 @@ mod tests {
             (
                 "STELA_METAL_TEXELS_MIRROR_COMPARE",
                 TexelArguments::MIRROR_COMPARE,
+            ),
+            (
+                "STELA_METAL_TEXELS_MIRROR_COPY",
+                TexelArguments::MIRROR_COPY,
             ),
             ("STELA_METAL_TEXELS_BYTES", TexelArguments::BYTES),
             (
@@ -1515,6 +1704,66 @@ mod tests {
             (
                 "STELA_METAL_AVERAGE_FOLLOW_MAX",
                 AverageArguments::FOLLOW_MAX,
+            ),
+            (
+                "STELA_METAL_COMPOSE_DESTINATION",
+                ComposeArguments::DESTINATION_OFFSET,
+            ),
+            ("STELA_METAL_COMPOSE_PITCH", ComposeArguments::PITCH_OFFSET),
+            ("STELA_METAL_COMPOSE_WIDTH", ComposeArguments::WIDTH_OFFSET),
+            (
+                "STELA_METAL_COMPOSE_FIRST_ROW",
+                ComposeArguments::FIRST_ROW_OFFSET,
+            ),
+            ("STELA_METAL_COMPOSE_COUNT", ComposeArguments::COUNT_OFFSET),
+            (
+                "STELA_METAL_COMPOSE_LAYER_COUNT",
+                ComposeArguments::LAYER_COUNT_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYERS",
+                ComposeArguments::LAYERS_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_MAX_LAYERS",
+                ComposeArguments::MAX_LAYERS,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_COLOR",
+                ComposeLayer::COLOR_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_ALPHA",
+                ComposeLayer::ALPHA_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_STRIDE",
+                ComposeLayer::STRIDE_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_ALPHA_STRIDE",
+                ComposeLayer::ALPHA_STRIDE_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_FORMAT",
+                ComposeLayer::FORMAT_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_FLAGS",
+                ComposeLayer::FLAGS_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_SOURCE",
+                ComposeLayer::SOURCE_OFFSET,
+            ),
+            (
+                "STELA_METAL_COMPOSE_LAYER_DESTINATION",
+                ComposeLayer::DESTINATION_OFFSET,
+            ),
+            ("STELA_METAL_COMPOSE_LAYER_BYTES", ComposeLayer::BYTES),
+            (
+                "STELA_METAL_COMPOSE_PREMULTIPLIED",
+                ComposeLayer::PREMULTIPLIED,
             ),
             ("STELA_METAL_REORDER_ROWS", ReorderArguments::ROWS_OFFSET),
             ("STELA_METAL_REORDER_LEVEL", ReorderArguments::LEVEL_OFFSET),
@@ -1855,6 +2104,27 @@ mod tests {
                 "{enumerator}"
             );
         }
+        check_enum(
+            "stela_metal_compose_format",
+            &[
+                (
+                    "STELA_METAL_COMPOSE_BGRA8",
+                    ComposeFormat::Bgra8.raw().into(),
+                ),
+                (
+                    "STELA_METAL_COMPOSE_RGBA8",
+                    ComposeFormat::Rgba8.raw().into(),
+                ),
+                (
+                    "STELA_METAL_COMPOSE_ARGB2101010",
+                    ComposeFormat::Argb2101010.raw().into(),
+                ),
+                (
+                    "STELA_METAL_COMPOSE_XR10A8",
+                    ComposeFormat::Xr10A8.raw().into(),
+                ),
+            ],
+        );
         check_enum(
             "stela_metal_heap_array",
             &[

@@ -86,6 +86,13 @@ pub trait PassiveRegisters: Send + Sync {
     /// The value a `bytes`-byte read at `physical` returns, if this serves
     /// it; `None` sends the read to [`Devices::read_scalar`].
     fn read(&self, physical: u64, bytes: u8) -> Option<u64>;
+    /// The word itself a `bytes`-byte read at `physical` loads, where this
+    /// serves it from one: native code reads it again at the same site
+    /// while it holds the value the engine read, the word being its own
+    /// epoch ([`PlainRead`]). `None` leaves every such read to the engine.
+    fn word(&self, _physical: u64, _bytes: u8) -> Option<Arc<core::sync::atomic::AtomicU64>> {
+        None
+    }
 }
 
 /// Device registers every PE reaches under the device's own lock instead of
@@ -492,6 +499,18 @@ pub trait Host {
     /// samples where its time goes names the exit kind.
     fn profile_exit(&mut self, _slot: usize, now: u64) {
         self.profile_boundary(step_timing::Phase::Exit, now);
+    }
+    /// Under `--profile`, a waiting PE starts (`true`) or ends (`false`)
+    /// its spin for a wake before it halts: a host that samples where its
+    /// time goes counts that time as idle rather than as the scheduler's
+    /// ([`step_timing::Phase::Schedule`]), which holds it.
+    fn profile_idle(&mut self, _idle: bool) {}
+    /// The profile ticks ([`Self::profile_ticks`]) at which the last native
+    /// run was entered and returned, as close to native code as the host
+    /// keeps them; 0 where it keeps none. Under `--profile` they bound a
+    /// traced System exit's round trip ([`step_timing::ExitTrace`]).
+    fn native_stamps(&self) -> [u64; 2] {
+        [0; 2]
     }
     /// Under `--profile`, the `bytes` of code just installed at `code` are
     /// `regions`: `(offset, region)` pairs in ascending offsets, each

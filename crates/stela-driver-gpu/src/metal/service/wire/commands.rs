@@ -47,12 +47,19 @@ records! {
     /// object, after the encoders: the service refreshes its device-memory
     /// copies of sampled surfaces only when their seed changed, and takes a
     /// surface written by the command buffer as changed for later ones.
+    ///
+    /// With `flags` bit 0 ([`SurfaceUse::SEED_ONLY`]), a texture the
+    /// command buffer does not name but may still reach (an argument buffer
+    /// of a residency set): one the service keeps in device memory
+    /// (`TextureResponse::copied`) whose surface's seed changed since the
+    /// guest last reported it, which the CPU's writes do. Its copies are
+    /// refreshed first; the command buffer writes nothing through it.
     pub struct SurfaceUse {
         pub object: u64,
         pub surface: u32,
         pub seed: u32,
         pub buffer: u32,
-        pub reserved: u32,
+        pub flags: u32,
     }
 
     /// `computeCommandEncoderWithDispatchType:`.
@@ -987,4 +994,9 @@ impl CommandCode {
             _ => None,
         }
     }
+}
+
+impl SurfaceUse {
+    /// `flags`: the object is only live, its surface's seed changed.
+    pub const SEED_ONLY: u32 = 1;
 }

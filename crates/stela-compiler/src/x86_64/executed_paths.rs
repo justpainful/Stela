@@ -4,11 +4,12 @@
 //! the x86 trap flag, which records every host instruction it executes.
 //! Guest registers point into a scratch arena whose words point back into
 //! it, so loads and pointer chasing stay mapped; the anchors point at zeroed
-//! areas with an unbounded chain budget, PAC instructions run the cipher
+//! areas with the most chain budget, PAC instructions run the cipher
 //! inline where the host has AES-NI, as the engine's blocks do, and the
 //! pointer-authentication routine returns its input. `DENSITY_OUT` gets, per block, a `B` line
 //! (PC, weight, exit, host instructions executed inline, out of line and
-//! outside the block) and per guest instruction an `S` line (its word, how
+//! outside the block, the loop's count, the instructions retired and
+//! whether it is a region) and per guest instruction an `S` line (its word, how
 //! often its code was entered, host instructions inline, and those out of
 //! line that it branched to), then a `C` line (its code, source map, inline
 //! end and how often each host instruction ran). Inline is the block's code
@@ -36,8 +37,9 @@ const RIP: usize = 16;
 const EFLAGS: usize = 17;
 const STEPS: usize = 1 << 20;
 const OUTSIDE: u32 = u32::MAX;
-/// Where the pointer anchor's area holds the cipher's schedules and layouts
-/// (zero: every pointer is canonical and every authentication succeeds).
+/// Where the pointer anchor's area holds the cipher's schedules and ranges
+/// (empty PAC fields: every pointer is canonical, every authentication
+/// succeeds and every result is its pointer).
 const CIPHER: u32 = 0x400;
 
 #[repr(C)]
@@ -108,6 +110,11 @@ extern "sysv64" fn authenticated(_: *mut u8, _: u32, value: u64, _: u64) -> Pair
 }
 
 fn options() -> Options {
+    // As the engine's blocks; `REGIONS=0` compiles blocks alone.
+    options_with(std::env::var("REGIONS").map_or(true, |regions| regions != "0"))
+}
+
+fn options_with(regions: bool) -> Options {
     let checks = MemoryChecks::system(true, false, true, false)
         .with_range(RangeCheck::four_level(4).one_sided(true));
     let system = NativeSystem {
@@ -122,6 +129,7 @@ fn options() -> Options {
                 .then_some(CIPHER),
         }),
         self_loops: true,
+        regions,
         ..NativeSystem::NONE
     };
     Options::new(
@@ -141,7 +149,7 @@ fn map(bytes: usize) -> *mut u8 {
 
 /// Run `entry` (the pinned entry wrapper and the block) in a child under
 /// the trap flag; the parent gets the trace and the exit.
-fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, Vec<u32>)> {
+fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, u64, Vec<u32>)> {
     let mut fds = [0i32; 2];
     // SAFETY: plain POSIX calls; the child only runs the block and writes.
     unsafe {
@@ -165,19 +173,20 @@ fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, Vec<u32>)> {
             sigaction(SIGTRAP, &action, core::ptr::null_mut());
             let state = alloc::boxed::Box::leak(alloc::boxed::Box::new(GuestState::default()));
             prepare(state);
-            let run: unsafe extern "sysv64" fn(*mut GuestState) -> u64 = core::mem::transmute(code);
+            // The exit's target and word, in RAX and RDX.
+            let run: unsafe extern "sysv64" fn(*mut GuestState) -> Pair =
+                core::mem::transmute(code);
             core::arch::asm!("pushfq", "or qword ptr [rsp], 0x100", "popfq");
-            let exit = run(state);
+            let Pair(exit, word) = run(state);
             core::arch::asm!("pushfq", "and qword ptr [rsp], -257", "popfq");
             let count = COUNT.load(Ordering::Relaxed);
             let trace =
                 core::slice::from_raw_parts(core::ptr::addr_of!(TRACE).cast::<u32>(), count);
             write(fds[1], (&raw const exit).cast(), 8);
-            // ChainControl's retired count (its second word) and the loop's.
-            let control = *(core::ptr::from_mut(state).cast::<u8>())
-                .add(core::mem::offset_of!(GuestState, anchors))
-                .cast::<*const u64>();
-            let retired = *control.add(1) + state.loop_retired;
+            write(fds[1], (&raw const word).cast(), 8);
+            // The instructions the chain's account counts and the loop's.
+            let account = crate::x86_64::chain::Account(state.account);
+            let retired = account.retired().wrapping_add(state.loop_retired);
             write(fds[1], (&raw const retired).cast(), 8);
             write(fds[1], (&raw const count).cast(), 8);
             let mut sent = 0;
@@ -195,7 +204,7 @@ fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, Vec<u32>)> {
             _exit(0);
         }
         close(fds[1]);
-        let mut header = [0u64; 2];
+        let mut header = [0u64; 3];
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 65536];
         loop {
@@ -208,24 +217,25 @@ fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, Vec<u32>)> {
         close(fds[0]);
         let mut status = 0;
         waitpid(pid, &mut status, 0);
-        if status != 0 || bytes.len() < 24 {
+        if status != 0 || bytes.len() < 32 {
             return None;
         }
         header[0] = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         header[1] = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let trace = bytes[24..]
+        header[2] = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let trace = bytes[32..]
             .as_chunks::<4>()
             .0
             .iter()
             .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
-        Some((header[0], header[1], trace))
+        Some((header[0], header[1], header[2], trace))
     }
 }
 
 /// Registers and memory for a run: an 8 MiB arena whose words point into
 /// its middle, registers spread over it, IXC set (the usual running
-/// state), zeroed anchor areas with an unbounded chain budget.
+/// state), zeroed anchor areas and the most chain budget.
 fn prepare(state: &mut GuestState) {
     const ARENA: usize = 8 << 20;
     let arena = map(ARENA);
@@ -246,6 +256,7 @@ fn prepare(state: &mut GuestState) {
     let fault = map(4096);
     state.unreachable = fault as u64;
     state.lower_limit = crate::Limit(u64::MAX);
+    state.account = super::chain::Account::new(super::chain::MAX_BUDGET).0;
     let raw = (state as *mut GuestState).cast::<u8>();
     let anchor_offset = core::mem::offset_of!(GuestState, anchors);
     // SAFETY: the anchors are eight words in the state; each area is mapped.
@@ -256,16 +267,20 @@ fn prepare(state: &mut GuestState) {
                 .cast::<u64>()
                 .write(area as u64);
         }
-        // ChainControl's budget, open tag words for the cipher, and the
-        // pointer routine.
-        anchors.cast::<u64>().write(u64::MAX / 2);
+        // Open tag words for the cipher, and the pointer routine.
         for key in 0..pointer::TAG_WORDS {
             anchors
                 .add(3 << 16)
                 .add(0x40 + 8 * key)
                 .cast::<u64>()
-                .write(1);
+                .write(pointer::tag(1, key as u8, 0));
         }
+        let ranges = [[false, true].map(|upper| pointer::cipher::Range::new(0, upper, false)); 2];
+        anchors
+            .add(3 << 16)
+            .add(CIPHER as usize + core::mem::offset_of!(pointer::cipher::Cipher, ranges))
+            .cast::<[[pointer::cipher::Range; 2]; 2]>()
+            .write(ranges);
         anchors.add(3 << 16).add(0x1c0).cast::<u64>().write(
             (authenticated as extern "sysv64" fn(*mut u8, u32, u64, u64) -> Pair) as usize as u64,
         );
@@ -281,6 +296,13 @@ fn executed_paths_of_real_blocks() {
     let mut out = std::fs::File::create(output).expect("the output");
     let options = options();
     let mut causes = census::Census::default();
+    // The causes in the blocks that compile as regions when regions are on,
+    // in this run's mode: the same code before and after.
+    let with_regions = options_with(true);
+    let mut region_causes = census::Census::default();
+    // Weighted guest and host instructions of all blocks and of regions
+    // (`CompiledBlock::region`), and the weight of each.
+    let mut shares = [[0_f64; 3]; 2];
     for line in std::fs::read_to_string(input).expect("the sample").lines() {
         let mut fields = line.split(' ');
         let (Some(pc), Some(weight), Some(hex)) = (fields.next(), fields.next(), fields.next())
@@ -297,6 +319,11 @@ fn executed_paths_of_real_blocks() {
         let Ok(compiled) = plan.compile() else {
             continue;
         };
+        let shaped = compiled.region
+            || CompilationPlan::new(&source, GuestAddress(pc), &with_regions)
+                .ok()
+                .and_then(|plan| plan.compile().ok())
+                .is_some_and(|compiled| compiled.region);
         let body = &compiled.native.x86_64_code;
         let entry = crate::x86_64::pinned::entered(body);
         let body_offset = entry.len() - body.len();
@@ -307,7 +334,7 @@ fn executed_paths_of_real_blocks() {
         // Inline: to the last instruction's first unconditional jump or ret.
         let last = map[map.len() - 1].1;
         let inline_end = inline_end(body, last);
-        let Some((exit, looped, trace)) = traced(&entry, body_offset) else {
+        let Some((exit, word, looped, trace)) = traced(&entry, body_offset) else {
             writeln!(out, "X {pc:x} {weight}").unwrap();
             continue;
         };
@@ -349,9 +376,26 @@ fn executed_paths_of_real_blocks() {
                 }
             }
         }
+        // The instructions retired: what the exit counts (a branch's the
+        // rows it did not skip, any other the ones before it) and what the
+        // chain and the loop counted besides.
+        let (kind, skipped) = crate::x86_64::chain::ExitWord::split(word);
+        use crate::block::ExitKind;
+        let counted = match ExitKind::try_from(kind) {
+            Ok(
+                ExitKind::Fallthrough
+                | ExitKind::Direct
+                | ExitKind::Indirect
+                | ExitKind::Call
+                | ExitKind::Return,
+            ) => (map.len() as u64).saturating_sub(u64::from(skipped)),
+            _ => exit.wrapping_sub(pc) / 4,
+        };
+        let guest = looped.wrapping_add(counted);
         writeln!(
             out,
-            "B {pc:x} {weight} {exit:x} {inside} {out_of_line} {outside} {looped}"
+            "B {pc:x} {weight} {exit:x} {inside} {out_of_line} {outside} {looped} {guest} {}",
+            u8::from(compiled.region)
         )
         .unwrap();
         for (index, &(guest, _)) in map.iter().enumerate() {
@@ -372,11 +416,6 @@ fn executed_paths_of_real_blocks() {
                 *runs.entry(offset).or_default() += 1;
             }
         }
-        let guest = if looped != 0 {
-            looped
-        } else {
-            entered.iter().filter(|&&count| count != 0).count() as u64
-        };
         let code: String = body.iter().map(|byte| format!("{byte:02x}")).collect();
         let spans: Vec<String> = map
             .iter()
@@ -393,7 +432,15 @@ fn executed_paths_of_real_blocks() {
             counts.join(",")
         )
         .unwrap();
-        causes.add(&census::Traced {
+        let weighted: f64 = weight.parse().unwrap_or(1.0);
+        for (index, share) in shares.iter_mut().enumerate() {
+            if index == 0 || shaped {
+                share[0] += weighted * guest as f64;
+                share[1] += weighted * f64::from(inside + out_of_line);
+                share[2] += weighted;
+            }
+        }
+        let traced = census::Traced {
             weight: weight.parse().unwrap_or(1),
             guest,
             pc,
@@ -402,9 +449,22 @@ fn executed_paths_of_real_blocks() {
             map,
             inline_end,
             runs: &runs,
-        });
+        };
+        causes.add(&traced);
+        if shaped {
+            region_causes.add(&traced);
+        }
     }
-    let table = causes.table();
+    let [all, regions] = shares;
+    let table = format!(
+        "{}{}R regions weight={:.1}% guest={:.1}% host_per_guest={:.3} (all {:.3})\n",
+        causes.table(),
+        region_causes.table().replace("T ", "RT "),
+        100.0 * regions[2] / all[2].max(1.0),
+        100.0 * regions[0] / all[0].max(1.0),
+        regions[1] / regions[0].max(1.0),
+        all[1] / all[0].max(1.0),
+    );
     write!(out, "{table}").unwrap();
     std::print!("{table}");
 }

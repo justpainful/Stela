@@ -589,7 +589,38 @@ pub struct EventSpin {
     /// The count the spin in progress began at, and its turns left.
     pub start: u64,
     pub turns: u64,
+    /// WFEs that found the register clear but an event stream edge since
+    /// the engine's last sample ([`EventStream`]), and completed.
+    pub streamed: u64,
 }
+
+/// The event stream an [`event_wait_thunk`] samples: the first system
+/// count after the engine's last sample at which an edge sets the event
+/// register (`u64::MAX`: none the thunk may take), the edges' period
+/// where they come every `period` counts (0: the thunk takes one edge and
+/// leaves the next to the engine), and the count the thunk last sampled
+/// at, which the engine takes as its own sample when native code returns.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventStream {
+    pub next: u64,
+    pub period: u64,
+    pub sampled: u64,
+}
+
+impl Default for EventStream {
+    fn default() -> Self {
+        Self {
+            next: u64::MAX,
+            period: 1,
+            sampled: 0,
+        }
+    }
+}
+
+const STREAM_NEXT: i8 = core::mem::offset_of!(EventStream, next) as i8;
+const STREAM_PERIOD: i8 = core::mem::offset_of!(EventStream, period) as i8;
+const STREAM_SAMPLED: i8 = core::mem::offset_of!(EventStream, sampled) as i8;
 
 const SPIN_COMPLETED: i8 = core::mem::offset_of!(EventSpin, completed) as i8;
 const SPIN_MISSED: i8 = core::mem::offset_of!(EventSpin, missed) as i8;
@@ -597,8 +628,10 @@ const SPIN_HELD: i8 = core::mem::offset_of!(EventSpin, held) as i8;
 const SPIN_COUNTS: i8 = core::mem::offset_of!(EventSpin, counts) as i8;
 const SPIN_START: i8 = core::mem::offset_of!(EventSpin, start) as i8;
 const SPIN_TURNS: i8 = core::mem::offset_of!(EventSpin, turns) as i8;
+const SPIN_STREAMED: i8 = core::mem::offset_of!(EventSpin, streamed) as i8;
 const INTERRUPT_EPOCH: i8 =
     core::mem::offset_of!(super::chain::ChainControl, interrupt_epoch) as i8;
+const QUIET: i8 = core::mem::offset_of!(super::chain::ChainControl, quiet) as i8;
 const OBSERVED_INTERRUPT_EPOCH: i8 =
     core::mem::offset_of!(super::chain::ChainControl, observed_interrupt_epoch) as i8;
 
@@ -610,7 +643,8 @@ const OBSERVED_INTERRUPT_EPOCH: i8 =
 /// ([`super::chain::ChainControl`]), whose interrupt epoch moves when
 /// anything is posted for the PE; the count before which time alone changes
 /// no interrupt line ([`crate::x86_64::transition::Places::lines_until`]),
-/// the count reader, and the spin's counts.
+/// the count reader, the spin's counts and the event stream
+/// ([`EventStream`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventWaitPlaces {
     pub events: Place,
@@ -620,11 +654,16 @@ pub struct EventWaitPlaces {
     pub lines_until: Place,
     pub count: Place,
     pub spin: Place,
+    pub stream: Place,
 }
 
 /// The thunk completing WFE at `pc` while the `events` cell is open and the
 /// event register is set: it clears the register in one exchange, as
-/// another PE may set it, and completes. With the register clear, where the
+/// another PE may set it, and completes. With the register clear, an event
+/// stream edge since the engine's last sample sets it as the engine's own
+/// sample would (`stream`), and the WFE takes it and completes, recording
+/// the count it sampled at and the next edge, before any trap check, as
+/// the engine does. With the register clear, where the
 /// WFE would wait (`waits` open), it spins for up to [`WFE_SPIN_COUNTS`]
 /// for the register and completes as soon as it finds it set. It spins only
 /// while nothing else would wake the WFE, all of which the engine's wait
@@ -649,6 +688,34 @@ pub fn event_wait_thunk(pc: GuestAddress, places: EventWaitPlaces) -> Thunk {
     asm.xchg(Byte, Mem::base(Rcx, 0), Rdx);
     asm.test(Byte, Rdx, Rdx);
     let set = asm.jcc(Cond::Ne);
+    // An event stream edge since the last sample: next += (k + 1) * period
+    // for k = (count - next) / period. Without a stream no count is read.
+    asm.place(Rcx, places.stream);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base_disp8(Rcx, STREAM_NEXT), -1);
+    let unpublished = asm.jcc(Cond::E);
+    read_count(&mut asm, places.count);
+    asm.place(Rcx, places.stream);
+    asm.mov(Qword, Rax, Rdx);
+    asm.alu_load(Alu::Sub, Qword, Rax, Mem::base_disp8(Rcx, STREAM_NEXT));
+    let no_edge = asm.jcc(Cond::B);
+    asm.mov_store(Qword, Mem::base_disp8(Rcx, STREAM_SAMPLED), Rdx);
+    // Without a period, the edge after it is the engine's to find.
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base_disp8(Rcx, STREAM_PERIOD), 0);
+    let periodic = asm.jcc(Cond::Ne);
+    asm.mov_rm_imm32(Qword, Mem::base_disp8(Rcx, STREAM_NEXT), -1);
+    let taken = asm.jmp();
+    asm.bind(periodic);
+    asm.alu(Alu::Xor, Dword, Rdx, Rdx);
+    asm.unary(Unary::Div, Qword, Mem::base_disp8(Rcx, STREAM_PERIOD));
+    asm.alu_imm8(Alu::Add, Qword, Rax, 1);
+    asm.unary(Unary::Mul, Qword, Mem::base_disp8(Rcx, STREAM_PERIOD));
+    asm.alu(Alu::Add, Qword, Mem::base_disp8(Rcx, STREAM_NEXT), Rax);
+    asm.bind(taken);
+    asm.place(Rcx, places.spin);
+    asm.alu_imm8(Alu::Add, Qword, spin(SPIN_STREAMED), 1);
+    let streamed = asm.jmp();
+    asm.bind(no_edge);
+    asm.bind(unpublished);
     // Whether the WFE may spin.
     asm.place(Rax, places.waits);
     asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
@@ -730,6 +797,7 @@ pub fn event_wait_thunk(pc: GuestAddress, places: EventWaitPlaces) -> Thunk {
     let held = asm.jmp();
     asm.bind(set);
     asm.bind(found);
+    asm.bind(streamed);
     finish_unless(
         code,
         [closed, traps, interrupt, notified, due, missed, held],
@@ -758,8 +826,9 @@ pub struct FastIpi {
 
 /// The bytes of one entry of the table [`FastIpi::base`] names, and the
 /// offsets of its words: the target's IPI_SR (`u64`), deferred-IPI flag
-/// (`u8`), line-change counter (`u64`), interruption epoch (`u64`), halted
-/// flag (`u8`) and PE number, each but the last an address.
+/// (`u8`), line-change counter (`u64`), chaining control
+/// ([`super::chain::ChainControl`]), halted flag (`u8`) and PE number, each
+/// but the last an address.
 pub const FAST_IPI_TARGET_BYTES: usize = 48;
 pub const FAST_IPI_TARGET_STATUS: usize = 0;
 pub const FAST_IPI_TARGET_ARMED: usize = 8;
@@ -794,12 +863,13 @@ pub struct FastIpiPlaces {
     pub interrupt_status: Place,
 }
 
-/// Add 1 to the epoch at `[RCX + offset]` unless it is `u64::MAX`, which
-/// stays, in a LOCK CMPXCHG loop. Clobbers RAX and RDX.
-fn bump_epoch(asm: &mut Asm<'_>, offset: i8) {
+/// Post an interruption to the control at RCX as `chain::interrupt` does:
+/// add 1 to its epoch unless it is `u64::MAX`, which stays, in a LOCK
+/// CMPXCHG loop, then zero its quiet word. Clobbers RAX and RDX.
+fn bump_epoch(asm: &mut Asm<'_>) {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
-    let epoch = Mem::base_disp8(Rcx, offset);
+    let epoch = Mem::base_disp8(Rcx, INTERRUPT_EPOCH);
     asm.mov_load(Qword, Rax, epoch);
     let top = asm.len();
     asm.alu_imm8(Alu::Cmp, Qword, Rax, -1);
@@ -810,6 +880,7 @@ fn bump_epoch(asm: &mut Asm<'_>, offset: i8) {
     let lost = asm.jcc(Cond::Ne);
     asm.bind_back(lost, top);
     asm.bind(saturated);
+    asm.mov_rm_imm32(Qword, Mem::base(Rcx, QUIET.into()), 0);
 }
 
 /// The thunk completing an immediate fast-IPI request, MSR IPI_RR_LOCAL
@@ -895,7 +966,7 @@ pub fn fast_ipi_request_thunk(
     asm.lock();
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, 0), 1);
     asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_INTERRUPT));
-    bump_epoch(&mut asm, 0);
+    bump_epoch(&mut asm);
     reload(&mut asm);
     asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_SLEEPING));
     asm.movzx(Dword, Rcx, Byte, Mem::base(Rcx, 0));
@@ -906,7 +977,7 @@ pub fn fast_ipi_request_thunk(
     asm.shift_cl(ShiftOp::Shl, Qword, Rdx);
     asm.alu(Alu::Or, Qword, ipi(IPI_WAKES), Rdx);
     asm.place(Rcx, places.control);
-    bump_epoch(&mut asm, INTERRUPT_EPOCH);
+    bump_epoch(&mut asm);
     asm.bind(pending);
     asm.bind(running);
     finish_unless(
@@ -1240,7 +1311,7 @@ impl InstructionCounter {
 /// the count from the [`InstructionCounter`] at `counter`
 /// ([`InstructionCounter::at`]) with the instructions native code retired
 /// before this one: the chain's count of the blocks it left
-/// (`ChainControl::retired`) and `before`. It opens `cell` on it, as an
+/// (`chain::Account::retired`) and `before`. It opens `cell` on it, as an
 /// engine read does, and completes with it. Else it exits at `pc`. It also
 /// clobbers RCX and RDX.
 pub fn instruction_counter_thunk(
@@ -1274,8 +1345,7 @@ pub fn instruction_counter_thunk(
         0,
     );
     let closed = asm.jcc(Cond::E);
-    asm.place(Rax, super::chain::CONTROL_PLACE);
-    asm.mov_load(Qword, Rdx, Mem::base(Rax, super::chain::RETIRED_OFFSET));
+    super::chain::account_retired(&mut asm, Rdx);
     if before != 0 {
         asm.alu_imm32(Alu::Add, Qword, Rdx, before);
     }
@@ -1576,12 +1646,26 @@ const READ_SEEN: i8 = core::mem::offset_of!(DeviceRead, seen) as i8;
 const READ_VALUE: i8 = core::mem::offset_of!(DeviceRead, value) as i8;
 const READ_UNTIL: i8 = core::mem::offset_of!(DeviceRead, until) as i8;
 
-/// The [`DeviceRead`]s a PE keeps, a slot per site ([`device_read_slot`]).
+/// The [`DeviceRead`]s a PE keeps, a slot per site and address
+/// ([`device_read_slot`]).
 pub const DEVICE_READS: usize = 64;
 
-/// The slot of the device site at physical address `site`.
-pub const fn device_read_slot(site: u64) -> usize {
-    ((site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - DEVICE_READS.ilog2())) as usize
+/// The multiplier mixing a read's address into its slot, as native code's
+/// `imul r64, r/m64, imm32` sign-extends it, and the bit of the product
+/// where the slot's bits start: bits 26-31 of the product take every
+/// address bit from 2 to 33, where a 32-bit multiplier leaves the top bits
+/// to the address's high bits alone.
+const ADDRESS_MIX: i32 = 0x9e37_79b1_u32 as i32;
+const ADDRESS_MIX_SHIFT: u8 = 26;
+
+/// The slot of the read at virtual `address` by the device site at
+/// physical `site`: one site that reads several addresses in turn (a
+/// sampler walking per-cluster counters) keeps a slot for each.
+pub const fn device_read_slot(site: u64, address: u64) -> usize {
+    let bits = 64 - DEVICE_READS.ilog2();
+    let site = (site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> bits;
+    let address = (address >> 2).wrapping_mul(ADDRESS_MIX as i64 as u64) >> ADDRESS_MIX_SHIFT;
+    (site ^ address) as usize & (DEVICE_READS - 1)
 }
 
 /// The key a [`DeviceRead`] made in mirror state `state` with PSTATE.PAN
@@ -1593,13 +1677,34 @@ pub const fn device_read_key(generation: u64, state: usize, pan: bool) -> u64 {
 
 /// A load a [`device_read_thunk`] completes: `LDR` or `LDUR` of a B, H, W or X
 /// register, zero-extending, without writeback, from a base other than SP
-/// (`rn`) plus `offset`, into `rt`.
+/// (`rn`) plus `offset` or plus an `index` register, into `rt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceLoad {
     pub rn: u8,
     pub offset: i32,
+    pub index: Option<DeviceIndex>,
     pub rt: u8,
     pub bytes: u8,
+}
+
+/// The index of `LDR (register)`: Xm, or Wm zero- or sign-extended, shifted
+/// left by `shift`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIndex {
+    pub rm: u8,
+    pub extend: IndexExtend,
+    pub shift: u8,
+}
+
+/// How `LDR (register)` widens its index ([`DeviceIndex`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexExtend {
+    /// UXTW: Wm zero-extended.
+    Unsigned,
+    /// SXTW: Wm sign-extended.
+    Signed,
+    /// LSL or SXTX: Xm as it is.
+    Whole,
 }
 
 impl DeviceLoad {
@@ -1608,21 +1713,94 @@ impl DeviceLoad {
         let size = word >> 30;
         let rn = (word >> 5 & 31) as u8;
         let rt = (word & 31) as u8;
+        let mut index = None;
         let offset = if word & 0x3fc0_0000 == 0x3940_0000 {
             // LDR (immediate, unsigned offset).
             ((word >> 10 & 0xfff) << size) as i32
         } else if word & 0x3fe0_0c00 == 0x3840_0000 {
             // LDUR.
             ((word << 11) as i32) >> 23
+        } else if word & 0x3fe0_0c00 == 0x3860_0800 {
+            // LDR (register); Rm 31 is XZR, which no device load names.
+            let rm = (word >> 16 & 31) as u8;
+            let extend = match word >> 13 & 7 {
+                0b010 => IndexExtend::Unsigned,
+                0b110 => IndexExtend::Signed,
+                0b011 | 0b111 => IndexExtend::Whole,
+                _ => return None,
+            };
+            let shift = if word >> 12 & 1 != 0 { size as u8 } else { 0 };
+            index = (rm != 31).then_some(DeviceIndex { rm, extend, shift });
+            index?;
+            0
         } else {
             return None;
         };
         (rn != 31).then_some(Self {
             rn,
             offset,
+            index,
             rt,
             bytes: 1 << size,
         })
+    }
+
+    /// The virtual address the load reads with `x` its X registers' values.
+    pub fn address(&self, x: impl Fn(u8) -> u64) -> u64 {
+        let index = self.index.map_or(0, |index| {
+            let value = x(index.rm);
+            let value = match index.extend {
+                IndexExtend::Unsigned => value & 0xffff_ffff,
+                IndexExtend::Signed => value as u32 as i32 as i64 as u64,
+                IndexExtend::Whole => value,
+            };
+            value << index.shift
+        });
+        x(self.rn)
+            .wrapping_add_signed(i64::from(self.offset))
+            .wrapping_add(index)
+    }
+
+    /// Its address into RAX, as [`Self::address`]. Clobbers RCX.
+    fn address_into_rax(&self, asm: &mut Asm<'_>) {
+        use Gpr::{Rax, Rcx};
+        use Size::{Dword, Qword};
+        asm.mov_load(Qword, Rax, register(self.rn));
+        if self.offset != 0 {
+            asm.alu_imm32(Alu::Add, Qword, Rax, self.offset);
+        }
+        if let Some(index) = self.index {
+            match index.extend {
+                IndexExtend::Unsigned => asm.mov_load(Dword, Rcx, register(index.rm)),
+                IndexExtend::Signed => asm.movsxd(Rcx, register(index.rm)),
+                IndexExtend::Whole => asm.mov_load(Qword, Rcx, register(index.rm)),
+            }
+            if index.shift != 0 {
+                asm.shift_imm(ShiftOp::Shl, Qword, Rcx, index.shift);
+            }
+            asm.alu(Alu::Add, Qword, Rax, Rcx);
+        }
+    }
+}
+
+/// The address of the [`DeviceRead`] slot of `site` and the address in RAX
+/// ([`device_read_slot`]) among `reads` into RCX.
+fn device_read_slot_into_rcx(asm: &mut Asm<'_>, reads: Place, site: u64) {
+    use Gpr::{Rax, Rcx};
+    use Size::{Dword, Qword};
+    let bits = 64 - DEVICE_READS.ilog2() as u8;
+    let site = (site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> bits;
+    asm.mov(Qword, Rcx, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rcx, 2);
+    asm.imul_imm32(Qword, Rcx, Rcx, ADDRESS_MIX);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rcx, ADDRESS_MIX_SHIFT);
+    asm.alu_imm8(Alu::And, Dword, Rcx, (DEVICE_READS - 1) as i8);
+    asm.alu_imm8(Alu::Xor, Dword, Rcx, site as i8);
+    asm.imul_imm32(Dword, Rcx, Rcx, core::mem::size_of::<DeviceRead>() as i32);
+    let anchor = core::mem::offset_of!(crate::GuestState, anchors) + reads.anchor as usize * 8;
+    asm.alu_load(Alu::Add, Qword, Rcx, Mem::base(Gpr::Rdi, anchor as i32));
+    if reads.offset != 0 {
+        asm.alu_imm32(Alu::Add, Qword, Rcx, reads.offset as i32);
     }
 }
 
@@ -1637,12 +1815,12 @@ pub struct DeviceReadPlaces {
 }
 
 /// The thunk completing the plain device load `load` of the site at `pc`
-/// and physical `site` natively, while the [`DeviceRead`] of its slot holds
-/// that site, the address the load reads now, the key of the PE's state
-/// and PSTATE.PAN, a model epoch that still holds the count it held, and a
-/// count below `until`: it writes the read's value to Xt and leaves through
-/// a direct exit to the next instruction. Else it exits at `pc`. It also
-/// clobbers RCX and RDX.
+/// and physical `site` natively, while the [`DeviceRead`] of the slot of
+/// that site and the address the load reads now ([`device_read_slot`])
+/// holds both, the key of the PE's state and PSTATE.PAN, a model epoch that
+/// still holds the count it held, and a count below `until`: it writes the
+/// read's value to Xt and leaves through a direct exit to the next
+/// instruction. Else it exits at `pc`. It also clobbers RCX and RDX.
 pub fn device_read_thunk(
     pc: GuestAddress,
     site: u64,
@@ -1651,10 +1829,6 @@ pub fn device_read_thunk(
 ) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
-    let slot = Place::new(
-        places.reads.anchor,
-        places.reads.offset + device_read_slot(site) * core::mem::size_of::<DeviceRead>(),
-    );
     let read = |offset| Mem::base_disp8(Rcx, offset);
     let (mut code, closed) = open(places.key);
     let mut asm = Asm::new(&mut code);
@@ -1665,18 +1839,15 @@ pub fn device_read_thunk(
         Rdx,
         frame_field(core::mem::offset_of!(GuestState, pan)),
     );
-    asm.place(Rcx, slot);
+    load.address_into_rax(&mut asm);
+    device_read_slot_into_rcx(&mut asm, places.reads, site);
     asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_KEY));
     let other_key = asm.jcc(Cond::Ne);
-    asm.mov_imm64(Rax, site);
-    asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_SITE));
-    let other_site = asm.jcc(Cond::Ne);
-    asm.mov_load(Qword, Rax, register(load.rn));
-    if load.offset != 0 {
-        asm.alu_imm32(Alu::Add, Qword, Rax, load.offset);
-    }
     asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_ADDRESS));
     let other_address = asm.jcc(Cond::Ne);
+    asm.mov_imm64(Rdx, site);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_SITE));
+    let other_site = asm.jcc(Cond::Ne);
     asm.mov_load(Qword, Rax, read(READ_EPOCH));
     asm.mov_load(Qword, Rax, Mem::base(Rax, 0));
     asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_SEEN));
@@ -1684,7 +1855,9 @@ pub fn device_read_thunk(
     asm.alu_imm8(Alu::Cmp, Qword, read(READ_UNTIL), -1);
     let timeless = asm.jcc(Cond::E);
     read_count(&mut asm, places.count);
-    asm.place(Rcx, slot);
+    // The count clobbered the slot's address: find it again.
+    load.address_into_rax(&mut asm);
+    device_read_slot_into_rcx(&mut asm, places.reads, site);
     asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_UNTIL));
     let due = asm.jcc(Cond::Ae);
     asm.bind(timeless);
@@ -2306,6 +2479,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 9,
                 offset: 0x14,
+                index: None,
                 rt: 8,
                 bytes: 4
             })
@@ -2315,6 +2489,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 1,
                 offset: 0,
+                index: None,
                 rt: 0,
                 bytes: 8
             })
@@ -2324,6 +2499,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 3,
                 offset: 1,
+                index: None,
                 rt: 2,
                 bytes: 1
             })
@@ -2333,6 +2509,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 5,
                 offset: 6,
+                index: None,
                 rt: 4,
                 bytes: 2
             })
@@ -2343,18 +2520,53 @@ mod tests {
             Some(DeviceLoad {
                 rn: 1,
                 offset: -4,
+                index: None,
                 rt: 0,
                 bytes: 4
             })
         );
+        // ldr x13, [x11, w13, uxtw]; ldr w0, [x1, x2]; ldr x0, [x1, w2, sxtw #3]
+        let indexed = |rn, rm, extend, shift, rt, bytes| DeviceLoad {
+            rn,
+            offset: 0,
+            index: Some(DeviceIndex { rm, extend, shift }),
+            rt,
+            bytes,
+        };
+        assert_eq!(
+            DeviceLoad::of(0xf86d_496d),
+            Some(indexed(11, 13, IndexExtend::Unsigned, 0, 13, 8))
+        );
+        assert_eq!(
+            DeviceLoad::of(0xb862_6820),
+            Some(indexed(1, 2, IndexExtend::Whole, 0, 0, 4))
+        );
+        assert_eq!(
+            DeviceLoad::of(0xf862_d820),
+            Some(indexed(1, 2, IndexExtend::Signed, 3, 0, 8))
+        );
+        let x = |r: u8| match r {
+            1 => 0x1000,
+            2 => 0xffff_ffff_ffff_fff0,
+            11 => 0x2000,
+            13 => 0xffff_ffff_0000_0040,
+            _ => 0,
+        };
+        assert_eq!(DeviceLoad::of(0xf86d_496d).unwrap().address(x), 0x2040);
+        assert_eq!(
+            DeviceLoad::of(0xf862_d820).unwrap().address(x),
+            0x1000 - 0x80
+        );
+        assert_eq!(DeviceLoad::of(0xb85f_c020).unwrap().address(x), 0xffc);
         // ldr x0, [sp]; ldrsw x0, [x1]; str w0, [x1]; ldr w0, [x1], #4;
-        // ldr w0, [x1, x2]
+        // ldr w0, [x1, xzr]; ldr w0, [x1, w2, uxth] (unallocated)
         for other in [
             0xf940_03e0_u32,
             0xb980_0020,
             0xb900_0020,
             0xb840_4420,
-            0xb862_6820,
+            0xb87f_6820,
+            0xb862_2820,
         ] {
             assert_eq!(DeviceLoad::of(other), None, "{other:#x}");
         }
@@ -2377,6 +2589,7 @@ mod tests {
         let load = DeviceLoad {
             rn: 1,
             offset: 0x10,
+            index: None,
             rt: 2,
             bytes: 4,
         };
@@ -2404,7 +2617,7 @@ mod tests {
         state.anchors[Anchor::Count] = &mut *count as *mut Count as u64;
         state.x[1] = 0xffff_fe00_1000_0000;
         let key = device_read_key(3, 1, false);
-        let slot = device_read_slot(SITE);
+        let slot = device_read_slot(SITE, 0xffff_fe00_1000_0010);
         // SAFETY: `base` points into the live box; written between runs.
         let data = |f: &mut dyn FnMut(&mut Data)| unsafe { f(&mut *base) };
         assert_eq!(run(&thunk.code, &mut state), MISS);
@@ -2452,6 +2665,88 @@ mod tests {
         assert_eq!(state.x[2], 0xabcd);
     }
 
+    /// One indexed load site reading a counter of each cluster in turn
+    /// (`ldr x13, [x11, w13, uxtw]`) completes each from the slot of its
+    /// own address, the timed one past its deadline exiting.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn indexed_device_reads_keep_a_slot_per_address() {
+        use crate::GuestState;
+        use core::mem::offset_of;
+        use core::sync::atomic::Ordering::Relaxed;
+        #[repr(C)]
+        struct Data {
+            key: Cell,
+            reads: [DeviceRead; DEVICE_READS],
+        }
+        const SITE: u64 = 0x8_0000_2144;
+        const CLUSTERS: [u64; 2] = [0xffff_fe00_2000_4100, 0xffff_fe00_2004_4100];
+        let load = DeviceLoad::of(0xf86d_496d).expect("an indexed load");
+        let slots = CLUSTERS.map(|address| device_read_slot(SITE, address + 0x20));
+        assert_ne!(slots[0], slots[1]);
+        let mut data = alloc::boxed::Box::new(Data {
+            key: Cell::default(),
+            reads: [DeviceRead::default(); DEVICE_READS],
+        });
+        let base = &mut *data as *mut Data;
+        let epoch = alloc::boxed::Box::new(AtomicU64::new(7));
+        let published = alloc::boxed::Box::new(CountState::default());
+        published.offset.store(100, Relaxed);
+        published.ceiling.store(u64::MAX, Relaxed);
+        let mut count = alloc::boxed::Box::new(Count {
+            state: &*published as *const CountState as u64,
+            ..Count::default()
+        });
+        let places = DeviceReadPlaces {
+            reads: Place::new(Anchor::Mirrors, offset_of!(Data, reads)),
+            key: Place::new(Anchor::Mirrors, offset_of!(Data, key)),
+            count: READER,
+        };
+        let thunk = device_read_thunk(PC, SITE, load, places);
+        let mut state = GuestState::default();
+        state.anchors[Anchor::Mirrors] = base as u64;
+        state.anchors[Anchor::Count] = &mut *count as *mut Count as u64;
+        let key = device_read_key(3, 1, false);
+        // SAFETY: `base` points into the live box; written between runs.
+        let data = |f: &mut dyn FnMut(&mut Data)| unsafe { f(&mut *base) };
+        data(&mut |d| {
+            d.key = Cell {
+                readable: 1,
+                value: key,
+            };
+            for (cluster, (&slot, &address)) in slots.iter().zip(&CLUSTERS).enumerate() {
+                d.reads[slot] = DeviceRead {
+                    site: SITE,
+                    address: address + 0x20,
+                    key,
+                    epoch: &*epoch as *const AtomicU64 as u64,
+                    seen: 7,
+                    value: 0x100 + cluster as u64,
+                    until: if cluster == 0 { u64::MAX } else { 1000 },
+                };
+            }
+        });
+        for _ in 0..2 {
+            for (cluster, &address) in CLUSTERS.iter().enumerate() {
+                state.x[11] = address;
+                state.x[13] = 0xdead_0000_0000_0020;
+                assert_eq!(run(&thunk.code, &mut state), NEXT);
+                assert_eq!(state.x[13], 0x100 + cluster as u64);
+            }
+        }
+        // Another index, or the timed cluster past its deadline, exits.
+        state.x[11] = CLUSTERS[0];
+        state.x[13] = 0x28;
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        data(&mut |d| d.reads[slots[1]].until = 50);
+        state.x[11] = CLUSTERS[1];
+        state.x[13] = 0x20;
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        state.x[11] = CLUSTERS[0];
+        assert_eq!(run(&thunk.code, &mut state), NEXT);
+        assert_eq!(state.x[13], 0x100);
+    }
+
     /// What the event thunks of these tests find at [`Anchor::Mirrors`].
     #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
     #[repr(C)]
@@ -2462,6 +2757,7 @@ mod tests {
         monitor: u64,
         lines_until: u64,
         spin: EventSpin,
+        stream: EventStream,
     }
 
     /// The event thunks of these tests, and their words: an event register,
@@ -2493,6 +2789,7 @@ mod tests {
                 lines_until: place(offset_of!(Waits, lines_until)),
                 count: READER,
                 spin: place(offset_of!(Waits, spin)),
+                stream: place(offset_of!(Waits, stream)),
             };
             let published = alloc::boxed::Box::new(CountState::default());
             published.offset.store(100, Relaxed);
@@ -2578,6 +2875,45 @@ mod tests {
         assert_eq!(events.event.load(Relaxed), 0);
         assert_eq!(events.wait(), MISS);
         assert_eq!(events.waits.spin, EventSpin::default(), "no spin");
+    }
+
+    /// With the register clear, an event stream edge at or before the count
+    /// (held at 100) completes the WFE, before a monitor or a trap is
+    /// looked at: the sample moves to the count and the next edge to the
+    /// first one past it. Without one, the WFE goes on as before.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn event_waits_take_a_stream_edge_since_the_sample() {
+        let mut events = Events::new(0);
+        events.open();
+        events.waits.monitor = 1;
+        assert_eq!(events.wait(), MISS, "no stream");
+        for (next, after) in [(100, 108), (60, 108), (93, 101)] {
+            events.waits.stream = EventStream {
+                next,
+                period: 8,
+                sampled: 7,
+            };
+            assert_eq!(events.wait(), NEXT, "{next}");
+            let stream = events.waits.stream;
+            assert_eq!((stream.next, stream.sampled), (after, 100), "{next}");
+            // The edge is taken: the next WFE finds none.
+            assert_eq!(events.wait(), MISS, "{next}");
+        }
+        assert_eq!(events.waits.spin.streamed, 3);
+        events.waits.stream.next = 101;
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(events.waits.stream.sampled, 100);
+        // Edges without a period: one is taken, the next is the engine's.
+        events.waits.stream = EventStream {
+            next: 99,
+            period: 0,
+            sampled: 7,
+        };
+        assert_eq!(events.wait(), NEXT);
+        assert_eq!(events.waits.stream.next, u64::MAX);
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(events.waits.spin.streamed, 4);
     }
 
     /// Where the WFE would wait, a clear event register makes it spin: it
@@ -2846,7 +3182,7 @@ mod tests {
     #[test]
     fn instruction_counter_thunks_add_what_native_code_retired() {
         use crate::GuestState;
-        use crate::x86_64::chain::ChainControl;
+        use crate::x86_64::chain::Account;
         #[repr(C)]
         struct Cells {
             cell: Cell,
@@ -2867,14 +3203,14 @@ mod tests {
                 steps: [0; crate::x86_64::transition::STATES],
             },
         });
-        let mut control = alloc::boxed::Box::new(ChainControl {
-            retired: 40,
-            ..ChainControl::default()
-        });
         let read = instruction_counter_thunk(PC, 3, CELL, PLAIN, COUNTER, 5).unwrap();
         let mut state = GuestState::default();
         state.anchors[Anchor::Mirrors] = &mut *cells as *mut Cells as u64;
-        state.anchors[Anchor::Control] = &mut *control as *mut ChainControl as u64;
+        // A budget beside the instructions, which the read leaves out.
+        state.account = Account::new(3).with_retired(40).0;
+        let set_retired = |state: &mut GuestState, retired: u64| {
+            state.account = Account(state.account).with_retired(retired).0;
+        };
         // Closed and not plain: the engine.
         state.x[3] = 0xdead;
         assert_eq!(run(&read.code, &mut state), MISS);
@@ -2892,25 +3228,25 @@ mod tests {
             }
         );
         // Open: its value until the cell closes again.
-        control.retired = 400;
+        set_retired(&mut state, 400);
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], 1_045);
         cells.cell.readable = 0;
-        for retired in [0, 1, 400, 1 << 40] {
-            control.retired = retired;
+        for retired in [0, 1, 400, (1 << 47) - 1] {
+            set_retired(&mut state, retired);
             assert_eq!(run(&read.code, &mut state), NEXT, "{retired}");
             assert_eq!(Some(state.x[3]), cells.counter.at(retired + 5), "{retired}");
             cells.cell.readable = 0;
         }
         // Wrapped to the counter's width.
-        control.retired = 0;
+        set_retired(&mut state, 0);
         cells.counter.base = u64::MAX >> 16;
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], 4);
         cells.cell.readable = 0;
         // Not counting: the count as it stands.
         cells.counter.step = 0;
-        control.retired = 1 << 40;
+        set_retired(&mut state, (1 << 47) - 1);
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], u64::MAX >> 16);
         cells.cell.readable = 0;
@@ -2930,7 +3266,7 @@ mod tests {
             overflow: 0,
             steps: [0; crate::x86_64::transition::STATES],
         };
-        control.retired = 7;
+        set_retired(&mut state, 7);
         let discard = instruction_counter_thunk(PC, 31, CELL, PLAIN, COUNTER, 0).unwrap();
         assert!(discard.code.len() < read.code.len());
         assert_eq!(run(&discard.code, &mut state), NEXT);
@@ -2941,12 +3277,12 @@ mod tests {
         cells.counter.overflow = 1 << 63;
         cells.counter.base = (1 << 63) - 13;
         cells.cell.readable = 0;
-        control.retired = 7;
+        set_retired(&mut state, 7);
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], (1 << 63) - 1);
         assert_eq!(cells.counter.at(12), Some((1 << 63) - 1));
         cells.cell.readable = 0;
-        control.retired = 8;
+        set_retired(&mut state, 8);
         state.x[3] = 0xdead;
         assert_eq!(cells.counter.at(13), None);
         assert_eq!(run(&read.code, &mut state), MISS);

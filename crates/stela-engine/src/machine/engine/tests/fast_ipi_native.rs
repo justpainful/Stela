@@ -6,15 +6,19 @@
 use super::super::transitions::tests::run_native;
 use super::*;
 use crate::machine::fast_ipi::{Register, Sent, Table, Word};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
+};
 
-/// One CPU's words as a board holds them.
+/// One CPU's words as a board holds them, its PE's chaining control among
+/// them.
 #[derive(Default)]
 struct Cpu {
     status: AtomicU64,
     armed: AtomicBool,
     lines: AtomicU64,
-    interrupt: AtomicU64,
+    control: UnsafeCell<ChainControl>,
     sleeping: AtomicBool,
 }
 
@@ -25,8 +29,9 @@ struct Board {
     table: Table,
 }
 
-/// A CPU's (status, armed, lines, interrupt, sleeping).
-type Words = (u64, bool, u64, u64, bool);
+/// A CPU's (status, armed, lines, (interruption epoch, quiet word),
+/// sleeping).
+type Words = (u64, bool, u64, (u64, u64), bool);
 
 impl Board {
     fn new() -> alloc::boxed::Box<Self> {
@@ -42,7 +47,7 @@ impl Board {
         let table = Table::new(&words, 3, |pe| {
             (
                 cpus[pe].lines.as_ptr() as u64,
-                cpus[pe].interrupt.as_ptr() as u64,
+                cpus[pe].control.get() as u64,
                 cpus[pe].sleeping.as_ptr() as u64,
             )
         });
@@ -57,7 +62,11 @@ impl Board {
                     cpu.status.load(SeqCst),
                     cpu.armed.load(SeqCst),
                     cpu.lines.load(SeqCst),
-                    cpu.interrupt.load(SeqCst),
+                    {
+                        // SAFETY: no send runs; nothing else writes it.
+                        let control = unsafe { *cpu.control.get() };
+                        (control.interrupt_epoch, control.quiet.0)
+                    },
                     cpu.sleeping.load(SeqCst),
                 )
             })
@@ -68,7 +77,13 @@ impl Board {
         let cpu = &self.cpus[n];
         cpu.status.store(status, SeqCst);
         cpu.armed.store(armed, SeqCst);
-        cpu.interrupt.store(interrupt, SeqCst);
+        // SAFETY: as in `words`.
+        unsafe {
+            *cpu.control.get() = ChainControl {
+                interrupt_epoch: interrupt,
+                ..ChainControl::default()
+            };
+        }
         cpu.sleeping.store(sleeping, SeqCst);
     }
 }

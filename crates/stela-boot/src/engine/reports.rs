@@ -90,7 +90,8 @@ impl TranslatedSeen {
 /// The host's shadow counters at the last heartbeat.
 #[derive(Default)]
 pub(super) struct ShadowSeen {
-    pub(super) counts: [u64; 14],
+    pub(super) counts: [u64; 29],
+    pub(super) gate: [u64; 7],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
 }
@@ -106,7 +107,20 @@ impl ShadowSeen {
     /// found the half kept, and the kept halves dropped; the switches
     /// between the roots of SPRR_PERM_EL0, SPRR_PERM_EL1 and E0PD1 values
     /// and those that found none kept; the TLBIs that unmapped ranges
-    /// instead; and the root loads for a change of view.
+    /// instead; and the root loads for a change of view. Then every #PF
+    /// from native code with its mean time, those that ended the block (a
+    /// guest fault, a device access, anything else), the fills by cause
+    /// (`stela_boot_core::shadow_fills`: first, another view, unmapped by
+    /// a TLBI by address, after the loss of the half, a write to a read-only
+    /// mapping), the guest walks fills made and those that started at the
+    /// fault's leaf table, the shadow frames taken, the kept lower halves
+    /// whose frames went back to the pool, the pages regions mapped
+    /// again at their first fill after their half was lost, the fills the
+    /// #PF gate made without saving extended state, and a fill's mean time
+    /// by segment: its walk, its mapping and prefill, fault-around and
+    /// restores; then the TLBIs by address that reached nothing of the
+    /// shadow, the root walks the others' unmapping took, and the mean
+    /// nanoseconds of the shadow's part of each.
     pub(super) fn report(&mut self) {
         let host = host::statistics();
         let counts = [
@@ -124,6 +138,30 @@ impl ShadowSeen {
             host.view_switches,
             host.fill_ns,
             host.around,
+            host.faults,
+            host.fault_ns,
+            host.abandoned[0],
+            host.abandoned[1],
+            host.abandoned[2],
+            host.walks,
+            host.table_walks,
+            host.frames,
+            host.fill_causes[0],
+            host.fill_causes[1],
+            host.fill_causes[2],
+            host.fill_causes[3],
+            host.fill_causes[4],
+            host.reclaimed,
+            host.restored,
+        ];
+        let gate = [
+            host.gate_fills,
+            host.fill_segment_ns[0],
+            host.fill_segment_ns[1],
+            host.fill_segment_ns[2],
+            host.empty_tlbis,
+            host.unmap_walks,
+            host.scoped_ns,
         ];
         let [
             fills,
@@ -140,9 +178,37 @@ impl ShadowSeen {
             view_switches,
             fill_ns,
             around,
+            faults,
+            fault_ns,
+            guest_faults,
+            device_faults,
+            other_faults,
+            walks,
+            table_walks,
+            frames,
+            first,
+            view,
+            unmapped,
+            lost,
+            upgrade,
+            reclaimed,
+            restored,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
+        let [
+            gate_fills,
+            walk_ns,
+            map_ns,
+            around_ns,
+            empty_tlbis,
+            unmap_walks,
+            scoped_ns,
+        ] = core::array::from_fn(|index| gate[index] - self.gate[index]);
+        self.gate = gate;
         let fill_ns_each = fill_ns / fills.max(1);
+        let fault_ns_each = fault_ns / faults.max(1);
+        let [walk_ns_each, map_ns_each, around_ns_each] =
+            [walk_ns, map_ns, around_ns].map(|ns| ns / fills.max(1));
         let [_, sprr, table, controls, tags, invalidated, maintained] =
             core::array::from_fn(|index| host.reset_causes[index] - self.causes[index]);
         self.causes = host.reset_causes;
@@ -167,7 +233,16 @@ impl ShadowSeen {
              lower_resets={lower_resets} lower_switches={lower_switches} \
              lower_found={lower_found} kept_dropped={kept_dropped} \
              bank_switches={bank_switches} bank_misses={bank_misses} scoped={scoped} \
-             view_switches={view_switches} fill_ns_each={fill_ns_each} around={around}\n"
+             view_switches={view_switches} fill_ns_each={fill_ns_each} around={around} \
+             faults={faults} fault_ns_each={fault_ns_each} guest_faults={guest_faults} \
+             device_faults={device_faults} other_faults={other_faults} first={first} \
+             view={view} unmapped={unmapped} lost={lost} upgrade={upgrade} walks={walks} \
+             table_walks={table_walks} frames={frames} reclaimed={reclaimed} \
+             restored={restored} gate_fills={gate_fills} walk_ns_each={walk_ns_each} \
+             map_ns_each={map_ns_each} around_ns_each={around_ns_each} \
+             empty_tlbis={empty_tlbis} unmap_walks={unmap_walks} \
+             scoped_ns_each={}\n",
+            scoped_ns / scoped.max(1)
         ));
         if let Some((from, to)) = host.last_controls
             && controls > 0

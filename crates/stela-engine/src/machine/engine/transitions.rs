@@ -1232,13 +1232,7 @@ pub(super) mod tests {
         let causes: [Cause; 2] = [
             |_, clock| clock.offset.store(DUE, Relaxed),
             |machine, _| {
-                machine
-                    .chain
-                    .weak_storage()
-                    .upgrade()
-                    .unwrap()
-                    .interrupt_epoch()
-                    .fetch_add(1, Relaxed);
+                machine.chain.weak_storage().upgrade().unwrap().notify();
             },
         ];
         for (index, cause) in causes.into_iter().enumerate() {
@@ -1504,13 +1498,7 @@ pub(super) mod tests {
                 .offset
                 .store(if case == 2 { DUE } else { DUE - 1 }, Relaxed);
             if case == 1 {
-                machine
-                    .chain
-                    .weak_storage()
-                    .upgrade()
-                    .unwrap()
-                    .interrupt_epoch()
-                    .fetch_add(1, Relaxed);
+                machine.chain.weak_storage().upgrade().unwrap().notify();
             }
             let options = stela_compiler::Options::new(
                 stela_compiler::block::BlockProfile::new(

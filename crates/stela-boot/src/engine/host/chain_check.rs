@@ -15,7 +15,8 @@
 //!   out of their page take: a direct jump while this PE's stamp holds, after
 //!   the first transfer's stamping cell probe.
 //!
-//! Each runs until its budget of transfers is spent; the line
+//! Each runs in native runs that each end when their budget of transfers is
+//! spent; the line
 //! (`stela_boot_core::chain_check::transfer_line`) gives the best of three
 //! runs in ns per transfer, the share of the stamped ring's transfers its
 //! stamps sent straight on, each transfer as a multiple of this core's own
@@ -26,7 +27,7 @@ use super::local;
 use crate::{apic::rdtsc, output};
 use alloc::vec::Vec;
 use stela_compiler::{
-    Anchor, GuestState,
+    Anchor, GuestAddress, GuestState,
     block::ExitKind,
     x86_64::{
         chain::{self, ChainControl, ExitWord, LookupEntry, LookupTable},
@@ -37,8 +38,11 @@ use stela_engine::machine::{Host, NativeCode};
 
 /// Blocks per ring: half in each page.
 const BLOCKS: usize = 32;
-/// Transfers per timed run.
+/// Transfers per timed run, in native runs of [`RUN`] transfers each, as
+/// one native run allows at most `chain::MAX_BUDGET`.
 const TRANSFERS: u64 = 1 << 20;
+const RUN: u64 = 1 << 15;
+const _: () = assert!(RUN <= chain::MAX_BUDGET && TRANSFERS.is_multiple_of(RUN));
 /// Bytes per stub block, per tail and per thunk.
 const STRIDE: usize = 256;
 const _: () = assert!(STRIDE >= chain::STAMPED_TAIL_BYTES);
@@ -58,8 +62,8 @@ const BURST_LOOPS: u64 = 64;
 /// The pieces of a probe transfer apart, each eight times a loop
 /// (`fn(loops: u64, data: *mut u64)`): a host CALL and RET pair on this
 /// stack; PUSH of two memory words and two POPs; a read-modify-write of one
-/// heap word, as the budget's; an indirect jump to the next instruction, as
-/// a tail's into its block.
+/// heap word, as a table probe's hit count; an indirect jump to the next
+/// instruction, as a tail's into its block.
 const RAW: [(&str, &[u8]); 4] = [
     ("callret", &[0xe8, 0, 0, 0, 0]),
     ("push", &[0xff, 0x36, 0xff, 0x76, 0x08, 0x58, 0x58]),
@@ -178,10 +182,12 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
         let next = (block + 1) % BLOCKS;
         let at = block_at(block);
         let tail = tail_at(block);
-        // The block: `movabs rax, next pc; jmp tail`, as a direct exit.
-        let mut exit = alloc::vec![0x48, 0xb8];
-        exit.extend(pc(next).to_le_bytes());
-        exit.extend(chain::jump(at + exit.len() as u64, tail)?);
+        // The block: a direct exit to the next PC whose patch point jumps
+        // to its tail, as a linked one does.
+        let mut exit = chain::direct_exit_at(at, GuestAddress(pc(next)), word);
+        let point = chain::direct_patch(at);
+        let offset = (point - at) as usize;
+        exit[offset..offset + chain::PATCH_BYTES].copy_from_slice(&chain::jump(point, tail)?);
         put(BLOCKS_AT + block * STRIDE, &exit);
         let tail_code = match ring {
             Ring::Near => chain::thunk(
@@ -189,13 +195,14 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
                 1,
                 next as u32,
                 block_at(next),
-                chain::Fallback::Return(word),
+                chain::unlinked_return(point),
+                chain::LinkGate::for_target(crate::engine::target(true)),
             )?,
             Ring::Cell => {
                 let current = table.find(table.slot(pc(next), key), pc(next), key);
                 let cell = table.link_cell(tail, pc(next), Some(current));
                 let probe = base + (DISPATCHER + chain::CELL_PROBE_ENTRY) as u64;
-                chain::cell_tail(tail, cell, word, 1, probe)?.to_vec()
+                chain::cell_tail(tail, cell, pc(next), word, 1, probe)?.to_vec()
             }
             Ring::Table => {
                 let probe = base + (DISPATCHER + chain::PROBE_ENTRY) as u64;
@@ -347,17 +354,20 @@ fn measure(ring: Ring, host: &mut impl Host, installed: NativeCode) -> Option<(f
     let mut state = alloc::boxed::Box::new(GuestState::default());
     state.anchors[Anchor::Control] = &raw mut *control as u64;
     type Entry = unsafe extern "sysv64" fn(*mut GuestState) -> u128;
-    // SAFETY: installed above: the pinned entry, then a ring whose every
-    // transfer stays in this region until the budget ends it with a return.
+    // SAFETY: installed above: the pinned entry, which takes the account
+    // from the state, then a ring whose every transfer stays in this region
+    // until the budget ends it with a return.
     let entry: Entry = unsafe { core::mem::transmute(base as usize + ENTRY) };
     let hz = local::state().tsc_hz.max(1);
     let mut best = u64::MAX;
     for _ in 0..3 {
-        control.budget = TRANSFERS;
         let started = rdtsc();
-        // SAFETY: as above; the ring touches only `state`, `control`, the
-        // tables and this stack.
-        core::hint::black_box(unsafe { entry(&raw mut *state) });
+        for _ in 0..TRANSFERS / RUN {
+            state.account = chain::Account::new(RUN).0;
+            // SAFETY: as above; the ring touches only `state`, `control`,
+            // the tables and this stack.
+            core::hint::black_box(unsafe { entry(&raw mut *state) });
+        }
         best = best.min(rdtsc().wrapping_sub(started));
     }
     // SAFETY: `stamps` is the table's, which lives.

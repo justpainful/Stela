@@ -174,11 +174,16 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// Whether `read_back`'s copy completed, after a [`Self::poll`].
     pub fn read_back_complete(&mut self, read_back: &ReadBack) -> Result<bool> {
+        self.completes(read_back.serial)
+    }
+
+    /// Whether command buffer `serial` completed, after a [`Self::poll`].
+    pub fn completes(&mut self, serial: u64) -> Result<bool> {
         if self.is_lost() {
             return Err(Error::DeviceLost);
         }
         self.poll()?;
-        Ok(self.serial_complete(read_back.serial))
+        Ok(self.serial_complete(serial))
     }
 
     /// Frees `read_back`'s memory once its copy no longer runs.

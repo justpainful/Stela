@@ -11,7 +11,7 @@
 use super::{BufferRef, CommandBuffer, Encoder, MappedRange, Resolver};
 use crate::metal::{
     abi::BlitOption,
-    binding::{ReorderArguments, ResourceId, TexelArguments},
+    binding::{ComposeArguments, ReorderArguments, ResourceId, TexelArguments},
     error::{Error, Result, ensure, require},
     hazard::Use,
     pixel_format::{Description, Encoding, Kind},
@@ -547,6 +547,35 @@ impl CommandBuffer {
             region,
         });
         self.synchronize()
+    }
+
+    /// Runs the compose kernel over `arguments`' pixels: display layers
+    /// blended into a scanout buffer's rows, which the command buffer's
+    /// completion makes the display's to show.
+    pub(crate) fn compose(
+        &mut self,
+        resolver: &mut dyn Resolver,
+        arguments: &ComposeArguments,
+    ) -> Result<()> {
+        self.blit()?;
+        let bytes = arguments.encode().ok_or(Error::Unsupported(
+            "display compositions of more than four layers",
+        ))?;
+        if arguments.count == 0 {
+            return Ok(());
+        }
+        let upload = self
+            .recorder
+            .upload(resolver, &bytes, ComposeArguments::ALIGNMENT)?;
+        self.recorder.access(Use::new(
+            PipelineStages::COMPUTE_SHADER,
+            Access::SHADER_READ.union(Access::SHADER_WRITE),
+        ));
+        self.recorder.push(Command::Compose {
+            arguments: upload.address,
+            count: arguments.count,
+        });
+        Ok(())
     }
 
     /// `synchronizeTexture:slice:level:` for a managed texture whose CPU copy

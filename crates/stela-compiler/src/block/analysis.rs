@@ -19,6 +19,8 @@ pub(super) struct ParsedBlock {
     pub(super) terminal: Option<(GuestAddress, Terminator)>,
     pub(super) next_pc: GuestAddress,
     pub(super) source_bytes: usize,
+    /// Its branches into itself jump there ([`super::region`]).
+    pub(super) region: bool,
 }
 
 /// An analysis failure at the instruction that caused it.
@@ -115,8 +117,21 @@ pub(super) fn analyze_parsed(parsed: &ParsedBlock) -> BlockAnalysis {
     let mut thread_register_instruction = None;
     let mut amx_instruction = None;
     let mut add = |kind, target| successors.push(StaticSuccessor { kind, target });
+    // A region's branches into itself are no successors; its B to
+    // elsewhere is one.
+    let count = parsed.source_bytes / 4;
+    let base = parsed
+        .instructions
+        .first()
+        .map_or(parsed.next_pc, |first| first.pc);
     for instruction in &parsed.instructions {
-        if let Some(target) = instruction.operation.conditional_target() {
+        if parsed.region {
+            if let Some((target, _)) = super::region::branch_target(&instruction.operation)
+                && super::region::index_of(base, count, target).is_none()
+            {
+                add(SuccessorKind::ConditionalTarget, target);
+            }
+        } else if let Some(target) = instruction.operation.conditional_target() {
             add(SuccessorKind::ConditionalTarget, target);
         }
     }
@@ -270,7 +285,6 @@ pub(super) fn parse_admitted(
     native: NativeSystem,
     mut admit: impl FnMut(u32) -> bool,
 ) -> Result<ParsedBlock, BlockAnalysisError> {
-    let inline_pointer = native.pointer.is_some();
     // Only the engine's own system-mode blocks read its cells.
     let mirrored = if profile == BlockProfile::new(Features::SYSTEM_MODE) {
         native.mirrored
@@ -293,28 +307,156 @@ pub(super) fn parse_admitted(
             },
         });
     }
+    let full_system = profile.has(Features::FULL_SYSTEM);
+    let checked_memory = profile.checked_memory().is_some();
+    let words = Words {
+        inline_pointer: native.pointer.is_some(),
+        mirrored,
+        profile,
+        native,
+        full_system,
+        pointer_authentication: profile.has(Features::POINTER_AUTHENTICATION),
+        checked_memory,
+        restricted_system: profile.has(Features::SYSTEM) && !full_system,
+    };
+    // A region scans on past the branch a block ends at ([`super::region`]).
+    let regions = native.regions
+        && profile == BlockProfile::new(Features::SYSTEM_MODE)
+        && full_system
+        && !checked_memory;
     // Room for most blocks' instructions, rather than growing from empty.
     let mut instructions = Vec::with_capacity((source.len() / 4).min(INSTRUCTIONS_HINT));
     let mut terminal = None;
     let mut source_bytes = 0;
     let mut side_exits = 0;
     let mut next_pc = base;
-    let full_system = profile.has(Features::FULL_SYSTEM);
-    let pointer_authentication = profile.has(Features::POINTER_AUTHENTICATION);
-    let checked_memory = profile.checked_memory().is_some();
-    let restricted_system = profile.has(Features::SYSTEM) && !full_system;
+    // Where a block would have ended: the index of its terminal branch,
+    // which a region's scan keeps among its instructions.
+    let mut block_end = None;
+    // Whether the scan stopped before a word past that point that it could
+    // not take, which then starts a block of its own.
+    let mut stopped = false;
     for bytes in source.as_chunks::<4>().0 {
         let word = u32::from_le_bytes(*bytes);
         if !admit(word) {
+            stopped = true;
             break;
         }
         let pc = next_pc;
-        next_pc = GuestAddress(pc.0.checked_add(4).ok_or(BlockAnalysisError {
-            pc,
-            encoding: None,
-            kind: CompileErrorKind::GuestAddressOverflow,
-        })?);
+        let Some(after) = pc.0.checked_add(4) else {
+            if block_end.is_some() {
+                stopped = true;
+                break;
+            }
+            return Err(BlockAnalysisError {
+                pc,
+                encoding: None,
+                kind: CompileErrorKind::GuestAddressOverflow,
+            });
+        };
+        let decoded = match words.decode(pc, word) {
+            Ok(decoded) => decoded,
+            Err(_) if block_end.is_some() => {
+                stopped = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        next_pc = GuestAddress(after);
         source_bytes += 4;
+        let instruction = match decoded {
+            Decoded::Push(instruction) => {
+                instructions.push(instruction);
+                continue;
+            }
+            Decoded::Terminal(decoded) => {
+                terminal = Some((pc, decoded));
+                break;
+            }
+            Decoded::Lifted(instruction) => instruction,
+        };
+        // Code lays its likely path out straight ahead, so a block runs past
+        // a forward conditional branch and leaves by a side exit when it is
+        // taken. A branch back is likely taken, and ends the block.
+        if block_end.is_none()
+            && side_exits < MAX_SIDE_EXITS
+            && source_bytes < source.len()
+            && full_system
+            && !checked_memory
+            && instruction
+                .operation
+                .conditional_target()
+                .is_some_and(|target| target.0 > pc.0)
+        {
+            side_exits += 1;
+            instructions.push(instruction);
+            continue;
+        }
+        if matches!(
+            instruction.operation,
+            Operation::Branch { .. }
+                | Operation::BranchCondition { .. }
+                | Operation::BranchZero { .. }
+                | Operation::BranchBit { .. }
+        ) {
+            if regions {
+                block_end.get_or_insert(instructions.len());
+                instructions.push(instruction);
+                continue;
+            }
+            terminal = Some((pc, Terminator::Branch(instruction.operation)));
+            break;
+        }
+        instructions.push(instruction);
+    }
+    let ended = stopped || terminal.is_some();
+    let parsed = ParsedBlock {
+        instructions,
+        terminal,
+        next_pc,
+        source_bytes,
+        region: false,
+    };
+    match block_end {
+        Some(end) => Ok(super::region::form(parsed, end, ended, native)),
+        None => Ok(parsed),
+    }
+}
+
+/// What one word of a block's source is.
+enum Decoded {
+    /// An instruction the block holds whatever comes after it.
+    Push(Instruction),
+    /// The block's terminal.
+    Terminal(Terminator),
+    /// A lifted instruction: a branch may end the block.
+    Lifted(Instruction),
+}
+
+/// How [`parse_admitted`] decodes the words of one profile.
+struct Words {
+    inline_pointer: bool,
+    mirrored: crate::x86_64::mirrored_read::Reads,
+    profile: BlockProfile,
+    native: NativeSystem,
+    full_system: bool,
+    pointer_authentication: bool,
+    checked_memory: bool,
+    restricted_system: bool,
+}
+
+impl Words {
+    fn decode(&self, pc: GuestAddress, word: u32) -> Result<Decoded, BlockAnalysisError> {
+        let Self {
+            inline_pointer,
+            mirrored,
+            profile,
+            native,
+            full_system,
+            pointer_authentication,
+            checked_memory,
+            restricted_system,
+        } = *self;
         // The commonest integer words, which no decoder here takes either
         // (`tests::direct_words_skip_the_block_decoders`), go to their
         // decoder directly.
@@ -329,14 +471,14 @@ pub(super) fn parse_admitted(
                 })?
             {
                 if inline_pointer && crate::x86_64::pointer::inline::inlines(decoded.operation) {
-                    instructions.push(Instruction {
+                    return Ok(Decoded::Push(Instruction {
                         pc,
                         operation: Operation::PointerAuthentication(decoded.operation),
-                    });
-                    continue;
+                    }));
                 }
-                terminal = Some((pc, Terminator::PointerAuthentication(decoded)));
-                break;
+                return Ok(Decoded::Terminal(Terminator::PointerAuthentication(
+                    decoded,
+                )));
             }
             use crate::aarch64::system::synchronization::{Operation as Sync, decode};
             let synchronization = decode(word);
@@ -345,11 +487,10 @@ pub(super) fn parse_admitted(
             // branch that ended the previous block, and the engine checks
             // that instruction before entering the block.
             if matches!(synchronization, Some(Sync::BranchTarget { .. })) {
-                instructions.push(Instruction {
+                return Ok(Decoded::Push(Instruction {
                     pc,
                     operation: Operation::Nop,
-                });
-                continue;
+                }));
             }
             // ISB executes as NOP in the serialized engine (Arm `ISB`): what
             // it synchronizes, a System register write, TLB or cache
@@ -362,11 +503,10 @@ pub(super) fn parse_admitted(
                     Some(Sync::InstructionSynchronization { .. })
                 )
             {
-                instructions.push(Instruction {
+                return Ok(Decoded::Push(Instruction {
                     pc,
                     operation: Operation::Nop,
-                });
-                continue;
+                }));
             }
             if let Some(decoded) = system::decode_system_mode_with_sync(pc, word, synchronization)
                 .map_err(|error| BlockAnalysisError {
@@ -378,11 +518,10 @@ pub(super) fn parse_admitted(
                     && access.direction() == crate::aarch64::system::registers::Direction::Read
                     && mirrored.cell(word).is_some()
                 {
-                    instructions.push(Instruction {
+                    return Ok(Decoded::Push(Instruction {
                         pc,
                         operation: Operation::MirroredRead { word },
-                    });
-                    continue;
+                    }));
                 }
                 // DC ZVA completes natively inside the engine's own blocks
                 // (`x86_64::zero_block`) with self-loops on: a loop zeroing
@@ -392,19 +531,17 @@ pub(super) fn parse_admitted(
                     && native.zero_block.is_some()
                     && let Some(rt) = crate::x86_64::zero_block::operand(&decoded)
                 {
-                    instructions.push(Instruction {
+                    return Ok(Decoded::Push(Instruction {
                         pc,
                         operation: Operation::ZeroBlock { rt },
-                    });
-                    continue;
+                    }));
                 }
                 // The shared lane executes these through the existing typed
                 // all-writer memory service, not the single-agent CPU monitor.
                 let checked = checked_memory
                     && matches!(decoded.operation, system::SystemOperation::Exclusive(Ok(_)));
                 if !checked {
-                    terminal = Some((pc, Terminator::System(decoded)));
-                    break;
+                    return Ok(Decoded::Terminal(Terminator::System(decoded)));
                 }
             }
         }
@@ -423,8 +560,7 @@ pub(super) fn parse_admitted(
                         | system::SystemOperation::PstateImmediate(_)
                 ))
         {
-            terminal = Some((pc, Terminator::System(decoded)));
-            break;
+            return Ok(Decoded::Terminal(Terminator::System(decoded)));
         }
         if !full_system
             && !direct
@@ -436,8 +572,9 @@ pub(super) fn parse_admitted(
                     kind: error.kind,
                 })?
         {
-            terminal = Some((pc, Terminator::PointerAuthentication(decoded)));
-            break;
+            return Ok(Decoded::Terminal(Terminator::PointerAuthentication(
+                decoded,
+            )));
         }
         if profile.has(Features::CLOCK)
             && !direct
@@ -448,8 +585,7 @@ pub(super) fn parse_admitted(
                     kind: error.kind,
                 })?
         {
-            terminal = Some((pc, Terminator::Clock(decoded)));
-            break;
+            return Ok(Decoded::Terminal(Terminator::Clock(decoded)));
         }
         if profile.has(Features::THREAD_REGISTERS)
             && !direct
@@ -462,8 +598,7 @@ pub(super) fn parse_admitted(
                     }
                 })?
         {
-            terminal = Some((pc, Terminator::ThreadRegister(decoded)));
-            break;
+            return Ok(Decoded::Terminal(Terminator::ThreadRegister(decoded)));
         }
         if profile.has(Features::AMX)
             && !direct
@@ -479,14 +614,12 @@ pub(super) fn parse_admitted(
                 && profile == BlockProfile::new(Features::SYSTEM_MODE)
                 && crate::x86_64::amx_transfer::in_block(decoded.operation)
             {
-                instructions.push(Instruction {
+                return Ok(Decoded::Push(Instruction {
                     pc,
                     operation: Operation::Amx(decoded),
-                });
-                continue;
+                }));
             }
-            terminal = Some((pc, Terminator::Amx(decoded)));
-            break;
+            return Ok(Decoded::Terminal(Terminator::Amx(decoded)));
         }
         if !direct
             && let Some(decoded) =
@@ -496,8 +629,7 @@ pub(super) fn parse_admitted(
                     kind: error.kind,
                 })?
         {
-            terminal = Some((pc, decoded));
-            break;
+            return Ok(Decoded::Terminal(decoded));
         }
         let instruction = if direct {
             crate::aarch64::lift_direct(pc, word)
@@ -531,44 +663,11 @@ pub(super) fn parse_admitted(
                 // Recover its exact prefix and complete through the existing FP
                 // service, including forms other profiles can execute inline.
                 let inline = (!checked).then_some(*operand);
-                terminal = Some((pc, Terminator::FloatingPoint { inline }));
-                break;
+                return Ok(Decoded::Terminal(Terminator::FloatingPoint { inline }));
             }
         }
-        // Code lays its likely path out straight ahead, so a block runs past
-        // a forward conditional branch and leaves by a side exit when it is
-        // taken. A branch back is likely taken, and ends the block.
-        if side_exits < MAX_SIDE_EXITS
-            && source_bytes < source.len()
-            && full_system
-            && !checked_memory
-            && instruction
-                .operation
-                .conditional_target()
-                .is_some_and(|target| target.0 > pc.0)
-        {
-            side_exits += 1;
-            instructions.push(instruction);
-            continue;
-        }
-        if matches!(
-            instruction.operation,
-            Operation::Branch { .. }
-                | Operation::BranchCondition { .. }
-                | Operation::BranchZero { .. }
-                | Operation::BranchBit { .. }
-        ) {
-            terminal = Some((pc, Terminator::Branch(instruction.operation)));
-            break;
-        }
-        instructions.push(instruction);
+        Ok(Decoded::Lifted(instruction))
     }
-    Ok(ParsedBlock {
-        instructions,
-        terminal,
-        next_pc,
-        source_bytes,
-    })
 }
 
 /// Validate and identify the consumed prefix without generating native code.

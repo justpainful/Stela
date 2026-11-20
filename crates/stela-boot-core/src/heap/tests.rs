@@ -460,8 +460,8 @@ fn size_class_reuse_preserves_other_live_bytes() {
 fn resizing_within_a_size_class_keeps_the_allocation() {
     let heap = Heap::new();
     let mut ram = backing();
-    let layout = Layout::from_size_align(50, 16).unwrap();
-    let smaller = Layout::from_size_align(34, 16).unwrap();
+    let layout = Layout::from_size_align(56, 16).unwrap();
+    let smaller = Layout::from_size_align(50, 16).unwrap();
     let larger = Layout::from_size_align(62, 16).unwrap();
     let next_class = Layout::from_size_align(65, 16).unwrap();
     // SAFETY: exclusive backing, valid nonzero layouts, and each resize
@@ -482,7 +482,7 @@ fn resizing_within_a_size_class_keeps_the_allocation() {
         assert!(!moved.is_null() && moved != shrunk);
         assert_eq!(
             core::slice::from_raw_parts(moved, smaller.size()),
-            &[0x5a; 34]
+            &[0x5a; 50]
         );
         heap.dealloc(moved, next_class);
     }
@@ -830,6 +830,64 @@ fn constrained_alignment_and_ordinary_pages_coalesce_together() {
     }
 }
 
+/// The sampled heap's range and what the sample hook heard of it.
+static SAMPLED_FROM: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_TO: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_FREES: AtomicUsize = AtomicUsize::new(0);
+
+fn heard(pointer: usize, bytes: usize, allocated: bool) {
+    let range = SAMPLED_FROM.load(Ordering::Relaxed)..SAMPLED_TO.load(Ordering::Relaxed);
+    if !range.contains(&pointer) {
+        return;
+    }
+    if allocated {
+        SAMPLED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        SAMPLED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SAMPLED_FREES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Sampling tells the hook one block in each sampled stretch of bytes, the
+/// samples standing for about the bytes allocated, a block of the stretch
+/// or more always, and every free under the tracked size; large blocks
+/// stay the large hook's alone.
+#[test]
+fn sampled_blocks_stand_for_the_bytes_allocated_and_every_free_is_told() {
+    const EVERY: usize = 64 << 10;
+    let heap = Heap::new();
+    let start = slab_aligned(&heap, 16 << 20);
+    SAMPLED_FROM.store(start, Ordering::Relaxed);
+    SAMPLED_TO.store(start + (16 << 20), Ordering::Relaxed);
+    set_sample_hook(heard, EVERY);
+    let small = Layout::from_size_align(64, 16).unwrap();
+    let medium = Layout::from_size_align(EVERY, 16).unwrap();
+    let large = Layout::from_size_align(TRACKED.load(Ordering::Relaxed), 16).unwrap();
+    // SAFETY: valid layouts, each block freed once.
+    unsafe {
+        let blocks: Vec<*mut u8> = (0..65536).map(|_| heap.alloc(small)).collect();
+        assert!(blocks.iter().all(|block| !block.is_null()));
+        // 4 MiB of 64-byte blocks: 64 samples of 64 KiB, give or take what
+        // other tests' heaps took from the first core's count meanwhile.
+        let samples = SAMPLED_BLOCKS.load(Ordering::Relaxed);
+        assert!((60..=68).contains(&samples), "{samples}");
+        assert_eq!(SAMPLED_BYTES.load(Ordering::Relaxed), samples * EVERY);
+        let block = heap.alloc(medium);
+        assert_eq!(SAMPLED_BLOCKS.load(Ordering::Relaxed), samples + 1);
+        heap.dealloc(block, medium);
+        let block = heap.alloc(large);
+        assert!(!block.is_null());
+        assert_eq!(SAMPLED_BLOCKS.load(Ordering::Relaxed), samples + 1);
+        heap.dealloc(block, large);
+        for block in blocks {
+            heap.dealloc(block, small);
+        }
+    }
+    assert_eq!(SAMPLED_FREES.load(Ordering::Relaxed), 65536 + 1);
+}
+
 /// A core's cache and counts share no cache line with another core's.
 #[test]
 fn each_cores_writes_stay_in_lines_of_its_own() {
@@ -1127,4 +1185,27 @@ fn a_stop_without_a_reserve_fails_instead_of_waiting() {
         assert!(!block.is_null());
         heap.dealloc(block, layout);
     }
+}
+
+/// Each request takes the smallest class that holds it, past the power of
+/// two below it by at most a half: three 24-byte records take 96 bytes,
+/// not 128; past the largest class, or aligned past 16, the free list.
+#[test]
+fn a_request_takes_the_smallest_class_that_holds_it() {
+    for size in 0..=4096 {
+        let class = class(Layout::from_size_align(size, 8).unwrap()).unwrap();
+        assert!(class_bytes(class) >= size.max(1), "{size}");
+        assert!(class == 0 || class_bytes(class - 1) < size, "{size}");
+        assert!(slab_bytes(class).is_power_of_two(), "{size}");
+        assert!(
+            (slab_bytes(class) - SLAB_FIRST) / class_bytes(class) >= 15,
+            "{size}"
+        );
+    }
+    assert_eq!(
+        class_bytes(class(Layout::from_size_align(72, 8).unwrap()).unwrap()),
+        96
+    );
+    assert_eq!(class(Layout::from_size_align(4097, 8).unwrap()), None);
+    assert_eq!(class(Layout::from_size_align(64, 32).unwrap()), None);
 }

@@ -14,6 +14,26 @@
 //! outputs between its loads and stores. Shader writes, views, blits and the
 //! CPU's copies of these textures are not implemented and are refused; the
 //! CPU reaches the surface's planes itself.
+//!
+//! Where the GPU's memory is not the guest RAM the planes lie in, a
+//! rendered texture keeps a device copy of its planes ([`PlaneCopy`]), whose
+//! linear images its sampled descriptors view: framebuffer reads (backdrop
+//! captures, blur copies) then run at the GPU's memory speed rather than
+//! across the bus. The copy holds what the planes hold whoever samples it,
+//! named or through an argument buffer (its aligned copies,
+//! [`Device::aligned_copy_commands`]): a command buffer refreshes it first
+//! when the CPU wrote the surface, whose new seed the guest reports of every
+//! live copied texture, and one that wrote the surface through another
+//! texture or a buffer refreshes it at its end; a pass after another
+//! texture over the same surface stored it in the same command buffer
+//! refreshes it before; and an encode writes each texel whose codes or
+//! alpha changed into the planes and the copy both, comparing with the
+//! copy, which replaces the working image's mirror. Decodes read the copy.
+//! The planes stay what the display, the CPU and other processes' textures
+//! read. A texture only sampled, as another process's over a surface it
+//! does not render, keeps no copy and samples the planes in guest RAM:
+//! correct, since they hold what the surface does, but across the bus,
+//! which the profile counts (`in_place` in GPU PASSES).
 use super::{Backing, Device, TestedCopyObject, TextureId, TextureObject};
 use crate::metal::{
     abi::TextureUsage,
@@ -21,13 +41,14 @@ use crate::metal::{
     capabilities::FormatCapabilities,
     command_buffer::BufferRef,
     error::{Error, Result, ensure},
-    pass::{AttachmentView, ExtendedPlanes, PlaneStaging, TestedCopy},
+    pass::{AttachmentView, ExtendedPlanes, PlaneCopy, TestedCopy},
     pixel_format::{Encoding, PixelFormat, Planes},
     resource::{self, CpuAccess, PlaneLayout, TextureDescriptor},
     shader::Compiler,
     vulkan::{
         BufferCreate, BufferUsage, ComponentSwizzle, ImageAspects, ImageCreate, ImageTiling,
         ImageType, ImageUsage, ImageViewType, MemoryProperties, SampleCounts,
+        backend::BufferAllocation,
         backend::{Backend, Descriptor, Object},
         object::{
             BufferInfo, ImageInfo, ImageView, ImageViewInfo, MemoryRequest, SubresourceRange,
@@ -56,6 +77,8 @@ pub(in crate::metal::device) struct PlaneState {
     /// The surface's generation the working image holds, as the texture's
     /// last stored pass encoded it.
     synced: Option<u64>,
+    /// The planes' device copy, which shaders sample in their place.
+    copy: Option<PlaneCopy>,
 }
 
 /// What a pass does with an extended-range attachment
@@ -87,6 +110,10 @@ pub struct PlaneChanges {
     surfaces: Vec<(u32, u64, u64)>,
     /// Stores of unreported surfaces, which advance every generation.
     unreported: u64,
+    /// Each surface the passes stored and the texture they stored through,
+    /// whose device copies of the surface's planes the store leaves current
+    /// ([`PlaneCopy`]); another texture's are refreshed before its next pass.
+    writers: Vec<(u32, u32)>,
     /// What its passes convert, which the commit adds to the profile's
     /// report.
     pub(crate) counts: crate::metal::device::pass_times::PlaneCounts,
@@ -152,6 +179,32 @@ fn next_stamp() -> u32 {
             return stamp;
         }
     }
+}
+
+/// The layout of a device copy of a surface's planes of `extent` texels
+/// ([`PlaneCopy`]): the codes words, then the alpha bytes, each plane's rows
+/// and start aligned as the GPU's linear images take them (`alignments`,
+/// [`Capabilities::linear_texture_alignments`]). Answers each plane's
+/// layout and the copy's size.
+///
+/// [`Capabilities::linear_texture_alignments`]: crate::metal::capabilities::Capabilities::linear_texture_alignments
+fn device_layout(alignments: (u64, u64), extent: [u64; 2]) -> ([PlaneLayout; 2], u64) {
+    let (row, offset) = (alignments.0.max(1), alignments.1.max(1));
+    let [width, height] = extent;
+    let color_row = (width * 4).next_multiple_of(row);
+    let alpha_row = width.next_multiple_of(row);
+    let alpha_offset = (color_row * height).next_multiple_of(offset);
+    let layouts = [
+        PlaneLayout {
+            offset: 0,
+            bytes_per_row: color_row,
+        },
+        PlaneLayout {
+            offset: alpha_offset,
+            bytes_per_row: alpha_row,
+        },
+    ];
+    (layouts, alpha_offset + alpha_row * height)
 }
 
 /// Whether `format` is a two-plane extended-range format.
@@ -226,11 +279,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             )
         };
         let plans = [plane(formats[0], planes[0])?, plane(formats[1], planes[1])?];
+        let device = self.device_planes(descriptor)?;
         let mut images = Vec::with_capacity(2);
         let mut views = Vec::with_capacity(2);
         let mut copies = Vec::new();
         let created = (|| -> Result<ResourceId> {
-            for ((plan, layout), format) in plans.iter().zip(planes).zip(formats) {
+            for (index, ((plan, layout), format)) in
+                plans.iter().zip(planes).zip(formats).enumerate()
+            {
                 let rows = super::aligned_copies::Rows {
                     buffer: vk_buffer,
                     memory,
@@ -238,13 +294,49 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     layout,
                     texel_bytes: u64::from(format.describe().block.bytes),
                 };
-                let (image, copy) = self.plane_image(plan, rows, false)?;
-                images.push(image);
-                copies.extend(copy);
-                let info = plan
-                    .views
-                    .sampled
-                    .ok_or(Error::Invalid("a plane has no sampled view"))?;
+                let sampled = match &device {
+                    // The plane's image is its device copy's, placed in the
+                    // copy's memory.
+                    Some((allocation, layouts, size)) => {
+                        let at = layouts[index];
+                        let plane = TextureDescriptor {
+                            pixel_format: format,
+                            usage: TextureUsage::SHADER_READ,
+                            ..*descriptor
+                        };
+                        let device_plan = resource::linear_texture(
+                            &self.capabilities,
+                            &plane,
+                            *size,
+                            at.offset,
+                            at.bytes_per_row,
+                        )?;
+                        let info = ImageInfo {
+                            usage: (device_plan.image.usage
+                                | ImageUsage::TRANSFER_SRC
+                                | ImageUsage::TRANSFER_DST)
+                                .difference(ImageUsage::HOST_TRANSFER),
+                            ..device_plan.image.clone()
+                        };
+                        let image = self.backend.create_placed_image(
+                            &info,
+                            allocation.memory,
+                            at.offset,
+                        )?;
+                        images.push(image);
+                        let extent = [descriptor.width, descriptor.height].map(|side| side as u32);
+                        copies.push(self.device_plane_copy(image, rows, extent)?);
+                        device_plan.views.sampled
+                    }
+                    None => {
+                        let (image, copy) = self.plane_image(plan, rows, false)?;
+                        images.push(image);
+                        copies.extend(copy);
+                        plan.views.sampled
+                    }
+                };
+                let info = sampled.ok_or(Error::Invalid("a plane has no sampled view"))?;
+                let image = *images.last().expect("the plane's image was just made");
                 views.push(self.backend.create_image_view(image, &info)?);
             }
             let first = self.descriptors.allocate_run(HeapArray::SampledImages, 2)?;
@@ -271,6 +363,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     self.backend.destroy(Object::Image(image));
                 }
                 self.release_aligned_copies(copies);
+                if let Some((allocation, ..)) = device {
+                    self.allocated -= allocation.allocated;
+                    self.destroy_cpu_copy(allocation);
+                }
                 return Err(error);
             }
         };
@@ -290,8 +386,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: Some(images[1]),
-            plane_staging: None,
+            plane_memory: device.map(|(allocation, ..)| allocation),
         };
+        let copy = device.map(|(allocation, layouts, _)| {
+            let row = |layout: PlaneLayout| layout.bytes_per_row as u32;
+            PlaneCopy {
+                color: allocation.address + layouts[0].offset,
+                color_bytes_per_row: row(layouts[0]),
+                alpha: allocation.address + layouts[1].offset,
+                alpha_bytes_per_row: row(layouts[1]),
+            }
+        });
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         let id = TextureId(self.resources.textures.insert(texture));
         self.keep_aligned_copies(id, copies);
@@ -301,9 +406,61 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 planes,
                 surface: None,
                 synced: None,
+                copy,
             },
         );
         Ok(id)
+    }
+
+    /// The device copy of a new extended-range IOSurface texture of
+    /// `descriptor`'s planes ([`PlaneCopy`]): its memory, each plane's
+    /// layout in it and its size. A copy is kept where the GPU's own memory
+    /// is not the guest RAM the planes lie in and the texture is rendered:
+    /// passes that sample it then read at the GPU's memory speed, and its
+    /// encodes compare with it. `None` elsewhere, and when no device memory
+    /// is left for it, which is reported once: the planes are then sampled
+    /// in place.
+    #[allow(clippy::type_complexity)]
+    fn device_planes(
+        &mut self,
+        descriptor: &TextureDescriptor,
+    ) -> Result<Option<(BufferAllocation, [PlaneLayout; 2], u64)>> {
+        let rendered =
+            descriptor.usage.is_empty() || descriptor.usage.contains(TextureUsage::RENDER_TARGET);
+        if self.capabilities.has_unified_memory || !rendered {
+            return Ok(None);
+        }
+        let (layouts, size) = device_layout(
+            self.capabilities.linear_texture_alignments(),
+            [descriptor.width, descriptor.height],
+        );
+        let info = BufferInfo {
+            size,
+            usage: BufferUsage::SHADER_DEVICE_ADDRESS
+                | BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_SRC
+                | BufferUsage::TRANSFER_DST,
+            flags: BufferCreate::EMPTY,
+        };
+        let request = MemoryRequest {
+            required: MemoryProperties::DEVICE_LOCAL,
+            preferred: MemoryProperties::EMPTY,
+            mapped: false,
+        };
+        match self.make_buffer(&info, request) {
+            Ok(allocation) => {
+                self.allocated += allocation.allocated;
+                Ok(Some((allocation, layouts, size)))
+            }
+            Err(Error::OutOfMemory) => {
+                self.unsupported(
+                    "device copies of rendered two-plane extended-range surfaces, which are \
+                     then sampled in guest RAM",
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Forgets an IOSurface texture's planes, and its surface's generation
@@ -321,6 +478,64 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         {
             self.resources.extended_generations.remove(&surface);
         }
+    }
+
+    /// The device copy of the planes of IOSurface `surface` that holds what
+    /// they do, where a texture over it keeps one whose source rectangle
+    /// `source` (`[x, y, width, height]`) lies in its texture: one no other
+    /// texture's write left stale ([`Self::device_copy_holds_rows`]). The
+    /// CPU's writes, which change the surface's seed, are seen at the next
+    /// command buffer, whose seed reports name it; the display composes
+    /// two-plane layers only of the lossless-compressed `&b38` form, which
+    /// an Apple GPU's encoder writes and no CPU reads or writes in place.
+    pub(in crate::metal::device) fn surface_copy(
+        &self,
+        surface: u32,
+        source: [u32; 4],
+    ) -> Option<PlaneCopy> {
+        let [x, y, width, height] = source.map(u64::from);
+        self.resources
+            .extended_planes
+            .iter()
+            .filter(|(_, state)| state.surface.is_some_and(|(id, _)| id == surface))
+            .find_map(|(&id, state)| {
+                let copy = state.copy?;
+                let texture = self.resources.textures.get(id).ok()?;
+                let fits = x + width <= texture.descriptor.width
+                    && y + height <= texture.descriptor.height;
+                (fits && self.device_copy_holds_rows(TextureId(id))).then_some(copy)
+            })
+    }
+
+    /// How many of a command buffer's reported textures sample extended-range
+    /// planes in guest RAM on a GPU of its own memory: textures of such
+    /// planes, or views of one, that keep no device copy. Correct, as the
+    /// planes hold what the surface does, but each sample crosses the bus.
+    pub(in crate::metal::device) fn planes_in_place(&self, surfaces: &[super::SurfaceNote]) -> u64 {
+        if self.capabilities.has_unified_memory {
+            return 0;
+        }
+        let root = |mut id: TextureId| {
+            for _ in 0..8 {
+                let parent = self.resources.textures.get(id.0).ok()?.parent;
+                match parent {
+                    Some(parent) => id = parent,
+                    None => return Some(id),
+                }
+            }
+            None
+        };
+        let in_place = surfaces
+            .iter()
+            .filter_map(|note| root(note.texture?))
+            .filter(|id| {
+                self.resources
+                    .extended_planes
+                    .get(&id.0)
+                    .is_some_and(|state| state.copy.is_none())
+            })
+            .count();
+        in_place as u64
     }
 
     /// Whether `id` is an IOSurface texture of extended-range planes.
@@ -468,68 +683,6 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok(created)
     }
 
-    /// The staging memory a large encode of an extended-range IOSurface
-    /// texture writes before the copy engine copies it into the planes
-    /// ([`PlaneStaging`]), created on first use and kept with the texture.
-    /// `None` for a surface under [`PlaneStaging::MIN_TEXELS`] texels, or
-    /// one of a plane the GPU reaches through an aligned copy (whose
-    /// refresh follows the encode's writes in the rows), and when no device
-    /// memory is left for it, which is reported once: its encodes then
-    /// write the planes in place.
-    fn plane_staging(&mut self, id: TextureId) -> Result<Option<PlaneStaging>> {
-        let texture = self.resources.textures.get(id.0)?;
-        let extent = [texture.descriptor.width, texture.descriptor.height].map(|side| side as u32);
-        let (Some(color), Some(alpha)) = (texture.image, texture.second_plane) else {
-            return Ok(None);
-        };
-        let texels = u64::from(extent[0]) * u64::from(extent[1]);
-        if texels < u64::from(PlaneStaging::MIN_TEXELS)
-            || self.plane_refreshes(id).iter().any(Option::is_some)
-        {
-            return Ok(None);
-        }
-        let (color_bytes_per_row, alpha_offset, alpha_bytes_per_row, size) =
-            PlaneStaging::layout(extent);
-        let staging = |buffer, address| PlaneStaging {
-            buffer,
-            address,
-            color_bytes_per_row,
-            alpha_offset,
-            alpha_bytes_per_row,
-            planes: [color, alpha],
-        };
-        if let Some(kept) = &texture.plane_staging {
-            return Ok(Some(staging(kept.buffer, kept.address)));
-        }
-        let info = BufferInfo {
-            size,
-            usage: BufferUsage::SHADER_DEVICE_ADDRESS
-                | BufferUsage::STORAGE_BUFFER
-                | BufferUsage::TRANSFER_SRC,
-            flags: BufferCreate::EMPTY,
-        };
-        let request = MemoryRequest {
-            required: MemoryProperties::DEVICE_LOCAL,
-            preferred: MemoryProperties::EMPTY,
-            mapped: false,
-        };
-        let allocation = match self.make_buffer(&info, request) {
-            Ok(allocation) => allocation,
-            Err(Error::OutOfMemory) => {
-                self.unsupported(
-                    "staging memory for large two-plane extended-range encodes, which write \
-                     the planes in place",
-                );
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        self.allocated += allocation.allocated;
-        let made = staging(allocation.buffer, allocation.address);
-        self.resources.textures.get_mut(id.0)?.plane_staging = Some(allocation);
-        Ok(Some(made))
-    }
-
     /// Applies a committed command buffer's [`PlaneChanges`]: its stores
     /// advance the surfaces' generations and its passes leave the textures'
     /// states. A texture destroyed since keeps none. Were a generation the
@@ -541,6 +694,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             states,
             surfaces,
             unreported,
+            writers: _,
             counts,
         } = changes;
         self.note_plane_counts(counts);
@@ -651,6 +805,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             && state.synced.is_some()
             && state.synced == generation
             && view.range.base_array_layer == 0;
+        // The device copy holds the planes as the command buffer began
+        // ([`Self::aligned_copy_commands`]) unless another texture wrote
+        // them since, or the guest did not name the surface, whose commits
+        // then refresh no copy: it is refreshed before the pass.
+        let copy_stale = kept.copy.is_some()
+            && surface.is_none_or(|(surface, _)| {
+                changes
+                    .writers
+                    .iter()
+                    .any(|&(written, writer)| written == surface && writer != id.0)
+            });
         // A pass that stores writes the planes under every other texture's
         // image: of its surface, or of any surface when the guest did not
         // name it. Its own image then holds what it encodes, all of the
@@ -658,6 +823,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let synced = match surface {
             Some((surface, _)) if stores => {
                 let generation = changes.store(surface, device(surface));
+                if let Some(writer) = changes
+                    .writers
+                    .iter_mut()
+                    .find(|(written, _)| *written == surface)
+                {
+                    writer.1 = id.0;
+                } else {
+                    changes.writers.push((surface, id.0));
+                }
                 (settled && (current || extent == size)).then_some(generation)
             }
             None if stores => {
@@ -674,11 +848,6 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 ..state
             },
         );
-        let staging = if stores {
-            self.plane_staging(id)?
-        } else {
-            None
-        };
         Ok(Some(ExtendedPlanes {
             storage: working.id,
             encoding,
@@ -699,8 +868,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             // The mirror holds what the planes do where the image did, or
             // once the pass decodes them all: its encode then writes only
             // the texels whose codes changed. Otherwise it writes all it
-            // encodes, and the mirror with them.
+            // encodes, and the mirror with them. Over unified memory the
+            // planes lie in the memory the mirror does: comparing reads
+            // as much as the writes it saves, and keeping it writes more,
+            // so no mirror is kept and encodes write the planes.
+            // A device copy holds what the planes do, whatever this texture
+            // last wrote: its encodes compare with it instead.
             mirror: match surface {
+                _ if kept.copy.is_some() => TexelArguments::MIRROR_COPY,
+                _ if self.capabilities.has_unified_memory => 0,
                 Some(_) if current || loads => TexelArguments::MIRROR_COMPARE,
                 Some(_) => TexelArguments::MIRROR_WRITE,
                 None => 0,
@@ -713,7 +889,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 0
             },
             refreshes: self.plane_refreshes(id),
-            staging,
+            copy: kept.copy,
+            copy_rows: self.device_copy_rows(id),
+            copy_stale,
         }))
     }
 }
@@ -1049,16 +1227,20 @@ mod tests {
         assert!(device.resources.extended_generations.is_empty());
     }
 
-    /// A followed surface's working image mirrors its planes in a second
-    /// layer: an encode compares with it where the image held the planes
-    /// or the pass decoded them all, so only texels whose codes changed are
-    /// written; otherwise it writes everything it encodes, and the mirror.
+    /// A followed surface's working image with no device copy mirrors its
+    /// planes in a second layer: an encode compares with it where the image
+    /// held the planes or the pass decoded them all, so only texels whose
+    /// codes changed are written; otherwise it writes everything it
+    /// encodes, and the mirror.
     #[test]
     fn encodes_compare_with_the_planes_mirror_once_it_holds_them() {
         let mut device = device();
         let buffer = device
             .new_buffer(5_251_264, options(StorageMode::Shared))
             .unwrap();
+        // With no device memory for a device copy, which compares in the
+        // mirror's place.
+        device.backend().memory_limit = Some(0);
         let texture = device
             .new_extended_plane_texture(
                 buffer,
@@ -1066,6 +1248,7 @@ mod tests {
                 PLANES,
             )
             .unwrap();
+        device.backend().memory_limit = None;
         let view = AttachmentView {
             texture: (),
             view_type: ImageViewType::D2,
@@ -1118,18 +1301,268 @@ mod tests {
         device.destroy_texture(texture).unwrap();
     }
 
-    /// An encode of a large surface converts what it drew into staging
-    /// memory in the device, and copies move it into the planes' rows,
-    /// the codes' and alpha's, after a barrier; the staging memory is kept
-    /// with the texture and freed with it. A pass that does not store
-    /// takes none, and without device memory for it the encode writes the
-    /// planes in place, which is reported once.
+    /// On a GPU of its own memory, a rendered surface texture keeps a
+    /// device copy of its planes: its images lie in device memory the
+    /// texture keeps, laid out as the GPU's linear images take them, and are
+    /// what shaders sample; its passes compare with the copy and write it
+    /// with the planes. A pass after another texture over
+    /// the same surface stored it in the same command buffer refreshes the
+    /// copy first. A texture only sampled, and any over unified memory,
+    /// keeps none; the former's uses are counted for the profile.
     #[test]
-    fn large_encodes_write_the_planes_through_staging_copies() {
+    fn rendered_surfaces_keep_a_device_copy_their_shaders_sample() {
         let mut device = device();
         let buffer = device
             .new_buffer(5_251_264, options(StorageMode::Shared))
             .unwrap();
+        let rendered = surface_texture(PixelFormat::Rgb10A8_2pXr10);
+        let texture = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        let copy = device.resources.extended_planes[&texture.0].copy.unwrap();
+        let memory = device.resources.textures.get(texture.0).unwrap();
+        let address = memory.plane_memory.as_ref().unwrap().address;
+        // 1280 codes words and alpha bytes a row fit 256-byte linear rows.
+        let alpha_offset = (1280 * 4 * 800_u64).next_multiple_of(256);
+        assert_eq!(
+            copy,
+            PlaneCopy {
+                color: address,
+                color_bytes_per_row: 1280 * 4,
+                alpha: address + alpha_offset,
+                alpha_bytes_per_row: 1280,
+            }
+        );
+        let refreshes = device.device_copy_rows(texture);
+        let images = [memory.image, memory.second_plane];
+        assert_eq!(refreshes.map(|copy| copy.map(|copy| copy.image)), images);
+        // Each refresh reads its plane's rows where the guest lays them.
+        assert_eq!(
+            refreshes.map(|copy| copy.map(|copy| copy.region.buffer_offset)),
+            [Some(0), Some(PLANES[1].offset)]
+        );
+        assert_eq!(device.plane_refreshes(texture), [None; 2]);
+        let view = AttachmentView {
+            texture: (),
+            view_type: ImageViewType::D2,
+            range: SubresourceRange {
+                aspects: ImageAspects::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+        };
+        let extent = [1280, 800];
+        let actions = |loads| PlaneActions {
+            loads,
+            stores: true,
+            settled: true,
+            surface: Some((7, 1)),
+        };
+        let mut changes = PlaneChanges::default();
+        for loads in [true, false] {
+            let planes = device
+                .extended_pass_planes(texture, view, extent, actions(loads), &mut changes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(planes.mirror, TexelArguments::MIRROR_COPY);
+            assert_eq!(planes.copy, Some(copy));
+            assert_eq!((planes.copy_rows, planes.copy_stale), (refreshes, false));
+            assert_eq!(planes.refreshes, [None; 2]);
+        }
+        // Another texture over the surface stores it: the first one's copy
+        // is refreshed before its next pass, once.
+        let other = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        device
+            .extended_pass_planes(other, view, extent, actions(true), &mut changes)
+            .unwrap();
+        let planes = device
+            .extended_pass_planes(texture, view, extent, actions(true), &mut changes)
+            .unwrap()
+            .unwrap();
+        assert!(planes.copy_stale);
+        let planes = device
+            .extended_pass_planes(texture, view, extent, actions(true), &mut changes)
+            .unwrap()
+            .unwrap();
+        assert!(!planes.copy_stale);
+        device.apply_plane_changes(changes);
+        // Only sampled, or over unified memory: no copy.
+        let sampled = TextureDescriptor {
+            usage: TextureUsage::SHADER_READ,
+            ..rendered
+        };
+        let read = device
+            .new_extended_plane_texture(buffer, &sampled, PLANES)
+            .unwrap();
+        assert!(device.resources.extended_planes[&read.0].copy.is_none());
+        // Its reported uses sample the planes in guest RAM, which the
+        // profile counts; a buffer's or a copied texture's do not.
+        let note = |texture| crate::metal::device::resources::SurfaceNote {
+            texture,
+            surface: 7,
+            seed: 1,
+        };
+        let uses = [note(Some(read)), note(Some(texture)), note(None)];
+        assert_eq!(device.planes_in_place(&uses), 1);
+        device.capabilities.has_unified_memory = true;
+        let unified = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        assert!(device.resources.extended_planes[&unified.0].copy.is_none());
+        assert_eq!(device.planes_in_place(&uses), 0, "in place by design");
+        for texture in [texture, other, read, unified] {
+            device.destroy_texture(texture).unwrap();
+        }
+    }
+
+    /// The display finds a surface's device copy by its IOSurface ID once
+    /// a reported pass rendered it, while the copy holds the rows: not
+    /// before, nor for a source past the texture. Another texture over the
+    /// surface that writes it refreshes the copy at its command buffer's
+    /// end, which then holds the rows again.
+    #[test]
+    fn the_display_finds_a_rendered_surfaces_device_copy_while_it_holds_the_rows() {
+        let mut device = device();
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let rendered = surface_texture(PixelFormat::Rgb10A8_2pXr10);
+        let texture = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        let copy = device.resources.extended_planes[&texture.0].copy;
+        let whole = [0, 0, 1280, 800];
+        assert_eq!(device.surface_copy(7, whole), None);
+        let note = |texture| crate::metal::device::resources::SurfaceNote {
+            texture: Some(texture),
+            surface: 7,
+            seed: 1,
+        };
+        let render = |device: &mut crate::metal::device::fixture::TestDevice, texture| {
+            let mut commands = device.new_command_buffer();
+            device
+                .begin_render(
+                    &mut commands,
+                    &reported(texture, LoadAction::Load, Some((7, 1))),
+                )
+                .unwrap();
+            commands.end_encoding(&mut device.resolver()).unwrap();
+            commands.surfaces.push(note(texture));
+            device.commit(commands).unwrap();
+        };
+        render(&mut device, texture);
+        assert_eq!(device.surface_copy(7, whole), copy);
+        assert_eq!(device.surface_copy(8, whole), None);
+        assert_eq!(device.surface_copy(7, [1, 0, 1280, 800]), None);
+        // Another texture over the surface without a copy of its own.
+        let sampled = TextureDescriptor {
+            usage: TextureUsage::SHADER_READ,
+            ..rendered
+        };
+        let other = device
+            .new_extended_plane_texture(buffer, &sampled, PLANES)
+            .unwrap();
+        let mut commands = device.new_command_buffer();
+        commands.surfaces.push(note(other));
+        commands.written.push(other);
+        device.commit(commands).unwrap();
+        let refreshed = device
+            .backend()
+            .submissions
+            .last()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment.commands.iter())
+            .filter(|command| matches!(command, Command::CopyBufferToImage { .. }))
+            .count();
+        assert_eq!(refreshed, 2, "both planes' copies, after the write");
+        assert_eq!(device.surface_copy(7, whole), copy);
+        for texture in [texture, other] {
+            device.destroy_texture(texture).unwrap();
+        }
+    }
+
+    /// Over unified memory an encode writes the planes in place, every
+    /// texel it encodes, with no mirror to compare or keep and no device
+    /// copy: either would move more bytes through the same memory than the
+    /// planes' writes they save.
+    #[test]
+    fn unified_memory_encodes_write_the_planes_with_no_mirror_or_staging() {
+        let mut device = device();
+        device.capabilities.has_unified_memory = true;
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let texture = device
+            .new_extended_plane_texture(
+                buffer,
+                &surface_texture(PixelFormat::Rgb10A8_2pXr10),
+                PLANES,
+            )
+            .unwrap();
+        let view = AttachmentView {
+            texture: (),
+            view_type: ImageViewType::D2,
+            range: SubresourceRange {
+                aspects: ImageAspects::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+        };
+        let extent = [1280, 800];
+        for (loads, seed) in [(true, 1), (false, 1), (true, 1), (false, 2)] {
+            let mut changes = PlaneChanges::default();
+            let actions = PlaneActions {
+                loads,
+                stores: true,
+                settled: true,
+                surface: Some((7, seed)),
+            };
+            let planes = device
+                .extended_pass_planes(texture, view, extent, actions, &mut changes)
+                .unwrap()
+                .unwrap();
+            device.apply_plane_changes(changes);
+            assert_eq!(planes.mirror, 0);
+            assert!(planes.copy.is_none());
+        }
+        // The same texture, made with no device copy, on a device of its
+        // own memory compares with the mirror.
+        device.capabilities.has_unified_memory = false;
+        let mut changes = PlaneChanges::default();
+        let actions = PlaneActions {
+            loads: true,
+            stores: true,
+            settled: true,
+            surface: Some((7, 2)),
+        };
+        let planes = device
+            .extended_pass_planes(texture, view, extent, actions, &mut changes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(planes.mirror, TexelArguments::MIRROR_COMPARE);
+        assert!(planes.copy.is_none());
+        device.destroy_texture(texture).unwrap();
+    }
+
+    /// An encode of a large area converts what it drew into the planes'
+    /// device copy alone, and copies move it into the planes' rows, the
+    /// codes' and alpha's, after a barrier. Without device memory for a
+    /// copy, which is reported once, the texture keeps none: its shaders
+    /// sample the rows and its encodes write them in place.
+    #[test]
+    fn large_encodes_write_the_device_copy_and_copy_it_into_the_rows() {
+        let mut device = device();
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let rows = device.resources.buffers.get(buffer.0).unwrap().buffer;
         let texture = device
             .new_extended_plane_texture(
                 buffer,
@@ -1157,7 +1590,7 @@ mod tests {
                 .iter()
                 .filter_map(|command| match command {
                     Command::Barrier(barrier) => Some(Err(barrier.dst_stages)),
-                    Command::CopyBufferToImage { src, dst, region } => Some(Ok((
+                    Command::CopyImageToBuffer { src, dst, region } => Some(Ok((
                         *src,
                         *dst,
                         region.buffer_offset,
@@ -1171,69 +1604,26 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let copies = encode(&mut device);
-        let staging = device
-            .resources
-            .textures
-            .get(texture.0)
-            .unwrap()
-            .plane_staging
-            .as_ref()
-            .unwrap()
-            .buffer;
-        // The alpha bytes start at the 256-byte boundary after the codes.
-        let alpha_offset = (1280 * 4 * 800_u64).next_multiple_of(256);
         assert_eq!(
             copies,
             [
                 Err(crate::metal::vulkan::PipelineStages::ALL_TRANSFER),
-                Ok((staging, color, 0, 1280, [0, 0, 0], [1280, 800, 1])),
+                Ok((color, rows, 0, 1280, [0, 0, 0], [1280, 800, 1])),
                 Ok((
-                    staging,
                     alpha,
-                    alpha_offset,
+                    rows,
+                    PLANES[1].offset,
                     1280,
                     [0, 0, 0],
                     [1280, 800, 1]
                 )),
             ]
         );
-        // The next encode copies from the same memory.
         assert_eq!(encode(&mut device), copies);
-        // A pass that does not store encodes nothing and takes none.
-        let view = AttachmentView {
-            texture: (),
-            view_type: ImageViewType::D2,
-            range: SubresourceRange {
-                aspects: ImageAspects::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-        };
-        let actions = |stores| PlaneActions {
-            loads: false,
-            stores,
-            settled: true,
-            surface: Some((7, 1)),
-        };
-        let mut changes = PlaneChanges::default();
-        let kept = device
-            .extended_pass_planes(texture, view, [1280, 800], actions(false), &mut changes)
-            .unwrap()
-            .unwrap();
-        assert_eq!(kept.staging, None);
         device.destroy_texture(texture).unwrap();
-        let (timeline, serial) = (device.timeline, device.submitted_serial());
-        device.backend().complete(timeline, serial);
-        device.poll().unwrap();
-        assert!(
-            device
-                .backend()
-                .destroyed
-                .contains(&Object::Buffer(staging))
-        );
-        // Without device memory for it, encodes write the planes in place.
+        // Without device memory for a copy.
+        while device.take_unsupported().is_some() {}
+        device.backend().memory_limit = Some(0);
         let texture = device
             .new_extended_plane_texture(
                 buffer,
@@ -1241,18 +1631,12 @@ mod tests {
                 PLANES,
             )
             .unwrap();
-        device.extended_working(texture, view).unwrap();
-        while device.take_unsupported().is_some() {}
-        device.backend().memory_limit = Some(0);
-        let planes = device
-            .extended_pass_planes(texture, view, [1280, 800], actions(true), &mut changes)
-            .unwrap()
-            .unwrap();
-        assert_eq!(planes.staging, None);
+        device.backend().memory_limit = None;
+        assert!(device.resources.extended_planes[&texture.0].copy.is_none());
         assert!(
             device
                 .take_unsupported()
-                .is_some_and(|what| what.starts_with("staging memory"))
+                .is_some_and(|what| what.starts_with("device copies"))
         );
         device.destroy_texture(texture).unwrap();
     }

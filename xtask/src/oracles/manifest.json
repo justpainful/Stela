@@ -3251,6 +3251,16 @@
   },
   {
     "package": "stela-loader",
+    "test": "original_j473_second_display_keeps_both_pipelines",
+    "source": "crates/stela-loader/src/devices/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_TEST_J473_DT"
+    ],
+    "reason": "requires the original J473AP DT through STELA_TEST_J473_DT"
+  },
+  {
+    "package": "stela-loader",
     "test": "original_direct_memory_preserves_source_while_pmp_dma_stays_hidden",
     "source": "crates/stela-loader/src/devices/tests.rs",
     "kind": "oracle",
@@ -3282,6 +3292,14 @@
     "kind": "manual",
     "inputs": [],
     "reason": "races two host cores on one 16-byte pair (FEAT_LSE2); run explicitly after changing pair lowering"
+  },
+  {
+    "package": "stela-engine",
+    "test": "regions_time_their_programs",
+    "source": "crates/stela-engine/tests/regions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "native timing of each region program against blocks; run explicitly in a release build on a quiet host"
   },
   {
     "package": "stela-soc",
@@ -4702,6 +4720,14 @@
     "reason": "host timing report of a Poll answered from the published serial against one that takes the turn and asks the mock device; a measurement, not a check; run on request"
   },
   {
+    "package": "stela-driver-gpu",
+    "test": "bench_compositor_commit_replay",
+    "source": "crates/stela-driver-gpu/src/metal/service/tests/commands.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing report of replaying a compositor-shaped Commit per command buffer and per draw over the mock backend; a measurement, not a check; run on request in release"
+  },
+  {
     "package": "stela-compiler",
     "test": "sve_merge_costs",
     "source": "crates/stela-compiler/src/x86_64/sve/integer_bits/tests/costs.rs",
@@ -4790,6 +4816,14 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "run_loop_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/run_overhead.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a native run's fixed cost on one PE and on several; run on request"
   },
   {
     "package": "stela-engine",
@@ -5054,5 +5088,77 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of one transfer through a stamped tail, a cell tail, an empty cell and a lookup tail of one to many targets; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "spread_transfer_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of transfers from sites of two random targets through their lookup and predicted tails; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "sign_in_replay_on_the_real_ring",
+    "source": "crates/stela-engine/src/machine/engine/board/replay.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "prints the table of the sign-in replays on the real ring; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "ahead_prepared_and_used",
+    "source": "crates/stela-engine/src/machine/engine/ahead/model.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host model of what translation ahead prepares and what of it runs, over a pack named by AHEAD_PACK and a shared cache named by AHEAD_DSC; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "fetch_phase_costs",
+    "source": "crates/stela-engine/src/machine/engine/fetch_costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the phases of a fetch over a code image named by FETCH_IMAGE; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "pack_record_compression",
+    "source": "crates/stela-engine/src/machine/engine/fetch_costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host size and timing of pack record compression over a code image; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "pac_costs",
+    "source": "crates/stela-engine/src/machine/engine/pointer/cost.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing and host instruction counts of PAC signing and authentication paths; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "whole_tlbi_benchmark",
+    "source": "crates/stela-engine/src/machine/engine/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a TLBI of everything and the refill after it; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "fill_walks_benchmark",
+    "source": "crates/stela-engine/src/memory/system_ram/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of shadow fills over random faults; run in release on request"
+  },
+  {
+    "package": "stela-soc",
+    "test": "schedule_scan_cost",
+    "source": "crates/stela-soc/src/dwc3/xhci/slot.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the xHCI schedule scan; run on request"
   }
 ]

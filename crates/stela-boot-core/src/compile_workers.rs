@@ -17,10 +17,10 @@
 //! busy desktop kept about a third of a core on. Jobs run one at a time, but
 //! a job's slice (up to 17 ms seen) would hold that work up on a worker that
 //! does both, so at least two run: one free for Linux while the other
-//! compiles. Workers also translate guest code ahead of its first run, and a
-//! desktop session kept both busy (6403 deferred compile jobs and 72 thousand
-//! translations dropped from a full queue in 2 h on an i7-12700KF). All four
-//! of its efficiency cores translating ahead never emptied the queue (151
+//! compiles. Workers also prepare blocks ahead of their first run, as PEs
+//! whose guest waits do (`stela_engine`'s `ahead`). An earlier design that
+//! translated every successor of every block on them kept all four
+//! efficiency cores of an i7-12700KF busy without emptying its queue (151
 //! million queued in 5.5 h, 14% of them ever run), and the PEs on the
 //! performance cores beside them lost a quarter of their speed: system exits
 //! took 4.4 us against 2.5 us with two workers, their table walks sharing

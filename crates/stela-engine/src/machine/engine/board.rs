@@ -32,10 +32,12 @@ use crate::platform::sync::{Mutex, MutexGuard};
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 use stela_compiler::x86_64::chain::{self, LookupTable, TableReader};
 
+#[cfg(test)]
+mod replay;
 mod ring;
 #[cfg(test)]
 mod tests;
@@ -377,6 +379,10 @@ pub(super) struct Cache {
     /// Why blocks the board held before are installed again
     /// ([`super::churn`]).
     pub(super) churn: super::ChurnCounts,
+    /// When the block table's last growth published its successor, while
+    /// the table it replaced is held: it goes once that grace passed
+    /// ([`super::compilation::grow_table`]).
+    pub(super) table_retired: Option<Snapshot>,
 }
 
 /// How a board's code lock was taken, counted under it: no atomic beyond
@@ -542,6 +548,10 @@ pub struct TargetCounts {
     pub raced: u64,
     pub unindexed: u64,
     pub deferred: u64,
+    /// The block table's entries now and its growths so far
+    /// (`chain::LookupTable::grow`).
+    pub entries: u64,
+    pub growths: u64,
 }
 
 /// Board events counted outside the lock: rare, so a shared atomic each,
@@ -638,13 +648,15 @@ impl Cache {
             targets_raced: 0,
             census: None,
             churn: super::ChurnCounts::default(),
+            table_retired: None,
         }
     }
 }
 
 impl Code {
-    /// Room for `slots` blocks and a block table of `entries`
-    /// (`chain::lookup_entries`).
+    /// Room for `slots` blocks and a block table of `entries` at first
+    /// (`chain::first_lookup_entries`), which doubles as blocks fill it
+    /// (`chain::LookupTable::grow`).
     pub(super) fn new(slots: u32, entries: usize, window: Option<CodeWindow>) -> Self {
         let targets = LookupTable::with_entries(entries);
         let finder = Arc::new(Finder::new(slots));
@@ -732,16 +744,20 @@ impl Code {
 
     /// What the board's code came to; the lock's longest wait starts over.
     pub(super) fn report(&self) -> CodeReport {
-        let (lock, inserted, raced, churn) = {
+        let (lock, inserted, raced, churn, table) = {
             let mut cache = self.cache_at(LockSite::Report);
             let lock = cache.lock;
             let counts = (cache.targets_inserted, cache.targets_raced);
+            let table = (
+                cache.targets.entries() as u64,
+                u64::from(cache.targets.growths()),
+            );
             let churn = cache.churn;
             cache.lock.longest = 0;
             for site in &mut cache.lock.sites {
                 site.longest_held = 0;
             }
-            (lock, counts.0, counts.1, churn)
+            (lock, counts.0, counts.1, churn, table)
         };
         let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CodeReport {
@@ -768,6 +784,8 @@ impl Code {
                 raced,
                 unindexed: count(&self.events.targets_unindexed),
                 deferred: count(&self.events.targets_deferred),
+                entries: table.0,
+                growths: table.1,
             },
             lock,
             churn,
@@ -831,11 +849,20 @@ pub(super) struct Record {
     used: AtomicU64,
     /// Its dynamic exit is served by a lookup dispatcher.
     dynamic: AtomicBool,
+    /// The patch point of the miss of its dynamic exit's predicted tail
+    /// while that miss still returns to the engine
+    /// (`chain::open_predicted_tail`), and the target the tail predicts:
+    /// the miss's next target becomes the site's second.
+    second: AtomicU64,
+    second_target: AtomicU64,
     /// Its install lost to another PE's of the same block: never reachable.
     lost: AtomicBool,
     /// Jump cache hits that found no block table entry of it and went for
     /// the lock to add one ([`Self::remember`]).
     remembers: AtomicU32,
+    /// Engine fetches that found it since its install, up to two, while
+    /// step timing counts them ([`Self::fetched`]).
+    fetches: AtomicU8,
     /// Its fault recovery rows, under a lock of their own: a PE faulting
     /// in the block reads them, its first fault may qualify them. They stay
     /// after the block retires until the slot takes its next block, as a
@@ -854,8 +881,11 @@ impl Default for Record {
             settled: AtomicU64::new(0),
             used: AtomicU64::new(0),
             dynamic: AtomicBool::new(false),
+            second: AtomicU64::new(0),
+            second_target: AtomicU64::new(0),
             lost: AtomicBool::new(false),
             remembers: AtomicU32::new(0),
+            fetches: AtomicU8::new(0),
             recovery: Mutex::new(None),
         }
     }
@@ -953,6 +983,20 @@ impl Record {
         self.live.load(Ordering::Acquire)
     }
 
+    /// Count an engine fetch that found its block, up to two. A plain load
+    /// and store: PEs fetching it at once may count one fetch for two.
+    pub(super) fn fetched(&self) {
+        let fetches = self.fetches.load(Ordering::Relaxed);
+        if fetches < 2 {
+            self.fetches.store(fetches + 1, Ordering::Relaxed);
+        }
+    }
+
+    /// The engine fetches that found its block since its install, up to two.
+    pub(super) fn fetches(&self) -> usize {
+        usize::from(self.fetches.load(Ordering::Relaxed))
+    }
+
     /// Whether successor `position` is linked or settled: not to link.
     pub(super) fn linked(&self, position: usize) -> bool {
         (self.linked.load(Ordering::Acquire) | self.settled.load(Ordering::Acquire)) & 1 << position
@@ -997,6 +1041,28 @@ impl Record {
 
     pub(super) fn close_dynamic(&self) {
         self.dynamic.store(true, Ordering::Release);
+    }
+
+    /// The patch point of its predicted tail's open miss and the target the
+    /// tail predicts, while the miss returns to the engine.
+    pub(super) fn second(&self) -> Option<(u64, u64)> {
+        let miss = self.second.load(Ordering::Acquire);
+        (miss != 0).then(|| (miss, self.second_target.load(Ordering::Relaxed)))
+    }
+
+    /// Its predicted tail of `target` misses through the dynamic exit whose
+    /// patch point is `miss`: under the board's lock.
+    pub(super) fn open_second(&self, miss: u64, target: u64) {
+        self.second_target.store(target, Ordering::Relaxed);
+        self.second.store(miss, Ordering::Release);
+    }
+
+    /// [`Self::second`], which no other caller then takes: under the
+    /// board's lock.
+    pub(super) fn take_second(&self) -> Option<(u64, u64)> {
+        let held = self.second()?;
+        self.second.store(0, Ordering::Release);
+        Some(held)
     }
 
     /// Whether its install lost to another PE's ([`Self::mark_lost`]).
@@ -1152,8 +1218,10 @@ impl Blocks {
         record.settled.store(0, Ordering::Relaxed);
         record.used.store(0, Ordering::Relaxed);
         record.dynamic.store(false, Ordering::Relaxed);
+        record.second.store(0, Ordering::Relaxed);
         record.lost.store(false, Ordering::Relaxed);
         record.remembers.store(0, Ordering::Relaxed);
+        record.fetches.store(0, Ordering::Relaxed);
         record.incarnation.fetch_add(1, Ordering::Release);
         record.live.store(true, Ordering::Release);
         self.live.fetch_add(1, Ordering::Relaxed);

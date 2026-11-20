@@ -17,7 +17,7 @@ use crate::metal::{
             ComputeCode, CopyBuffer, DepthStencilRecord, Dispatch, DrawPrimitives, FillBuffer,
             MappingRecord, Mode, PassAttachmentRecord, RenderCode, ResolveCounters, Resource,
             ResourceStateCode, SampleCounters, SetBuffer, SetBytes, SetPipeline, StageSampler,
-            StencilRecord, UpdateMappings, ViewportRecord,
+            StencilRecord, SurfaceUse, UpdateMappings, ViewportRecord,
         },
     },
     vulkan::{PipelineBindPoint, command::Command},
@@ -719,5 +719,236 @@ fn mapping_updates_name_sparse_textures() {
     assert_eq!(
         commit(&mut service, connection, &stream).map_err(|outcome| outcome.reason),
         Err("the texture is not sparse")
+    );
+}
+
+/// A seed report names a texture the service keeps in device memory, which
+/// a command buffer may reach unnamed: one of a buffer, or with flags the
+/// service does not know, is refused.
+#[test]
+fn seed_reports_name_textures_only() {
+    let mut service = service();
+    let connection = connect(&mut service);
+    let response: TextureResponse = call(
+        &mut service,
+        connection,
+        Operation::NewTexture,
+        &texture(StorageMode::Private),
+        &mut Memory::default(),
+    )
+    .unwrap();
+    assert_eq!(response.copied, 0, "no copy of a private texture");
+    let buffer = new_buffer(&mut service, connection, StorageMode::Shared);
+    let report = |object, buffer, flags| {
+        let mut stream = Stream::default();
+        let record = SurfaceUse {
+            object,
+            surface: 3,
+            seed: 1,
+            buffer,
+            flags,
+        };
+        stream.push(CommandBufferCode::SurfaceUse.raw(), &record, &[]);
+        stream
+    };
+    let mut accepted = |stream: Stream| status(commit(&mut service, connection, &stream));
+    assert_eq!(
+        [
+            report(response.handle, 0, SurfaceUse::SEED_ONLY),
+            report(response.handle, 0, 0),
+            report(buffer, 1, 0),
+            report(buffer, 1, SurfaceUse::SEED_ONLY),
+            report(response.handle, 0, 2),
+        ]
+        .map(&mut accepted),
+        [
+            Status::Ok,
+            Status::Ok,
+            Status::Ok,
+            Status::Malformed,
+            Status::Malformed,
+        ]
+    );
+}
+
+/// The host cost of replaying a compositor's command buffer, without a GPU:
+/// 6 render passes of 10 draws each, every draw with its own vertex buffer,
+/// vertex bytes, fragment texture and sampler, as Core Animation's
+/// composites bind them. Prints the commit's time per command buffer and per
+/// draw over the mock backend, whose submit copies the commands instead of
+/// recording them. Run with `--ignored --nocapture` in release.
+#[test]
+#[ignore = "manual: opt-in"]
+fn bench_compositor_commit_replay() {
+    extern crate std;
+    use crate::metal::service::wire::commands::{StageBuffer, StageBytes, StageTexture};
+    const PASSES: usize = 6;
+    const DRAWS: usize = 10;
+    const COMMITS: usize = 4000;
+    let mut service = service();
+    let connection = connect(&mut service);
+    let memory = &mut Memory::default();
+    let library = new_library(&mut service, connection, memory);
+    let mut function = |name| {
+        new_function(&mut service, connection, library, name, &[], memory)
+            .unwrap()
+            .handle
+    };
+    let (vertex, fragment) = (function("vertex"), function("fragment"));
+    let pipeline: RenderPipelineResponse = call(
+        &mut service,
+        connection,
+        Operation::NewRenderPipeline,
+        &render_pipeline_request(vertex, fragment),
+        memory,
+    )
+    .unwrap();
+    let target = TextureDescriptorRecord {
+        usage: TextureUsage::RENDER_TARGET.bits(),
+        ..texture(StorageMode::Private)
+    };
+    let target: TextureResponse = call(
+        &mut service,
+        connection,
+        Operation::NewTexture,
+        &target,
+        memory,
+    )
+    .unwrap();
+    let sampled = TextureDescriptorRecord {
+        usage: TextureUsage::SHADER_READ.bits(),
+        ..texture(StorageMode::Private)
+    };
+    let sampled: TextureResponse = call(
+        &mut service,
+        connection,
+        Operation::NewTexture,
+        &sampled,
+        memory,
+    )
+    .unwrap();
+    let descriptor = SamplerDescriptorRecord {
+        min_filter: SamplerMinMagFilter::Linear.raw(),
+        mag_filter: SamplerMinMagFilter::Linear.raw(),
+        mip_filter: SamplerMipFilter::NotMipmapped.raw(),
+        max_anisotropy: 1,
+        address_modes: [SamplerAddressMode::ClampToEdge.raw(); 3],
+        border_color: SamplerBorderColor::TransparentBlack.raw(),
+        reduction_mode: SamplerReductionMode::WeightedAverage.raw(),
+        compare_function: CompareFunction::Never.raw(),
+        lod_min_clamp: 0.0,
+        lod_max_clamp: f32::MAX,
+        normalized_coordinates: 1,
+        reserved: 0,
+    };
+    let sampler: SamplerResponse = call(
+        &mut service,
+        connection,
+        Operation::NewSampler,
+        &descriptor,
+        memory,
+    )
+    .unwrap();
+    let buffers: alloc::vec::Vec<u64> = (0..DRAWS)
+        .map(|_| new_buffer(&mut service, connection, StorageMode::Shared))
+        .collect();
+    let mut begin = BeginRender::default();
+    begin.color_attachments[0].attachment = PassAttachmentRecord {
+        texture: target.handle,
+        load_action: LoadAction::Load.raw(),
+        store_action: StoreAction::Store.raw(),
+        ..Default::default()
+    };
+    let viewport = ViewportRecord {
+        width: 8.0,
+        height: 4.0,
+        zfar: 1.0,
+        ..Default::default()
+    };
+    let draw = DrawPrimitives {
+        primitive: PrimitiveType::TriangleStrip.raw(),
+        vertex_start: 0,
+        vertex_count: 4,
+        instance_count: 1,
+        base_instance: 0,
+    };
+    let mut stream = Stream::default();
+    for _ in 0..PASSES {
+        stream
+            .push(RenderCode::Begin.raw(), &begin, &[])
+            .push(
+                RenderCode::SetPipeline.raw(),
+                &SetPipeline {
+                    pipeline: pipeline.handle,
+                },
+                &[],
+            )
+            .push(
+                RenderCode::SetViewports.raw(),
+                &Empty {},
+                wire::bytes(&viewport),
+            );
+        for &buffer in &buffers {
+            stream
+                .push(
+                    RenderCode::SetBuffer.raw(),
+                    &StageBuffer {
+                        stage: 1,
+                        buffer,
+                        offset: 0,
+                        index: 1,
+                    },
+                    &[],
+                )
+                .push(
+                    RenderCode::SetBytes.raw(),
+                    &StageBytes { stage: 1, index: 0 },
+                    &[7; 64],
+                )
+                .push(
+                    RenderCode::SetTexture.raw(),
+                    &StageTexture {
+                        stage: 2,
+                        texture: sampled.handle,
+                        index: 0,
+                    },
+                    &[],
+                )
+                .push(
+                    RenderCode::SetSampler.raw(),
+                    &StageSampler {
+                        stage: 2,
+                        sampler: sampler.handle,
+                        index: 0,
+                        clamped: 0,
+                        lod_min: 0.0,
+                        lod_max: 0.0,
+                        reserved: 0,
+                    },
+                    &[],
+                )
+                .push(RenderCode::DrawPrimitives.raw(), &draw, &[]);
+        }
+        stream.end();
+    }
+    let mut elapsed = core::time::Duration::ZERO;
+    for round in 0..COMMITS {
+        let start = std::time::Instant::now();
+        let committed = commit(&mut service, connection, &stream);
+        if round >= COMMITS / 10 {
+            elapsed += start.elapsed();
+        }
+        assert!(committed.is_ok(), "{committed:?}");
+        service.device().backend().finish();
+        service.device().backend().submissions.clear();
+        let _: wire::PollResponse =
+            call(&mut service, connection, Operation::Poll, &Empty {}, memory).unwrap();
+    }
+    let timed = (COMMITS - COMMITS / 10) as u32;
+    let per_commit = elapsed / timed;
+    std::println!(
+        "BENCH commit: {per_commit:?} per command buffer of {PASSES} passes and {} draws, {:?} per draw",
+        PASSES * DRAWS,
+        per_commit / (PASSES * DRAWS) as u32
     );
 }

@@ -131,6 +131,13 @@ __attribute__((objc_root_class)) @interface NSObject {
 - (void)setObject:(id)object forKey:(id)key;
 @end
 
+@interface NSHashTable : NSObject
++ (instancetype)weakObjectsHashTable;
+- (void)addObject:(id)object;
+@property(readonly) NSArray *allObjects;
+@property(readonly) NSUInteger count;
+@end
+
 @interface NSValue : NSObject
 + (instancetype)valueWithNonretainedObject:(id)object;
 @property(readonly) id nonretainedObjectValue;

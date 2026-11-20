@@ -5,8 +5,8 @@
 //! tail of its cell, and leaves the control the same, whatever stamps
 //! earlier runs left. Then the same while another thread changes the cell.
 use super::super::*;
-use crate::GuestState;
-use alloc::{boxed::Box, vec::Vec};
+use super::Controlled;
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::AtomicBool;
 unsafe extern "C" {
@@ -101,14 +101,14 @@ fn region() -> Pages {
     region
 }
 
-fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    let mut frame = Box::new(GuestState::default());
-    frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+/// Run the stub with `control` and its account: what it returned.
+fn run(region: &Pages, control: &mut Controlled, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result =
-        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
+    let result = control.run(|frame| unsafe {
+        crate::x86_64::native::enter_counted(region.0 as *const u8, frame, target, 0)
+    });
     (result as u64, (result >> 64) as u64)
 }
 
@@ -142,7 +142,7 @@ fn tail(
         )
         .unwrap()
         .to_vec(),
-        None => cell_tail(at, cell, kind, ran, probe).unwrap().to_vec(),
+        None => cell_tail(at, cell, pc, kind, ran, probe).unwrap().to_vec(),
     };
     put(region, TAIL, &code);
 }
@@ -248,21 +248,24 @@ fn stamped_tails_transfer_as_their_cell_tails() {
         let ran = 1 + rng.below(9) as u32;
         tail(&stamped, &table, site, pc, linked, ran);
         tail(&plain, &table, site, pc, None, ran);
-        let base = ChainControl {
-            budget: [0, 1, 2, 5, 9][rng.below(5) as usize],
-            retired: 100,
-            block: 7,
-            contexts,
-            table: table.address(),
-            hits: 3,
-            interrupt_epoch: u64::from(rng.below(12) == 0),
-            itlb: itlb.address(),
-            masks: [table.mask(), itlb.mask()],
-            salts: contexts.map(|context| itlb.salt(context)),
-            stamps,
-            cells,
-            ..ChainControl::default()
+        let mut base = Controlled {
+            control: ChainControl {
+                block: 7,
+                contexts,
+                table: table.address(),
+                hits: 3,
+                itlb: itlb.address(),
+                masks: [table.mask(), itlb.mask()],
+                salts: contexts.map(|context| itlb.salt(context)),
+                stamps,
+                cells,
+                ..ChainControl::default()
+            },
+            account: Account::new([0, 1, 2, 5, 9][rng.below(5) as usize]).with_retired(100),
         };
+        if rng.below(12) == 0 {
+            base.interrupt();
+        }
         // SAFETY: the table's stamps, which live.
         let hits = || unsafe { stamp_counts(stamps) }[StampCount::Hits as usize];
         let before = hits();
@@ -307,15 +310,16 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             0 => &CONTEXTS[..],
             _ => &contexts[1..],
         };
+        // The cell probe then exits, or takes the table's entry of the key
+        // the ITLB holds now, which may be another block or the same one,
+        // counted as a table probe's.
         let evicted = translated != Some(cell.key)
             && stamped_in
                 .iter()
                 .any(|&context| keys.get(&(page, context)) == Some(&cell.key))
-            && rb == exit
+            && (rb == exit || rb.1 == 99)
             && linked.is_some_and(|linked| linked.entry == cell.entry)
-            && (ra == (0x7700 + u64::from(cell.block), 99)
-                // Or no budget: the stamped tail spent it, as a transfer.
-                || (ra == exit && base.budget == 0 && a.budget == u64::MAX));
+            && ra == (0x7700 + u64::from(cell.block), 99);
         if evicted {
             refilled += 1;
             continue;
@@ -359,16 +363,18 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     table.insert(table.slot(pc, KEYS[0]), held);
     table.link_hot_cell(0x1000, pc, Some(held)).unwrap();
     tail(&region, &table, 0x1000, pc, Some(held), 4);
-    let mut control = ChainControl {
-        budget: 100,
-        contexts: [CONTEXTS[0], context],
-        table: table.address(),
-        itlb: itlb.address(),
-        masks: [table.mask(), itlb.mask()],
-        salts: [CONTEXTS[0], context].map(|context| itlb.salt(context)),
-        stamps,
-        cells,
-        ..ChainControl::default()
+    let mut control = Controlled {
+        control: ChainControl {
+            contexts: [CONTEXTS[0], context],
+            table: table.address(),
+            itlb: itlb.address(),
+            masks: [table.mask(), itlb.mask()],
+            salts: [CONTEXTS[0], context].map(|context| itlb.salt(context)),
+            stamps,
+            cells,
+            ..ChainControl::default()
+        },
+        account: Account::new(100),
     };
     // SAFETY: the table's stamps, which live.
     let counts = || unsafe { stamp_counts(stamps) };
@@ -377,14 +383,14 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     };
     // A transfer into a block was a stamp's hit or a counted miss that
     // went through the cell probe, which counts it in the control.
-    let through = |control: &mut ChainControl, _: &LookupTable| {
+    let through = |control: &mut Controlled, _: &LookupTable| {
         let (before, was) = (control.heat, counts());
         let result = run(&region, control, pc);
         let probed = control.heat != before;
         if result.1 == 99 {
             let missed = count(was, StampCount::Epoch)
                 + count(was, StampCount::Context)
-                + count(was, StampCount::Interrupted);
+                + count(was, StampCount::Stopped);
             assert_eq!(count(was, StampCount::Hits), u64::from(!probed));
             assert_eq!(missed, u64::from(probed));
         }
@@ -394,7 +400,14 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     // hits the stamp.
     assert_eq!(through(&mut control, &table), ((0x7703, 99), true));
     assert_eq!(through(&mut control, &table), ((0x7703, 99), false));
-    assert_eq!((control.budget, control.retired, control.block), (98, 8, 3));
+    assert_eq!(
+        (
+            control.account.budget(),
+            control.account.retired(),
+            control.block
+        ),
+        (98, 8, 3)
+    );
     assert_eq!(counts(), [1, 1, 0, 0, 1, 0, 0]);
     // A drop in the half: the probe again, which stamps again.
     itlb.forget_range_where(0..=0, |_| true);
@@ -439,9 +452,8 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(through(&mut control, &table), ((0x7705, 99), true));
     assert_eq!(count(was, StampCount::Changed), 2);
     assert_eq!(count(was, StampCount::Restamped), 0);
-    // No budget on the stamp's path: the exit, the budget wrapped. The
-    // table taking the entry the cell holds again changes nothing, so the
-    // stamp holds.
+    // The table taking the entry the cell holds again changes nothing, so
+    // the stamp holds.
     table.link_hot_cell(0x1000, pc, Some(held)).unwrap();
     table.insert(table.slot(pc, KEYS[0]), held);
     tail(&region, &table, 0x1000, pc, Some(held), 4);
@@ -451,24 +463,27 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(run(&region, &mut control, pc), (0x7703, 99));
     assert_eq!(count(was, StampCount::Restamped), 1);
     assert_eq!(count(was, StampCount::Hits), 1);
-    control.budget = 0;
+    // No budget, then a pending interruption: the probe's exit, nothing
+    // spent or counted.
+    control.account = control.account.with_budget(0);
+    let was = (counts(), control.account);
     assert_eq!(run(&region, &mut control, pc), (pc, word));
-    assert_eq!(control.budget, u64::MAX);
-    // A pending interruption: the probe's exit, nothing spent.
-    control.budget = 10;
-    control.interrupt_epoch = 1;
-    let was = counts();
+    assert_eq!(count(was.0, StampCount::Stopped), 1);
+    assert_eq!(control.account, was.1);
+    control.account = control.account.with_budget(10);
+    control.interrupt();
+    let was = (counts(), control.account);
     assert_eq!(run(&region, &mut control, pc), (pc, word));
-    assert_eq!(count(was, StampCount::Interrupted), 1);
-    assert_eq!(control.budget, 10);
-    control.interrupt_epoch = 0;
+    assert_eq!(count(was.0, StampCount::Stopped), 1);
+    assert_eq!(control.account, was.1);
+    control.acknowledge();
     // A cell past the stamped ones: one transfer in CELL_SAMPLE names its
     // cell, which names the exit's link.
     let address = table.link_cell(0x1000, pc, Some(held));
     let number = table.site_cell_number(0x1000).unwrap();
     assert!(number as usize >= STAMPED_CELLS);
     tail(&region, &table, 0x1000, pc, None, 4);
-    control.budget = 1000;
+    control.account = control.account.with_budget(1000);
     control.heat = 0;
     control.sampled = 0;
     let link = CellLink {
@@ -538,16 +553,18 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
             }
             done.store(true, Ordering::SeqCst);
         });
-        let mut control = ChainControl {
-            budget: u64::MAX / 2,
-            contexts: [context, CONTEXTS[1]],
-            table: address,
-            itlb: itlb.address(),
-            masks: [mask, itlb.mask()],
-            salts: [context, CONTEXTS[1]].map(|context| itlb.salt(context)),
-            stamps,
-            cells,
-            ..ChainControl::default()
+        let mut control = Controlled {
+            control: ChainControl {
+                contexts: [context, CONTEXTS[1]],
+                table: address,
+                itlb: itlb.address(),
+                masks: [mask, itlb.mask()],
+                salts: [context, CONTEXTS[1]].map(|context| itlb.salt(context)),
+                stamps,
+                cells,
+                ..ChainControl::default()
+            },
+            account: Account::default(),
         };
         // The writer stops waiting once this thread leaves, a failed
         // assertion included.
@@ -566,6 +583,7 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
                 tail(&region, &table, 0x1000, pc, Some(held), 2);
             }
             let seen = changed.load(Ordering::SeqCst);
+            control.account = Account::new(MAX_BUDGET);
             let result = run(&region, &mut control, pc);
             if seen {
                 assert_eq!(result, (0x7702, 99), "a stale stamp entered block 1");

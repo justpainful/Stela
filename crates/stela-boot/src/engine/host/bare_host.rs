@@ -584,8 +584,15 @@ impl Host for BareHost<'_> {
     }
 
     fn invalidate_reach(&mut self, reach: Reach, everywhere: Everywhere) {
+        let entered = rdtsc();
         let state = state();
-        if !state.kept.is_empty() {
+        // A TLBI of everything that empties the shadow below drops the
+        // kept halves with the lower half's frames: no table of theirs
+        // needs walking first.
+        let emptied = reach == Reach::All
+            && matches!(everywhere, Everywhere::All)
+            && state.legacy_translations_dirty;
+        if !state.kept.is_empty() && !emptied {
             let bounds = state.half_range(LOWER);
             let entry_bits = 12 + 9 * layout::top_level();
             let pool = &state.pool;
@@ -605,6 +612,7 @@ impl Host for BareHost<'_> {
                 ),
             };
             state.kept_dropped += dropped as u64;
+            state.reclaim_kept();
         }
         if reach == Reach::All {
             return match everywhere {
@@ -634,11 +642,13 @@ impl Host for BareHost<'_> {
             }
         }
         const { assert!(INVLPG_PAGES <= u16::BITS as u64) };
+        state.empty_tlbis += u64::from(!whole && first_range.is_none());
         let precise = !whole && pages <= INVLPG_PAGES;
         let current = state.root_of(state.current);
         let mut reload_current = false;
         for (first, last) in first_range.into_iter().chain(extra_ranges) {
             let base = first & !(PAGE - 1);
+            state.unmap_walks += (state.roots.len() * (1 + state.banks.len())) as u64;
             for (view, root) in state.roots.into_iter().enumerate() {
                 let mut removed = 0u16;
                 tables::unmap(&state.pool, root, first, last, |address| {
@@ -679,6 +689,7 @@ impl Host for BareHost<'_> {
         } else {
             state.scoped += 1;
         }
+        state.scoped_ticks += rdtsc().wrapping_sub(entered);
     }
 
     fn profile_ticks(&mut self) -> u64 {
@@ -692,6 +703,14 @@ impl Host for BareHost<'_> {
     ) {
         super::sampling::charge(phase, None);
         pmu::boundary(phase, now);
+    }
+
+    fn profile_idle(&mut self, idle: bool) {
+        super::sampling::idle(idle);
+    }
+
+    fn native_stamps(&self) -> [u64; 2] {
+        state().native_stamps
     }
 
     fn profile_exit(&mut self, slot: usize, now: u64) {

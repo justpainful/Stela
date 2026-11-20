@@ -31,21 +31,18 @@ use crate::metal::{
     capabilities::MAX_BUFFER_BINDINGS,
     error::{Error, Result, ensure},
     hazard::{RENDER_PASS, Use},
-    pass::{
-        AttachmentSlot, ExtendedPlanes, FollowedStencil, PlaneStaging, RenderPassPlan,
-        RenderingAttachment,
-    },
+    pass::{AttachmentSlot, ExtendedPlanes, FollowedStencil, RenderPassPlan, RenderingAttachment},
     pipeline::{DepthStencilState, MAX_COLOR_ATTACHMENTS},
     resource::raw_rendered,
     shader::{Interface, MAX_PATCH_CONTROL_POINTS, Stage},
     vertex::{STRIDE_DYNAMIC, VertexDescriptor},
     vulkan::{
-        Access, AttachmentLoadOp, AttachmentStoreOp, CullMode, FrontFace, ImageAspects, IndexType,
+        Access, AttachmentLoadOp, AttachmentStoreOp, CullMode, FrontFace, IndexType,
         PipelineBindPoint, PipelineStages, PolygonMode, PrimitiveTopology, ResolveModes,
         SampleCounts,
         command::{
             Attachment, Barrier, BufferCopy, BufferImageCopy, Command, DepthStencil, Rect,
-            Rendering, Subresource, VertexBuffer, Viewport as VkViewport,
+            Rendering, VertexBuffer, Viewport as VkViewport,
         },
         object::{Buffer, ImageView, Pipeline, QueryPool, QueryType},
     },
@@ -517,11 +514,11 @@ impl CommandBuffer {
         };
         let features = self.features;
         let recorder = &mut self.recorder;
-        recorder.push(Command::SetViewports(alloc::vec![flip(viewport)]));
-        recorder.push(Command::SetScissors(alloc::vec![Rect {
+        recorder.push(Command::SetViewport(flip(viewport)));
+        recorder.push(Command::SetScissor(Rect {
             offset: [0, 0],
-            extent: [width, height]
-        }]));
+            extent: [width, height],
+        }));
         recorder.push(Command::SetCullMode(CullMode::EMPTY));
         recorder.push(Command::SetFrontFace(FrontFace::Clockwise));
         recorder.push(Command::SetDepthBias {
@@ -639,6 +636,15 @@ impl CommandBuffer {
             let stores = pass.color[index].as_ref().is_some_and(|color| {
                 !color.memoryless && color.store_op == AttachmentStoreOp::Store
             });
+            // Another texture over the surface wrote its planes since its
+            // device copy was refreshed: the copy holds them again before
+            // the pass reads or encodes them.
+            if begins && planes.copy_stale {
+                self.recorder.access(super::blit::TRANSFER);
+                for refresh in planes.copy_rows.iter().flatten() {
+                    self.recorder.push(refresh.refresh());
+                }
+            }
             if begins && !planes.loads || !begins && !stores {
                 continue;
             }
@@ -661,21 +667,25 @@ impl CommandBuffer {
             };
             let mut ordered = false;
             // The staged encodes' areas, which copies move into the planes
-            // once every encode of the pass wrote its staging memory.
+            // once every encode of the pass wrote the device copy.
             let mut staged = Vec::new();
             for &area in areas {
-                let staging = planes
-                    .staging
-                    .filter(|_| !begins && stamp == 0 && planes.color != 0 && planes.layers == 1)
-                    .filter(|_| planes.refreshes.iter().all(Option::is_none))
-                    .filter(|_| {
+                let stages = planes.copy.is_some()
+                    && planes.copy_rows.iter().all(Option::is_some)
+                    && !begins
+                    && stamp == 0
+                    && planes.layers == 1
+                    && {
                         let [width, height] = area.map_or(planes.extent, |[_, _, w, h]| [w, h]);
-                        u64::from(width) * u64::from(height) * u64::from(planes.layers)
-                            >= u64::from(PlaneStaging::MIN_TEXELS)
-                    });
-                let converted = match staging {
-                    Some(staging) => staged_conversion(planes, area, &staging)?,
-                    None => plane_conversion(planes, area, stamp)?,
+                        u64::from(width) * u64::from(height)
+                            >= u64::from(ExtendedPlanes::STAGED_TEXELS)
+                    };
+                let converted = if stages {
+                    staged_conversion(planes, area)?
+                } else if begins {
+                    decode_conversion(planes, area)?
+                } else {
+                    plane_conversion(planes, area, stamp)?
                 };
                 let Some((arguments, count)) = converted else {
                     continue;
@@ -697,14 +707,14 @@ impl CommandBuffer {
                     decodes.push((self.recorder.commands().len(), index));
                     counts.decoded += 1;
                     counts.decoded_texels += u64::from(count);
-                } else if let Some(staging) = staging {
-                    staged.push((staging, arguments));
+                } else if stages {
+                    staged.push(arguments);
                     counts.copied += 1;
                     counts.copied_texels += u64::from(count);
                 } else if stamp != 0 {
                     counts.stamped += 1;
                     let tile = TexelArguments::DIRTY_TILE;
-                    counts.stamped_tiles += u64::from(count / (tile * tile));
+                    counts.stamped_tiles += u64::from(count / tile);
                 } else {
                     counts.direct += 1;
                     counts.direct_texels += u64::from(count);
@@ -723,8 +733,8 @@ impl CommandBuffer {
             }
             if !staged.is_empty() {
                 self.recorder.access(super::blit::TRANSFER);
-                for (staging, arguments) in &staged {
-                    for command in staged_copies(planes, staging, arguments) {
+                for arguments in &staged {
+                    for command in staged_copies(planes, arguments) {
                         self.recorder.push(command);
                     }
                 }
@@ -762,7 +772,7 @@ impl CommandBuffer {
             if drawn == [0, 0, width, height] {
                 continue;
             }
-            let command = match plane_conversion(planes, Some(drawn), 0)? {
+            let command = match decode_conversion(planes, Some(drawn))? {
                 Some((arguments, count)) => {
                     let upload = self.recorder.upload(
                         resolver,
@@ -1073,8 +1083,17 @@ fn drawn_area(commands: &[Command], extent: [u32; 2]) -> (Vec<[u32; 4]>, bool) {
                 scissors.clone_from(rects);
                 continue;
             }
+            Command::SetScissor(rect) => {
+                scissors.clear();
+                scissors.push(*rect);
+                continue;
+            }
             Command::SetViewports(set) => {
                 viewports = viewport_bounds(set, extent);
+                continue;
+            }
+            Command::SetViewport(set) => {
+                viewports = viewport_bounds(core::slice::from_ref(set), extent);
                 continue;
             }
             Command::SetPrimitiveTopology(set) => {
@@ -1263,8 +1282,8 @@ fn narrows(planes: &ExtendedPlanes) -> bool {
 /// The texel kernels' arguments converting `planes` over `area`
 /// (`[x, y, width, height]`, all of the extent for `None`), and the threads;
 /// `None` for none. With a pass's `stamp` the area is the whole extent,
-/// rounded up to whole tiles, and a thread converts each texel of the tiles
-/// its fragments marked ([`TexelArguments::stamp`]).
+/// rounded up to whole tiles, and a thread converts a column of each tile
+/// its fragments marked, a workgroup a tile ([`TexelArguments::stamp`]).
 fn plane_conversion(
     planes: &ExtendedPlanes,
     area: Option<[u32; 4]>,
@@ -1273,7 +1292,7 @@ fn plane_conversion(
     let [x, y, width, height] = area.unwrap_or([0, 0, planes.extent[0], planes.extent[1]]);
     let tile = TexelArguments::DIRTY_TILE;
     let count = if stamp != 0 {
-        width.div_ceil(tile) * height.div_ceil(tile) * tile * tile
+        width.div_ceil(tile) * height.div_ceil(tile) * tile
     } else {
         width
             .checked_mul(height)
@@ -1305,86 +1324,101 @@ fn plane_conversion(
             alpha_bytes_per_row: planes.alpha_bytes_per_row,
             mirror: planes.mirror,
             stamp,
+            copy: planes
+                .copy
+                .map_or(0, |copy| at(copy.color, copy.color_bytes_per_row, 4)),
+            copy_bytes_per_row: planes.copy.map_or(0, |copy| copy.color_bytes_per_row),
+            copy_alpha: planes
+                .copy
+                .filter(|_| planes.alpha != 0)
+                .map_or(0, |copy| at(copy.alpha, copy.alpha_bytes_per_row, 1)),
+            copy_alpha_bytes_per_row: planes.copy.map_or(0, |copy| copy.alpha_bytes_per_row),
             ..TexelArguments::default()
         },
         count,
     )))
 }
 
+/// The texel kernels' arguments decoding `planes` over `area`, and the
+/// threads: from their device copy where they have one, which holds what
+/// they do in the GPU's own memory ([`PlaneCopy`]).
+///
+/// [`PlaneCopy`]: crate::metal::pass::PlaneCopy
+fn decode_conversion(
+    planes: &ExtendedPlanes,
+    area: Option<[u32; 4]>,
+) -> Result<Option<(TexelArguments, u32)>> {
+    let converted = plane_conversion(planes, area, 0)?;
+    Ok(match (converted, planes.copy) {
+        (Some((arguments, count)), Some(_)) => Some((
+            TexelArguments {
+                buffer: arguments.copy,
+                bytes_per_row: arguments.copy_bytes_per_row,
+                alpha: arguments.copy_alpha,
+                alpha_bytes_per_row: arguments.copy_alpha_bytes_per_row,
+                ..arguments
+            },
+            count,
+        )),
+        (converted, _) => converted,
+    })
+}
+
 /// The texel kernel's arguments encoding `planes` over `area` into their
-/// `staging` memory, and its threads: every texel of the area, whose
-/// copies then replace the planes' ([`staged_copies`]), and the mirror
-/// with them where the planes have one.
+/// device copy alone, and its threads: every texel of the area, which
+/// [`staged_copies`] then moves into the planes' rows.
 fn staged_conversion(
     planes: &ExtendedPlanes,
     area: Option<[u32; 4]>,
-    staging: &PlaneStaging,
 ) -> Result<Option<(TexelArguments, u32)>> {
     let Some((arguments, count)) = plane_conversion(planes, area, 0)? else {
         return Ok(None);
     };
-    let [x, y, _] = arguments.origin.map(u64::from);
-    let color_row = u64::from(staging.color_bytes_per_row);
-    let alpha_row = u64::from(staging.alpha_bytes_per_row);
     Ok(Some((
         TexelArguments {
-            buffer: staging.address + y * color_row + x * 4,
-            bytes_per_row: staging.color_bytes_per_row,
-            alpha: if planes.alpha == 0 {
-                0
-            } else {
-                staging.address + staging.alpha_offset + y * alpha_row + x
-            },
-            alpha_bytes_per_row: staging.alpha_bytes_per_row,
-            // Everything it encodes reaches the planes.
-            mirror: if planes.mirror == 0 {
-                0
-            } else {
-                TexelArguments::MIRROR_WRITE
-            },
+            buffer: arguments.copy,
+            bytes_per_row: arguments.copy_bytes_per_row,
+            alpha: arguments.copy_alpha,
+            alpha_bytes_per_row: arguments.copy_alpha_bytes_per_row,
+            // Everything it encodes reaches the rows.
+            mirror: 0,
+            copy: 0,
+            copy_bytes_per_row: 0,
+            copy_alpha: 0,
+            copy_alpha_bytes_per_row: 0,
             ..arguments
         },
         count,
     )))
 }
 
-/// The copies of what a staged conversion of `arguments` wrote into
-/// `staging` to the planes' rows: the codes words, and the alpha bytes
+/// The copies of what a staged conversion of `arguments` wrote into the
+/// planes' device copy to their rows: the codes words, and the alpha bytes
 /// where the planes have them.
-fn staged_copies(
-    planes: &ExtendedPlanes,
-    staging: &PlaneStaging,
-    arguments: &TexelArguments,
-) -> Vec<Command> {
+fn staged_copies(planes: &ExtendedPlanes, arguments: &TexelArguments) -> Vec<Command> {
     let [x, y, _] = arguments.origin;
     let (width, height) = (arguments.width, arguments.height);
-    let copy = |offset: u64, row_bytes: u32, texel: u32, image| Command::CopyBufferToImage {
-        src: staging.buffer,
-        dst: image,
-        region: BufferImageCopy {
-            buffer_offset: offset + u64::from(y) * u64::from(row_bytes) + u64::from(x * texel),
-            buffer_row_length: row_bytes / texel,
-            buffer_image_height: 0,
-            subresource: Subresource {
-                aspects: ImageAspects::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            offset: [x as i32, y as i32, 0],
-            extent: [width, height, 1],
-        },
-    };
-    let mut copies = alloc::vec![copy(0, staging.color_bytes_per_row, 4, staging.planes[0])];
-    if planes.alpha != 0 {
-        copies.push(copy(
-            staging.alpha_offset,
-            staging.alpha_bytes_per_row,
-            1,
-            staging.planes[1],
-        ));
-    }
-    copies
+    planes
+        .copy_rows
+        .iter()
+        .zip([4u64, 1])
+        .take(if planes.alpha == 0 { 1 } else { 2 })
+        .filter_map(|(rows, texel)| {
+            let rows = (*rows)?;
+            let region = rows.region;
+            let row = u64::from(region.buffer_row_length) * texel;
+            Some(Command::CopyImageToBuffer {
+                src: rows.image,
+                dst: rows.buffer,
+                region: BufferImageCopy {
+                    buffer_offset: region.buffer_offset + u64::from(y) * row + u64::from(x) * texel,
+                    offset: [x as i32, y as i32, 0],
+                    extent: [width, height, 1],
+                    ..region
+                },
+            })
+        })
+        .collect()
 }
 
 /// The copies through which the pass's stencil resolve follows its depth
@@ -1659,9 +1693,11 @@ impl CommandBuffer {
             "between 1 and 16 viewports",
         )?;
         render.depth_range = [viewports[0].znear as f32, viewports[0].zfar as f32];
-        self.recorder.push(Command::SetViewports(
-            viewports.iter().copied().map(flip).collect(),
-        ));
+        let command = match viewports {
+            [viewport] => Command::SetViewport(flip(*viewport)),
+            _ => Command::SetViewports(viewports.iter().copied().map(flip).collect()),
+        };
+        self.recorder.push(command);
         Ok(())
     }
 
@@ -1671,8 +1707,7 @@ impl CommandBuffer {
             (1..=16).contains(&rects.len()),
             "between 1 and 16 scissor rectangles",
         )?;
-        let mut scissors = Vec::with_capacity(rects.len());
-        for rect in rects {
+        let scissor = |rect: &ScissorRect| {
             let inside = rect
                 .x
                 .checked_add(rect.width)
@@ -1682,12 +1717,16 @@ impl CommandBuffer {
                     .checked_add(rect.height)
                     .is_some_and(|bottom| bottom <= u64::from(height));
             ensure(inside, "scissor rectangles lie within the render target")?;
-            scissors.push(Rect {
+            Ok(Rect {
                 offset: [rect.x as i32, rect.y as i32],
                 extent: [rect.width as u32, rect.height as u32],
-            });
-        }
-        self.recorder.push(Command::SetScissors(scissors));
+            })
+        };
+        let command = match rects {
+            [rect] => Command::SetScissor(scissor(rect)?),
+            _ => Command::SetScissors(rects.iter().map(scissor).collect::<Result<_>>()?),
+        };
+        self.recorder.push(command);
         Ok(())
     }
 
