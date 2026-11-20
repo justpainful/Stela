@@ -9,13 +9,19 @@
 //! commands once its media has. It looks once the disk has posted a
 //! completion. A disk that signals its completions wakes the core that
 //! looks, so it looks otherwise only for a lost signal; for one that does
-//! not, it looks after half the disk's recent latency, then more often
-//! (Linux's hybrid polling). Nothing waits for the disk and nothing wakes
-//! while no transfer runs. A disk that runs nothing queued executes each
-//! command on the calling PE. One poll admits at most 64 commands, so larger
-//! transfers keep their partial progress until later polls. The boot stages
-//! the guest's disk: there a submission and a look only queue commands and
-//! take results, and the host I/O runs outside the devices' lock.
+//! not, it looks an eighth of its recent latency apart from a transfer's
+//! start. That disk's look is what makes a completion seen: the boot's
+//! staged disk takes a result only in the step a look asks for, which comes
+//! once another processor gets to it. So a first look after half the
+//! latency, as Linux's hybrid polling sleeps, only delayed each result,
+//! and by a latency that, counting that delay, kept itself at twice the
+//! step's wait whatever the disk took. Nothing waits for the disk and
+//! nothing wakes while no transfer runs. A disk that runs nothing queued
+//! executes each command on the calling PE. One poll admits at most 64
+//! commands, so larger transfers keep their partial progress until later
+//! polls. The boot stages the guest's disk: there a submission and a look
+//! only queue commands and take results, and the host I/O runs outside the
+//! devices' lock.
 //!
 //! A mounting APFS deallocates tens of thousands of ranges, which already
 //! read as zeros ([`super::namespace::Medium::deallocate`]), so a Deallocate
@@ -338,6 +344,11 @@ pub(super) struct HostDisk {
     /// What a transfer took, a moving average in counter ticks.
     latency: u64,
     discards: Discards,
+    /// A test's wait from the oldest transfer's start to the first look
+    /// for a disk that signals nothing, as an earlier schedule waited half
+    /// the latency, to time the two apart.
+    #[cfg(test)]
+    pub(super) first_look: Option<fn(&HostDisk) -> u64>,
 }
 
 impl HostDisk {
@@ -348,6 +359,8 @@ impl HostDisk {
             writing: Vec::new(),
             latency: FIRST_LATENCY,
             discards: Discards::default(),
+            #[cfg(test)]
+            first_look: None,
         }
     }
 
@@ -675,8 +688,8 @@ impl HostDisk {
     }
 
     /// When to look for the running transfers' completions next, at counter
-    /// `now`: half the latency after the oldest began, then more often; for
-    /// a disk that signals them, only once a signal is overdue.
+    /// `now`: an eighth of the latency on, from a transfer's start; for a
+    /// disk that signals them, only once a signal is overdue.
     pub(super) fn next_look(&self, now: u64) -> u64 {
         // Only discards wait for the pause that sends them.
         if self.running.is_empty() && self.discards.running.is_empty() {
@@ -695,12 +708,19 @@ impl HostDisk {
                 now.saturating_add(LOST_SIGNAL)
             };
         }
-        let half = oldest.unwrap_or(now).saturating_add(self.latency / 2);
-        if now < half {
-            half
-        } else {
-            now.saturating_add((self.latency / 8).max(SHORTEST_POLL))
+        // Discards alone are looked at half the latency apart.
+        if self.running.is_empty() {
+            return now.saturating_add(self.latency / 2);
         }
+        // A transfer's look asks a staged disk for its result: from the
+        // transfer's start, as a wait first would only delay that result.
+        #[cfg(test)]
+        if let (Some(first), Some(oldest)) = (self.first_look, oldest)
+            && now < oldest.saturating_add(first(self))
+        {
+            return oldest.saturating_add(first(self));
+        }
+        now.saturating_add((self.latency / 8).max(SHORTEST_POLL))
     }
 }
 

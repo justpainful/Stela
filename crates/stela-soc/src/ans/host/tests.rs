@@ -801,3 +801,5 @@ fn urgent_discards_go_in_large_commands_that_measure_nothing() {
     assert!(disk.poll(100 * DISCARD_TARGET).is_empty());
     assert!(disk.diagnostic(0).contains("piece=65536KiB last=none"));
 }
+
+mod polling;
