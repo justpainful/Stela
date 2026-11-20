@@ -156,8 +156,14 @@ fn report(what: &str, ns: [f64; 3], base: [f64; 3], per: f64) {
     );
 }
 
+/// The best of five timings on 1, 2 and 4 threads: the host schedules each
+/// timing's threads on its P and E cores as it sees fit.
 fn on_each(lines: &Lines, step: &(dyn Fn(&mut GuestState) + Sync)) -> [f64; 3] {
-    [1, 2, 4].map(|threads| timed(threads, lines, step))
+    [1, 2, 4].map(|threads| {
+        (0..5)
+            .map(|_| timed(threads, lines, step))
+            .fold(f64::MAX, f64::min)
+    })
 }
 
 /// 16 copies of `words`, one block.
