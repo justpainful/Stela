@@ -548,10 +548,15 @@ const fn site_return(site: usize) -> u64 {
 const TAIL_AT: usize = 2048;
 const PROBES: usize = 4096;
 const CONTINUATIONS: usize = 6 * 1024;
+/// The state's X2 and X3, the frame slots of registers the code keeps in
+/// its frame, as pinned code keeps X0 and X1 in host registers
+/// ([`crate::x86_64::pinned`]): the loops' sequence and link register.
+const SEQUENCE: Mem = Mem::base(Gpr::Rdi, 8 * 2);
+const LINK: Mem = Mem::base(Gpr::Rdi, 8 * 3);
 
 /// A loop of RSI calls whose callee returns at once, through `sites` call
 /// sites: with one, the same site each time; with more, a site the
-/// state's X0 (a linear congruential sequence) picks each time, as a
+/// state's X2 (a linear congruential sequence) picks each time, as a
 /// function with several callers returns. The callee's return is the
 /// return exit's tail at [`TAIL_AT`]: a paired tail with `paired`, the
 /// lookup tail (its jump cache, then the table probe) without, as today.
@@ -563,12 +568,12 @@ fn call_loop(paired: bool, sites: usize, base: u64) -> Vec<u8> {
     let start = asm.len();
     asm.alu_imm8(Alu::Sub, Qword, Gpr::Rsi, 1);
     let done = asm.jcc(Cond::E);
-    // RCX = the site: X0 = X0 * 6364136223846793005 + 1, its top 3 bits.
+    // RCX = the site: X2 = X2 * 6364136223846793005 + 1, its top 3 bits.
     asm.mov_imm64(Rcx, 6_364_136_223_846_793_005);
-    asm.mov_load(Qword, Rax, Mem::base(Gpr::Rdi, 0));
+    asm.mov_load(Qword, Rax, SEQUENCE);
     asm.fixed(&[0x48, 0x0f, 0xaf, 0xc1]); // imul rax, rcx
     asm.alu_imm8(Alu::Add, Qword, Rax, 1);
-    asm.mov_store(Qword, Mem::base(Gpr::Rdi, 0), Rax);
+    asm.mov_store(Qword, SEQUENCE, Rax);
     asm.shift_imm(ShiftOp::Shr, Qword, Rax, 61);
     let mut to_sites = Vec::new();
     for site in 1..sites {
@@ -585,9 +590,9 @@ fn call_loop(paired: bool, sites: usize, base: u64) -> Vec<u8> {
                 asm.bind(branch);
             }
         }
-        // BL: X30 (the state's X1 here) is the return address.
+        // BL: X30 (the state's X3 here) is the return address.
         asm.mov_imm64(R8, site_return(site));
-        asm.mov_store(Qword, Mem::base(Gpr::Rdi, 8), R8);
+        asm.mov_store(Qword, LINK, R8);
         let continuation = paired.then(|| paired_call(&mut asm, GuestAddress(site_return(site))));
         // The call's exit, linked into the callee.
         let to_callee = asm.jmp();
@@ -599,7 +604,7 @@ fn call_loop(paired: bool, sites: usize, base: u64) -> Vec<u8> {
     }
     // The callee: RET X30, its exit's patch point jumping to the tail.
     let callee = asm.len();
-    asm.mov_load(Qword, Rax, Mem::base(Gpr::Rdi, 8));
+    asm.mov_load(Qword, Rax, LINK);
     asm.mov_imm32(Rdx, ExitWord::from(ExitKind::Return).encoded());
     let to_tail = asm.jmp();
     asm.bind(done);
@@ -720,6 +725,312 @@ fn paired_and_looked_up_return_costs() {
             "call/return pair, {sites} site(s): lookup tail {:.2} ns, paired {:.2} ns",
             results[0],
             results[1]
+        );
+    }
+}
+
+/// How [`chain_loop`]'s calls reach their returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Calls {
+    /// Each call pushes its paired frame, and its return takes it: a call
+    /// and its return in one native run.
+    Paired,
+    /// No call pushes a frame, so each return finds none and takes its
+    /// lookup tail's jump cache, or the table probe: a return in a native
+    /// run after the one its call was made in.
+    Frameless,
+    /// No call pushes a host frame: each pushes its return address and its
+    /// continuation's host address on a stack in memory, which outlives a
+    /// native run, and its return, finding no host frame, compares the
+    /// target with the top's address, takes the entry and jumps to its
+    /// continuation by the return site's own indirect jump: the most a
+    /// predictor of returns across native runs could take, without the
+    /// checks of contexts, ITLB drop and retire epochs, budget and
+    /// interruption that one needs, or the block's name.
+    Stacked,
+}
+
+/// Bytes of [`chain_loop`]'s region: its code, then a paired tail per
+/// level, then the probes, then [`CHAIN_STACK`]'s bytes for its stack.
+const CHAIN_REGION: usize = 1 << 17;
+/// Bytes of a [`Calls::Stacked`] loop's stack at the region's end: two
+/// words a call.
+const CHAIN_STACK: usize = 4096;
+/// Where that stack's top is: the state's X3.
+const CHAIN_STACK_TOP: Mem = Mem::base(Gpr::Rdi, 8 * 3);
+
+/// The guest return address of call site `site` of level `level` of a
+/// [`chain_loop`] of `sites` sites a level: 0x44 bytes apart, as a
+/// library's return addresses spread, each with its own jump cache entry.
+const fn chain_return(level: usize, site: usize, sites: usize) -> u64 {
+    0xffff_fe00_1234_0004 + 0x44 * (level * sites + site) as u64
+}
+
+/// The frame slot of [`chain_loop`]'s link register at `level`: X4 up,
+/// past the registers pinned code keeps in host registers.
+fn chain_link(level: usize) -> Mem {
+    use crate::aarch64::Register;
+    let register = (4..31)
+        .filter(|&register| crate::x86_64::pinned::host(Register::X(register)).is_none())
+        .nth(level)
+        .expect("a frame slot for each level");
+    Mem::base(Gpr::Rdi, 8 * i32::from(register))
+}
+
+/// A loop of RSI walks down a chain of `depth` calls and back: at each
+/// level the function picks one of `sites` call sites by bits of X2 (a
+/// linear congruential sequence) and calls the next level's function,
+/// whose return goes back to that site's return address, as a function
+/// with several callers returns. Each level's function has one return
+/// site with a paired tail of its own; a return address's block goes on
+/// to its function's return, or at level 0 back to the loop. X2 holds the
+/// sequence and [`chain_link`] each level's link register. The code, at
+/// `base`, and each return address's block offset in it.
+fn chain_loop(depth: usize, sites: usize, calls: Calls, base: u64) -> (Vec<u8>, Vec<(u64, usize)>) {
+    assert!((1..=24).contains(&depth) && sites.is_power_of_two() && sites <= 8);
+    let link = chain_link;
+    let word = ExitWord::from(ExitKind::Return);
+    let mut code = Code::pinned();
+    let mut asm = code.asm();
+    let start = asm.len();
+    asm.alu_imm8(Alu::Sub, Qword, Gpr::Rsi, 1);
+    let done = asm.jcc(Cond::E);
+    asm.mov_imm64(Rcx, 6_364_136_223_846_793_005);
+    asm.mov_load(Qword, Rax, SEQUENCE);
+    asm.fixed(&[0x48, 0x0f, 0xaf, 0xc1]); // imul rax, rcx
+    asm.alu_imm8(Alu::Add, Qword, Rax, 1);
+    asm.mov_store(Qword, SEQUENCE, Rax);
+    let stack = base + (CHAIN_REGION - CHAIN_STACK) as u64;
+    if calls == Calls::Stacked {
+        // Each walk down starts at the stack's bottom.
+        asm.mov_imm64(R8, stack);
+        asm.mov_store(Qword, CHAIN_STACK_TOP, R8);
+    }
+    // Each level's function entry; level 0's is the loop's.
+    let mut entries = vec![0; depth + 1];
+    // A call's jump into the callee, by callee level.
+    let mut to_callee = Vec::new();
+    // A continuation's jump to its return address's block.
+    let mut to_block = Vec::new();
+    // A stacked call's MOVABS of its continuation's host address.
+    let mut continuations = Vec::new();
+    // A return's jump to its level's tail.
+    let mut to_tail = Vec::new();
+    let bits = sites.trailing_zeros() as usize;
+    for (level, at) in entries.iter_mut().enumerate().take(depth) {
+        *at = asm.len();
+        let mut branches = Vec::new();
+        if sites > 1 {
+            // EAX = the site: `bits` bits of X2's upper 48.
+            asm.mov_load(Qword, Rax, SEQUENCE);
+            let shift = 16 + (bits * level) % (48 - bits);
+            asm.shift_imm(ShiftOp::Shr, Qword, Rax, shift as u8);
+            asm.alu_imm8(Alu::And, Dword, Rax, (sites - 1) as i8);
+            for site in 1..sites {
+                asm.alu_imm8(Alu::Cmp, Dword, Rax, site as i8);
+                branches.push(asm.jcc(Cond::E));
+            }
+        }
+        for site in 0..sites {
+            if site > 0 {
+                asm.bind(branches.remove(0));
+            }
+            // BL: the link register, then the paired frame.
+            let address = chain_return(level, site, sites);
+            asm.mov_imm64(R8, address);
+            asm.mov_store(Qword, link(level), R8);
+            let continuation =
+                (calls == Calls::Paired).then(|| paired_call(&mut asm, GuestAddress(address)));
+            if calls == Calls::Stacked {
+                // The entry: the return address, then the continuation.
+                asm.mov_load(Qword, R9, CHAIN_STACK_TOP);
+                asm.mov_store(Qword, Mem::base(R9, 0), R8);
+                let movabs = asm.len();
+                asm.mov_imm64(R8, 0);
+                continuations.push(((level, site), movabs + 2));
+                asm.mov_store(Qword, Mem::base(R9, 8), R8);
+                asm.lea(Qword, R9, Mem::base(R9, 16));
+                asm.mov_store(Qword, CHAIN_STACK_TOP, R9);
+            }
+            to_callee.push((level + 1, asm.jmp()));
+            if let Some(continuation) = continuation {
+                asm.bind(continuation);
+                to_block.push(((level, site), asm.jmp()));
+            }
+        }
+    }
+    // The leaf: RET to the last level's call.
+    entries[depth] = asm.len();
+    asm.mov_load(Qword, Rax, link(depth - 1));
+    asm.mov_imm32(Rdx, word.encoded());
+    to_tail.push((depth - 1, asm.jmp()));
+    asm.bind(done);
+    asm.mov_imm32(Rax, 1);
+    asm.mov_imm32(Rdx, 2);
+    exit_return(&mut asm);
+    // The return addresses' blocks: the rest of the caller, which returns
+    // in turn, or at level 0 the loop again.
+    let mut blocks = Vec::new();
+    for level in 0..depth {
+        for site in 0..sites {
+            let at = asm.len().next_multiple_of(16);
+            while asm.len() < at {
+                asm.int3();
+            }
+            blocks.push((chain_return(level, site, sites), at));
+            if level == 0 {
+                let back = asm.jmp();
+                asm.bind_back(back, start);
+            } else {
+                asm.mov_load(Qword, Rax, link(level - 1));
+                asm.mov_imm32(Rdx, word.encoded());
+                to_tail.push((level - 1, asm.jmp()));
+            }
+        }
+    }
+    // A paired tail per level, then the probes.
+    let tails = asm.len().next_multiple_of(64);
+    while asm.len() < tails {
+        asm.int3();
+    }
+    let probes = tails + depth * PAIRED_TAIL_BYTES;
+    for level in 0..depth {
+        let at = tails + level * PAIRED_TAIL_BYTES;
+        let probe = base + (probes + PROBE_ENTRY) as u64;
+        let tail = match calls {
+            Calls::Stacked => {
+                // The top's entry, when it holds the target: taken, and
+                // its continuation entered; else the lookup tail.
+                let mut check = Code::pinned();
+                let mut asm = check.asm();
+                asm.mov_load(Qword, R8, CHAIN_STACK_TOP);
+                asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(R8, -16));
+                let other = asm.jcc8(Cond::Ne);
+                count(&mut asm, transfer_change(RAN).unwrap());
+                asm.lea(Qword, R8, Mem::base(R8, -16));
+                asm.mov_store(Qword, CHAIN_STACK_TOP, R8);
+                asm.jmp_rm(Mem::base(R8, 8));
+                asm.bind(other);
+                let mut tail = check.into_bytes();
+                let lookup = base + (at + tail.len()) as u64;
+                tail.extend(lookup_tail(lookup, word, RAN, probe, 0).unwrap());
+                tail.resize(PAIRED_TAIL_BYTES, 0xcc);
+                tail
+            }
+            _ => paired_tail(base + at as u64, word, RAN, probe)
+                .unwrap()
+                .to_vec(),
+        };
+        asm.fixed(&tail);
+    }
+    asm.fixed(&lookup_dispatcher(0).unwrap());
+    assert!(asm.len() <= CHAIN_REGION - CHAIN_STACK, "{}", asm.len());
+    for (level, jump) in to_callee {
+        crate::x86_64::asm::resolve(&mut code, jump, entries[level]);
+    }
+    for ((level, site), jump) in to_block {
+        crate::x86_64::asm::resolve(&mut code, jump, blocks[level * sites + site].1);
+    }
+    for (level, jump) in to_tail {
+        crate::x86_64::asm::resolve(&mut code, jump, tails + level * PAIRED_TAIL_BYTES);
+    }
+    let mut bytes = code.into_bytes();
+    for ((level, site), at) in continuations {
+        let continuation = base + blocks[level * sites + site].1 as u64;
+        bytes[at..at + 8].copy_from_slice(&continuation.to_le_bytes());
+    }
+    (bytes, blocks)
+}
+
+/// Host cost of one guest call and return pair down and back up chains of
+/// calls one to 24 deep, each level's function called from one of 1 to 8
+/// sites at random, in one native run (each return takes its paired
+/// frame), frameless (each return takes its lookup tail, as a return in a
+/// native run after its call's does) and stacked (each takes an entry of
+/// a stack in memory, [`Calls::Stacked`], the bound of a predictor across
+/// native runs). Prints nanoseconds per pair; asserts only the counts.
+#[test]
+#[ignore = "manual: opt-in"]
+fn call_return_chain_costs() {
+    const RUNS: u64 = 256;
+    let key = block_key(0x4000_0000, 1);
+    for (depth, sites) in [(1, 1), (1, 8), (4, 1), (4, 4), (16, 2), (16, 4), (24, 4)] {
+        // Runs of fewer transfers than MAX_BUDGET: a frameless return
+        // spends one.
+        let run_pairs = (MAX_BUDGET - 1) / depth as u64 / 2;
+        let mut results = Vec::new();
+        for calls in [Calls::Frameless, Calls::Stacked, Calls::Paired] {
+            let region = pages(&[0; CHAIN_REGION]);
+            let base = region.0 as u64;
+            let (code, blocks) = chain_loop(depth, sites, calls, base);
+            // SAFETY: the mapping is RWX and nothing runs it yet.
+            unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), region.0, code.len()) };
+            let mut table = LookupTable::new();
+            let mut itlb = LookupTable::itlb();
+            for &(pc, at) in &blocks {
+                itlb.insert(
+                    itlb.page_slot(pc, CONTEXTS[1]),
+                    LookupEntry::page(pc & !0xfff, CONTEXTS[1], key),
+                );
+                table.insert(
+                    table.slot(pc, key),
+                    LookupEntry {
+                        pc,
+                        key,
+                        entry: base + at as u64,
+                        block: 3 + at as u32,
+                        targets: 1,
+                    },
+                );
+            }
+            let stamps = table.new_stamps();
+            let mut run = Run::new(DEFAULT_FRAME_BOUND);
+            run.control.table = table.address();
+            run.control.itlb = itlb.address();
+            run.control.salts = [itlb.salt(CONTEXTS[0]), itlb.salt(CONTEXTS[1])];
+            run.control.masks = [table.mask(), itlb.mask()];
+            run.control.stamps = stamps;
+            // Warm: the jump cache, the host's predictors.
+            for _ in 0..16 {
+                run.account = Account::new(MAX_BUDGET);
+                assert_eq!(run.enter(&region, 0, run_pairs), (1, 2));
+            }
+            let (pairs_before, hits_before) = (run.pairs(), run.control.hits);
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for _ in 0..RUNS {
+                    run.account = Account::new(MAX_BUDGET);
+                    assert_eq!(run.enter(&region, 0, run_pairs), (1, 2));
+                }
+                let pairs = RUNS * (run_pairs - 1) * depth as u64;
+                best = best.min(start.elapsed().as_secs_f64() * 1e9 / pairs as f64);
+            }
+            let returns = 5 * RUNS * (run_pairs - 1) * depth as u64;
+            let (pairs, hits) = (run.pairs(), run.control.hits - hits_before);
+            let matched =
+                pairs[PairCount::Matched as usize] - pairs_before[PairCount::Matched as usize];
+            match calls {
+                Calls::Paired => {
+                    assert_eq!((matched, hits), (returns, 0));
+                    assert_eq!(pairs[PairCount::Missed as usize], 0);
+                }
+                Calls::Frameless => {
+                    assert_eq!((matched, hits), (0, returns));
+                    assert_eq!(pairs, [0; PAIR_COUNTS]);
+                }
+                Calls::Stacked => {
+                    assert_eq!((matched, hits), (0, 0));
+                    assert_eq!(pairs, [0; PAIR_COUNTS]);
+                }
+            }
+            results.push(best);
+        }
+        std::println!(
+            "{depth} deep, {sites} site(s) a level: frameless {:.2} ns, stacked {:.2} ns, paired {:.2} ns a call and return",
+            results[0],
+            results[1],
+            results[2]
         );
     }
 }
