@@ -1139,12 +1139,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let at = tail.0 as u64;
         let code = match open {
             true => chain::open_predicted_tail(at, GuestAddress(target), word),
+            // The miss of a site of more targets than it predicts takes
+            // the jump cache before the table probe.
             false => chain::predicted_tail(
                 at,
                 GuestAddress(target),
                 word,
                 retired,
-                probe + chain::PROBE_ENTRY as u64,
+                probe + chain::JUMP_PROBE_ENTRY as u64,
             ),
         };
         let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {

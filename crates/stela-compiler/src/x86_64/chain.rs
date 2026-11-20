@@ -3395,6 +3395,11 @@ pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 /// Where a [`lookup_dispatcher`]'s stamping cell probe begins, after the
 /// table probe: a [`stamped_tail`]'s miss takes it.
 pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 640;
+/// Where a [`lookup_dispatcher`]'s jump probe begins, after the stamping
+/// cell probe: this PE's jump cache, then the table probe, as a
+/// [`lookup_tail`] takes them, for the tails that call a probe without a
+/// cache check of their own ([`predicted_tail`]'s miss).
+pub const JUMP_PROBE_ENTRY: usize = STAMPING_PROBE_ENTRY + 512;
 /// Bytes in a tail's call of a probe: `mov edx, word`, `call probe` and
 /// `jmp r9` into the block the probe found.
 pub const TAIL_BYTES: usize = 5 + 5 + 3;
@@ -3510,7 +3515,79 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let (to_table, to_probe) = cell_probe(&mut code, policy, true, btype);
     crate::x86_64::asm::resolve(&mut code, to_table, table);
     crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
+    let padding = JUMP_PROBE_ENTRY
+        .checked_sub(code.len())
+        .expect("the stamping cell probe fits its bytes");
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    let to_probe = jump_probe(&mut code, policy, btype);
+    crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
     Some(code.into_bytes())
+}
+
+/// The jump probe at the end of `code` ([`JUMP_PROBE_ENTRY`]), which a
+/// tail calls with the target in RAX and its word in EDX: a target this
+/// PE's jump cache holds, and that accepts `btype`, returns to the tail
+/// with its block's code in R9, counted and named as a [`lookup_tail`]'s
+/// hit counts and names it, under that tail's rules; any other, or a run
+/// that must stop, takes the jump returned to the table probe, its return
+/// address and EDX kept, whose own checks stop the run.
+fn jump_probe(code: &mut Code, policy: Interruption, btype: u8) -> crate::x86_64::asm::Patch {
+    let mut asm = code.asm();
+    asm.place(Rcx, CONTROL);
+    let mut misses = Vec::new();
+    let entry = jump_cache_check(&mut asm, btype, &mut misses);
+    misses.push(stop_check(&mut asm, policy, true));
+    spend_transfer(&mut asm);
+    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
+    asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
+    entered_btype(&mut asm, R8, btype);
+    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    asm.mov_load(Qword, R9, entry(JUMP_CODE));
+    found(&mut asm);
+    for miss in misses {
+        asm.bind(miss);
+    }
+    asm.jmp()
+}
+
+/// The check that this PE's jump cache holds the target in RAX, RCX at
+/// the control ([`lookup_tail`]): R10 = the PE's stamps and R9 = the
+/// entry's offset from the cache, the jumps of a miss pushed to `misses`,
+/// and the entry's fields, by their offsets, returned. The entry holds
+/// while the target's half has the context and this PE's ITLB the drop
+/// epoch of that half it names, and, for a nonzero `btype`, its block
+/// accepts `btype`. Clobbers R8 (the target's half) and R11.
+fn jump_cache_check(
+    asm: &mut crate::x86_64::asm::Asm,
+    btype: u8,
+    misses: &mut Vec<crate::x86_64::asm::Patch>,
+) -> fn(i32) -> Mem {
+    let entry: fn(i32) -> Mem = |field| Mem::indexed(R10, R9, 1, JUMP_CACHE + field);
+    asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
+    asm.mov(Dword, R9, Rax);
+    asm.alu_imm32(Alu::And, Dword, R9, JUMP_INDEX);
+    asm.shift_imm(ShiftOp::Shl, Dword, R9, JUMP_INDEX_SHIFT);
+    asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
+    misses.push(asm.jcc(Cond::Ne));
+    // The target's half still has the context and ITLB drop epoch the
+    // entry holds in. No context is 0, so an empty entry holds in none.
+    asm.mov(Qword, R8, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, R8, 55);
+    asm.alu_imm8(Alu::And, Dword, R8, 1);
+    asm.mov_load(Qword, R11, Mem::indexed(Rcx, R8, 8, CONTEXTS));
+    asm.alu_load(Alu::Cmp, Qword, R11, entry(JUMP_CONTEXT));
+    misses.push(asm.jcc(Cond::Ne));
+    asm.mov_load(Qword, R11, Mem::base(Rcx, ITLB));
+    asm.mov_load(Qword, R11, Mem::indexed(R11, R8, 8, ITLB_DROPS));
+    asm.alu_load(Alu::Cmp, Qword, R11, entry(JUMP_EPOCH));
+    misses.push(asm.jcc(Cond::Ne));
+    if btype != 0 {
+        asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
+        misses.push(asm.jcc(Cond::E));
+    }
+    entry
 }
 
 /// The BTYPE bits of `block` ([`BLOCK_BTYPE_SHIFT`]) set in `register`,
@@ -4037,33 +4114,10 @@ fn lookup_tail_code(
     if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
     }
-    let entry = |field: i32| Mem::indexed(R10, R9, 1, JUMP_CACHE + field);
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
     let mut misses = Vec::new();
-    // R10 = this PE's stamps, R9 = the entry's offset.
-    asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
-    asm.mov(Dword, R9, Rax);
-    asm.alu_imm32(Alu::And, Dword, R9, JUMP_INDEX);
-    asm.shift_imm(ShiftOp::Shl, Dword, R9, JUMP_INDEX_SHIFT);
-    asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
-    misses.push(asm.jcc(Cond::Ne));
-    // The target's half still has the context and ITLB drop epoch the
-    // entry holds in. No context is 0, so an empty entry holds in none.
-    asm.mov(Qword, R8, Rax);
-    asm.shift_imm(ShiftOp::Shr, Qword, R8, 55);
-    asm.alu_imm8(Alu::And, Dword, R8, 1);
-    asm.mov_load(Qword, R11, Mem::indexed(Rcx, R8, 8, CONTEXTS));
-    asm.alu_load(Alu::Cmp, Qword, R11, entry(JUMP_CONTEXT));
-    misses.push(asm.jcc(Cond::Ne));
-    asm.mov_load(Qword, R11, Mem::base(Rcx, ITLB));
-    asm.mov_load(Qword, R11, Mem::indexed(R11, R8, 8, ITLB_DROPS));
-    asm.alu_load(Alu::Cmp, Qword, R11, entry(JUMP_EPOCH));
-    misses.push(asm.jcc(Cond::Ne));
-    if btype != 0 {
-        asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
-        misses.push(asm.jcc(Cond::E));
-    }
+    let entry = jump_cache_check(&mut asm, btype, &mut misses);
     // A run that must stop takes the plain tail, whose probe stops it.
     misses.push(stop_check(&mut asm, policy, true));
     count(&mut asm, transfer_change(ran)?);
@@ -4199,10 +4253,13 @@ const _: () = assert!(TAIL_BYTES <= DYNAMIC_EXIT_BYTES);
 /// ([`PREDICTED_EXIT`]), which returns RAX and EDX exactly as the
 /// redirected exit does and which the engine links like a block's direct
 /// exit, through a cell ([`cell_tail`], [`stamped_branch_tail`]); any other
-/// target takes the [`lookup_tail`] to `probe` after it. Both leave EDX as
-/// the redirected exit or its lookup tail would, so whichever runs, the
-/// transfer or exit is the one the lookup tail makes. `None` as for a
-/// [`lookup_tail`].
+/// target calls `probe` after it, the engine's the jump probe
+/// ([`JUMP_PROBE_ENTRY`]): the jump cache, then the table probe, as a
+/// [`lookup_tail`] takes them, where a site of more targets than it
+/// predicts (a vtable call, an `objc_msgSend` tail) took the table probe
+/// at every transfer. Both leave EDX as the redirected exit or its lookup
+/// tail would, so whichever runs, the transfer or exit is the one the
+/// lookup tail makes. `None` as for a [`lookup_tail`].
 pub fn predicted_tail(
     at: u64,
     target: GuestAddress,
