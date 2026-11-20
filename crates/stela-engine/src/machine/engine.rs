@@ -1585,6 +1585,8 @@ impl<H: Host> mmu::TableMemory for RamTables<'_, H> {
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod atomic_cost;
 #[cfg(test)]
 mod density;
 #[cfg(test)]
