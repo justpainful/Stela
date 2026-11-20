@@ -520,6 +520,61 @@ fn system_mode_blocks_check_every_access_against_the_guest_ranges() {
     assert_eq!(accesses(&zero), [(64, 1)]);
 }
 
+/// A global, addressed from the PC (ADRP, then ADD immediate), needs no
+/// check where the PC's 4 GiB slice and those on either side pass
+/// (`x86_64::guest_range`): a kernel's, and with EL0's one-sided check a
+/// program's. In the lower range's last slice, whose neighbour fails, the
+/// same block checks, and so does an EL0 block in the first.
+#[test]
+fn accesses_through_a_passing_constant_base_skip_the_range_check() {
+    use crate::x86_64::{MemoryChecks, RangeCheck};
+    // adrp x8, #0; add x8, x8, #0x10; ldr x9, [x8, #16]; str x9, [x8, #24]
+    let words = [0x9000_0008_u32, 0x9100_4108, 0xf940_0909, 0xf900_0d09];
+    let source: Vec<u8> = words.iter().copied().flat_map(u32::to_le_bytes).collect();
+    let compile = |pc: u64, range: RangeCheck| {
+        let options = crate::Options::new(
+            BlockProfile::new(Features::SYSTEM_MODE),
+            crate::TargetCpu::detect(),
+        )
+        .with_memory_checks(MemoryChecks::system(true, false, true, false).with_range(range));
+        crate::compile(&source, GuestAddress(pc), &options)
+            .unwrap()
+            .native
+            .x86_64_code
+    };
+    for range in [RangeCheck::FIVE_LEVEL, RangeCheck::four_level(2)] {
+        let check = range.pinned_code();
+        let count = |pc: u64| {
+            compile(pc, range)
+                .windows(check.len())
+                .filter(|bytes| *bytes == check)
+                .count()
+        };
+        let lower = range.lower_limit();
+        assert_eq!(count(0xffff_fe00_0712_3400), 0, "{range:?}");
+        assert_eq!(count(lower - (3 << 32)), 0, "{range:?}");
+        assert_eq!(count(0x1_0000), 0, "{range:?}");
+        assert_eq!(count(lower - 0x1000), 1, "{range:?}");
+        assert_eq!(count(lower), 1, "{range:?}");
+        // `cmp r, [lower_limit]` (REX.W 3B /r) with the frame's limit.
+        let limit = core::mem::offset_of!(crate::GuestState, lower_limit) as u32;
+        let compares = |pc: u64| {
+            compile(pc, range.one_sided(true))
+                .windows(7)
+                .filter(|bytes| {
+                    matches!(bytes[0], 0x48 | 0x4c)
+                        && bytes[1] == 0x3b
+                        && bytes[2] & 0xc7 == 0x87
+                        && bytes[3..7] == limit.to_le_bytes()
+                })
+                .count()
+        };
+        assert_eq!(compares(0x1_0000_4000), 0, "{range:?}");
+        assert_eq!(compares(0x1_0000), 1, "{range:?}");
+        assert_eq!(compares(lower - 0x1000), 1, "{range:?}");
+    }
+}
+
 #[test]
 fn system_mode_blocks_check_sctlr_a_and_the_ordered_granule_when_asked() {
     // ldr x0, [x1, #8]; ldp w2, w3, [x1]; ldr h0, [x1, x2]; ld1 {v0.4s},

@@ -799,6 +799,48 @@ fn ending_word(random: &mut impl FnMut() -> u32) -> u32 {
     }
 }
 
+/// A page whose 4 GiB slice, or one beside it, the range check fails has
+/// another context than the pages of its address class around which it
+/// passes: an access through a value a block formed from its PC skips its
+/// check only around them (`stela_compiler::x86_64::guest_range`), so a
+/// stored block moves only between pages that answer alike.
+#[test]
+fn pages_the_range_check_fails_around_have_a_context_of_their_own() {
+    use stela_compiler::x86_64::{MemoryChecks, NativeSystem, RangeCheck};
+    // EL0's one-sided check: the lower range's first 4 GiB and last 4 GiB
+    // have a failing slice beside them, and share a context; a program at
+    // 4 GiB and the shared cache past it do not.
+    let user = system_preparation(stela_compiler::TargetCpu::Baseline);
+    let [first, program, cache, last] =
+        [0x4000, 0x1_0000_4000, 0x18_0000_0000, 0x7fff_ffff_c000].map(|page| user.context(page));
+    assert_eq!(program, cache);
+    assert_ne!(first, program);
+    assert_eq!(first, last);
+    assert_eq!(first, user.context(0xffff_c000));
+    // A kernel's two-sided check, four-level with 4 slices: the upper
+    // range's first slice, at 0xffff_8800_0000_0000, has the window's
+    // guard below it.
+    let chip = crate::machine::test_chip();
+    let kernel = Preparation::new(
+        chip,
+        Arc::new(chip.admit_table(0).expect("admit")),
+        stela_compiler::TargetCpu::Baseline,
+        true,
+        MemoryChecks::system(true, false, true, false).with_range(RangeCheck::four_level(4)),
+        None,
+        NativeSystem::NONE,
+    );
+    let [start, kernel_text, top] = [
+        0xffff_8800_0000_4000,
+        0xffff_fe00_0712_0000,
+        0xffff_ffff_ffff_c000,
+    ]
+    .map(|page| kernel.context(page));
+    assert_eq!(kernel_text, top);
+    assert_ne!(start, kernel_text);
+    assert_eq!(kernel_text, kernel.context(0xffff_8801_0000_0000));
+}
+
 /// Every block's stored form, made from the relocations its compiler
 /// recorded, is what compiling it again at other pages proves: the fields
 /// that move are those, each by its page's displacement, and nothing else

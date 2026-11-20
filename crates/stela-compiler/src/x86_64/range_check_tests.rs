@@ -74,6 +74,51 @@ fn the_one_sided_check_passes_exactly_the_two_sided_lower_range() {
     assert_eq!(RangeCheck::four_level(2).lower_limit(), 1 << 47);
 }
 
+/// `passes_around` holds exactly where the check passes the first and last
+/// address of the 4 GiB slice holding the PC and of those on either side,
+/// and so every address between them (the passing addresses are one signed
+/// interval), in either form.
+#[test]
+fn passes_around_is_the_three_slices_around_the_pc_passing() {
+    const SHIFT: u32 = 32;
+    let slice = |at: i64| (at << SHIFT) as u64;
+    for check in PLACEMENTS {
+        for form in [check, check.one_sided(true)] {
+            let (mut passing, mut around) = (0, 0);
+            // Every slice near a range's edge, and every 2^20th beyond.
+            const NEAR: i64 = (1 << 17) + 8;
+            let far = (-(1i64 << 31)..1 << 31)
+                .step_by(1 << 20)
+                .filter(|at| !(-NEAR..NEAR).contains(at));
+            for at in (-NEAR..NEAR).chain(far) {
+                let ends = [at - 1, at, at + 1].map(|at| {
+                    at.checked_shl(SHIFT)
+                        .filter(|&start| start >> SHIFT == at)
+                        .is_some_and(|_| {
+                            form.passes(slice(at)) && form.passes(slice(at) + ((1 << SHIFT) - 1))
+                        })
+                });
+                for pc in [
+                    slice(at),
+                    slice(at) + 0x1234_5000,
+                    slice(at) + ((1 << SHIFT) - 4),
+                ] {
+                    assert_eq!(
+                        form.passes_around(pc),
+                        ends.iter().all(|&end| end),
+                        "{form:?} {pc:#x}"
+                    );
+                }
+                passing += usize::from(ends[1]);
+                around += usize::from(form.passes_around(slice(at)));
+            }
+            // The ranges' slices but the lower range's last and the upper
+            // range's first, or the EL0 range's first.
+            assert_eq!(around, passing - 2, "{form:?}");
+        }
+    }
+}
+
 #[test]
 fn the_one_sided_check_is_a_frame_compare_and_the_mask() {
     let limit = core::mem::offset_of!(GuestState, lower_limit) as u32;

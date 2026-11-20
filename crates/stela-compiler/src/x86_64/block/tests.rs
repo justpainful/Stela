@@ -3166,7 +3166,11 @@ fn region_census_of_real_code() {
         runs += 1;
         let mut ranges = [false; MAX_BLOCK_INSTRUCTIONS];
         if system {
-            super::super::guest_range::checks(run, &mut ranges[..run.len()]);
+            super::super::guest_range::checks(
+                super::super::RangeCheck::FIVE_LEVEL,
+                run,
+                &mut ranges[..run.len()],
+            );
         }
         let checks_at = |index: usize| super::super::MemoryChecks {
             guest_range: ranges[index],

@@ -40,9 +40,10 @@ pub struct Preparation {
     scalable: Option<bool>,
     system: NativeSystem,
     /// [`Self::context`] of the lower and upper halves' address classes,
-    /// which every fetch page lies in: each install of a block prepared
-    /// elsewhere checks it.
-    contexts: [Digest; 2],
+    /// which every fetch page lies in, by whether the range check passes
+    /// around the page: each install of a block prepared elsewhere checks
+    /// it.
+    contexts: [[Digest; 2]; 2],
 }
 
 /// The address classes of the lower and upper halves of a 48-bit address
@@ -109,9 +110,10 @@ impl Preparation {
             checks,
             scalable,
             system,
-            contexts: [Digest::default(); 2],
+            contexts: [[Digest::default(); 2]; 2],
         };
-        preparation.contexts = HALVES.map(|class| preparation.describe(class));
+        preparation.contexts =
+            HALVES.map(|class| [false, true].map(|around| preparation.describe(class, around)));
         preparation
     }
 
@@ -162,16 +164,27 @@ impl Preparation {
 
     /// The entry context of blocks prepared with this in the page at
     /// `page`: everything besides their bytes and offset that shapes their
-    /// compilation.
+    /// compilation. That is its address class, and whether the range check
+    /// passes the page's 2 TiB slice and those on either side
+    /// ([`stela_compiler::x86_64::RangeCheck::passes_around`]), where an
+    /// access through an address the block formed from its PC needs no
+    /// check: a block moves only to pages that answer alike.
     pub fn context(&self, page: u64) -> Digest {
         let class = translations::address_class(page);
+        let around = self.passes_around(page);
         match HALVES.iter().position(|&half| half == class) {
-            Some(half) => self.contexts[half],
-            None => self.describe(class),
+            Some(half) => self.contexts[half][usize::from(around)],
+            None => self.describe(class, around),
         }
     }
 
-    fn describe(&self, class: u64) -> Digest {
+    /// Whether the range check passes around `page`, a part of its
+    /// [`Self::context`].
+    pub(super) fn passes_around(&self, page: u64) -> bool {
+        self.checks.range.passes_around(page)
+    }
+
+    fn describe(&self, class: u64, around: bool) -> Digest {
         let Self {
             chip,
             admit,
@@ -184,7 +197,7 @@ impl Preparation {
         } = self;
         let described = format!(
             "chip {chip:?} withheld {:#x} target {target:?} fp {fp} checks {checks:?} scalable {scalable:?} \
-             system {system:?} class {class:#x}",
+             system {system:?} class {class:#x} around {around}",
             admit.withheld(),
         );
         Digest::of(described.as_bytes())

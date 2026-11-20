@@ -584,6 +584,13 @@ pub struct RangeCheck {
 
 /// A four-level check's slices of 2 TiB.
 const SLICE_SHIFT: u8 = 41;
+/// The slices of [`RangeCheck::passes_around`]: 4 GiB, so that a program's
+/// code at 4 GiB, as a Mach-O's starts, has passing slices on either side.
+const AROUND_SHIFT: u32 = 32;
+/// How far from its PC a value a block forms from it may lie for an access
+/// through it to need no check ([`RangeCheck::passes_around`]): within a
+/// slice of it, the 2^16 bytes an immediate-offset access reaches included.
+pub(crate) const AROUND_DISTANCE: u64 = (1 << AROUND_SHIFT) - (1 << 16);
 /// The slices of each half.
 const HALF_SLICES: u8 = 64;
 /// The largest positive sign-extended imm8.
@@ -648,6 +655,28 @@ impl RangeCheck {
         }
         let slice = ((address as i64) >> self.shift) as u32;
         slice.wrapping_add(self.bias as u32) <= self.bound as u32
+    }
+
+    /// Whether the check passes every address of the 4 GiB slice holding
+    /// `pc` and of the slices on either side of it: where a value a block
+    /// forms from its PC, within [`AROUND_DISTANCE`] of it, and the 2^16
+    /// bytes an access reaches from that value lie wherever in such a slice
+    /// the block runs. Whole slices, so the pages of one agree: the engine
+    /// binds a stored block to its page's answer (`Preparation::context`),
+    /// and a block moved to another page keeps its accesses through such
+    /// values in range ([`guest_range`]). The EL0 form's limit in the frame
+    /// is [`Self::lower_limit`] (`GuestState::lower_limit`).
+    pub const fn passes_around(self, pc: u64) -> bool {
+        let slice = (pc as i64 >> AROUND_SHIFT) as i128;
+        let low = (slice - 1) << AROUND_SHIFT;
+        let high = ((slice + 2) << AROUND_SHIFT) - 1;
+        // Either form passes one interval of signed addresses
+        // (`Self::passes`): both ends of the neighbourhood, in i64, pass
+        // the addresses between them.
+        low >= i64::MIN as i128
+            && high <= i64::MAX as i128
+            && self.passes(low as u64)
+            && self.passes(high as u64)
     }
 
     /// Whether the fields fit the check's encoding: a shift of an address
