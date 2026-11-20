@@ -344,11 +344,11 @@ fn time_compare_loop() {
 
 /// Code mapped once, executable, for repeated runs.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-struct Mapped(*mut core::ffi::c_void);
+pub(super) struct Mapped(*mut core::ffi::c_void);
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl Mapped {
-    fn new(code: &[u8]) -> Self {
+    pub(super) fn new(code: &[u8]) -> Self {
         unsafe extern "C" {
             fn mmap(
                 address: *mut core::ffi::c_void,
@@ -373,7 +373,7 @@ impl Mapped {
         }
     }
 
-    fn run(&self, state: &mut crate::GuestState) -> u64 {
+    pub(super) fn run(&self, state: &mut crate::GuestState) -> u64 {
         // SAFETY: the mapping holds an entered block and a RET.
         unsafe {
             let entry: unsafe extern "sysv64" fn(*mut crate::GuestState) -> u64 =

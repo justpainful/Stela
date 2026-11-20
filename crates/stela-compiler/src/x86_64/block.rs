@@ -2991,6 +2991,8 @@ fn branch_condition_with(
 mod flag_cost_tests;
 #[cfg(test)]
 mod host_cost;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod kernel_costs;
 #[cfg(test)]
 mod lazy_flags_tests;
 #[cfg(test)]
