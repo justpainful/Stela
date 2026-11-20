@@ -587,9 +587,11 @@ pub struct Layout<'a> {
     records: Vec<(u64, Piece<'a>)>,
     length: u64,
     /// The heap bytes it holds ([`Layout::owned`]), and its records
-    /// encoded for it and not yet moved to an arena ([`Layout::settle`]).
+    /// encoded for it and not yet moved to an arena ([`Layout::settle`]),
+    /// none of them before `unsettled`.
     owned: u64,
     fresh: usize,
+    unsettled: usize,
 }
 
 /// What [`Layout::settle`] did: moved every record, has more to move, or
@@ -679,68 +681,166 @@ impl<'a> Arena<'a> {
 
     /// Move the records `layouts` keep in the arena to its front, in the
     /// order they lie, and give back the bytes between them: what it gave
-    /// back. Records the arena does not hold are left as they are.
+    /// back. Records the arena does not hold are left as they are. A
+    /// [`Compaction`] at once.
     ///
     /// # Safety
     /// `layouts` hold every slice of the arena still in use: nothing else
     /// keeps one, as a write or merge in progress would.
     pub unsafe fn compact(&mut self, layouts: &mut [&mut Layout<'a>]) -> u64 {
-        let start = self.base.as_ptr() as usize;
-        let end = start + self.used;
-        // Each kept record: its offset and length, and where it is.
-        let mut places: Vec<(usize, usize, usize, usize)> = Vec::new();
-        for (index, layout) in layouts.iter_mut().enumerate() {
-            for (record, (_, piece)) in layout.records.iter_mut().enumerate() {
+        let mut compaction = Compaction::new();
+        loop {
+            // SAFETY: the caller's contract, and one call does it all.
+            if let Some(given) = unsafe { compaction.step(self, layouts, &mut || false) } {
+                return given;
+            }
+        }
+    }
+}
+
+/// The records a step of the arena's work (records moved to it, or found
+/// or moved by a [`Compaction`]) takes between looks at its time, and the
+/// bytes a compaction moves at most between them.
+const STEP_RECORDS: usize = 32;
+const STEP_BYTES: usize = 1 << 20;
+
+/// An [`Arena`]'s compaction, a bounded piece at a time
+/// ([`Compaction::step`]), so that no step of the writer waits for a whole
+/// one (run 20261120 compacted 670 MB of arena 12 times): it finds the
+/// records the layouts given keep in the arena, then moves them to its
+/// front in the order they lie, pointing each at its new place as it
+/// moves. Between two steps every layout reads whole, so one left
+/// unfinished leaves them as good as before; the arena takes back its room
+/// at the end.
+#[derive(Debug)]
+pub struct Compaction {
+    /// Finding: the next layout and record to look at.
+    finding: bool,
+    layout: usize,
+    record: usize,
+    /// The records kept in the arena by their offset in it, layout and
+    /// record, and their lengths: those not yet moved.
+    places: BTreeMap<(usize, usize, usize), usize>,
+    /// Where the next run of records moves to, and the run moving (records
+    /// that overlap, as a record two layouts share): how far back it moves
+    /// and where its bytes end.
+    front: usize,
+    shift: usize,
+    end: usize,
+}
+
+impl Default for Compaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Compaction {
+    pub fn new() -> Self {
+        Self {
+            finding: true,
+            layout: 0,
+            record: 0,
+            places: BTreeMap::new(),
+            front: 0,
+            shift: 0,
+            end: 0,
+        }
+    }
+
+    /// Carry the compaction on until `over` says the step's time is up:
+    /// the bytes the arena took back once it is done.
+    ///
+    /// # Safety
+    /// `layouts` hold every slice of the arena still in use, and are the
+    /// same layouts in the same order at every step of one compaction,
+    /// which nothing else changes from its first step to its last: no
+    /// merge or write holds one, and the arena keeps no new record.
+    pub unsafe fn step<'a>(
+        &mut self,
+        arena: &mut Arena<'a>,
+        layouts: &mut [&mut Layout<'a>],
+        over: &mut dyn FnMut() -> bool,
+    ) -> Option<u64> {
+        let base = arena.base.as_ptr();
+        let start = base as usize;
+        let end = start + arena.used;
+        while self.finding {
+            for _ in 0..STEP_RECORDS {
+                let Some(layout) = layouts.get(self.layout) else {
+                    self.finding = false;
+                    break;
+                };
+                let Some((_, piece)) = layout.records.get(self.record) else {
+                    self.layout += 1;
+                    self.record = 0;
+                    continue;
+                };
                 if let Piece::Kept(bytes) = piece {
                     let at = bytes.as_ptr() as usize;
                     if !bytes.is_empty() && (start..end).contains(&at) {
-                        places.push((at - start, bytes.len(), index, record));
-                        // No slice of the arena stays while it moves.
-                        *piece = Piece::Kept(&[]);
+                        self.places
+                            .insert((at - start, self.layout, self.record), bytes.len());
                     }
                 }
+                self.record += 1;
+            }
+            if self.finding && over() {
+                return None;
             }
         }
-        places.sort_unstable();
-        // Runs of overlapping records (one two layouts share) move together,
-        // each run to the end of the one before: (from, to, new start).
-        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
-        let mut moved = Vec::with_capacity(places.len());
-        for &(offset, bytes, _, _) in &places {
-            let front = match runs.last_mut() {
-                Some(run) if offset < run.1 => {
-                    run.1 = run.1.max(offset + bytes);
-                    None
+        loop {
+            let mut moved = 0;
+            for _ in 0..STEP_RECORDS {
+                let Some(((offset, layout, record), bytes)) = self.places.pop_first() else {
+                    let given = arena.used - self.front;
+                    arena.used = self.front;
+                    return Some(given as u64);
+                };
+                let stop = offset + bytes;
+                // The bytes not moved yet of a record that overlaps the run
+                // moving move with it, the same distance back; one past it
+                // starts the next run, at the front.
+                let from = if offset < self.end {
+                    self.end.max(offset)
+                } else {
+                    self.shift = offset - self.front;
+                    offset
+                };
+                if stop > from && self.shift != 0 {
+                    // SAFETY: both ranges lie in the used region, the target
+                    // before the source. The layouts hold every slice of the
+                    // arena (the caller's contract): one of a record not yet
+                    // moved past this run lies past the target, and one of
+                    // this run that the copy overwrites is replaced, as the
+                    // run moves whole within this call, before any reads it.
+                    unsafe {
+                        core::ptr::copy(base.add(from), base.add(from - self.shift), stop - from)
+                    };
                 }
-                Some(run) => Some(run.2 + run.1 - run.0),
-                None => Some(0),
-            };
-            if let Some(front) = front {
-                runs.push((offset, offset + bytes, front));
+                if stop > self.end {
+                    self.end = stop;
+                    self.front = stop - self.shift;
+                }
+                moved += stop.saturating_sub(from);
+                // SAFETY: the record's bytes now lie there in the used region.
+                let kept =
+                    unsafe { core::slice::from_raw_parts(base.add(offset - self.shift), bytes) };
+                layouts[layout].records[record].1 = Piece::Kept(kept);
+                if moved >= STEP_BYTES {
+                    break;
+                }
             }
-            let (from, _, at) = runs[runs.len() - 1];
-            moved.push(at + offset - from);
-        }
-        for &(from, to, at) in runs.iter().filter(|run| run.0 != run.2) {
-            // SAFETY: both ranges lie in the used region, `at <= from`, and
-            // no slice of the arena is alive (the caller's contract).
-            unsafe {
-                core::ptr::copy(
-                    self.base.as_ptr().add(from),
-                    self.base.as_ptr().add(at),
-                    to - from,
-                );
+            // A run moves whole within one step: between steps, every record
+            // not yet moved lies past the bytes written.
+            let open = self
+                .places
+                .first_key_value()
+                .is_some_and(|(&(offset, _, _), _)| offset < self.end);
+            if !open && over() {
+                return None;
             }
         }
-        for (&(_, bytes, index, record), &at) in places.iter().zip(&moved) {
-            // SAFETY: the record's bytes now lie at `at` in the used region.
-            let kept = unsafe { core::slice::from_raw_parts(self.base.as_ptr().add(at), bytes) };
-            layouts[index].records[record].1 = Piece::Kept(kept);
-        }
-        let front = runs.last().map_or(0, |&(from, to, at)| at + to - from);
-        let given = self.used - front;
-        self.used = front;
-        given as u64
     }
 }
 
@@ -818,27 +918,44 @@ impl<'a> Layout<'a> {
             length,
             owned: owned as u64,
             fresh,
+            unsettled: 0,
         }
     }
 
     /// Move records encoded for it to `arena`, about `budget` bytes of
     /// them, while the arena has room. Its bytes stay the same.
     pub fn settle(&mut self, arena: &mut Arena<'a>, budget: usize) -> Settled {
+        self.settle_until(arena, budget, &mut || false)
+    }
+
+    /// [`Layout::settle`], until `over` says the time is up too: it looks
+    /// every [`STEP_RECORDS`] records.
+    pub fn settle_until(
+        &mut self,
+        arena: &mut Arena<'a>,
+        budget: usize,
+        over: &mut dyn FnMut() -> bool,
+    ) -> Settled {
         let mut moved = 0;
-        for (_, piece) in &mut self.records {
-            if self.fresh == 0 || moved >= budget {
+        let mut looked = 0;
+        while self.fresh != 0 && moved < budget {
+            let Some((_, piece)) = self.records.get_mut(self.unsettled) else {
+                break;
+            };
+            if let Piece::New(bytes) = piece {
+                let Some(kept) = arena.keep(bytes) else {
+                    return Settled::Full;
+                };
+                moved += bytes.len();
+                self.owned -= bytes.capacity() as u64;
+                self.fresh -= 1;
+                *piece = Piece::Kept(kept);
+            }
+            self.unsettled += 1;
+            looked += 1;
+            if looked % STEP_RECORDS == 0 && over() {
                 break;
             }
-            let Piece::New(bytes) = piece else {
-                continue;
-            };
-            let Some(kept) = arena.keep(bytes) else {
-                return Settled::Full;
-            };
-            moved += bytes.len();
-            self.owned -= bytes.capacity() as u64;
-            self.fresh -= 1;
-            *piece = Piece::Kept(kept);
         }
         if self.fresh == 0 {
             Settled::Done

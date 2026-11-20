@@ -41,7 +41,8 @@
 //! merge moves its inputs' records rather than copying them, and copies a
 //! record several segments hold only when merging changes it; when the
 //! arena fills, it is compacted to the records the segments keep, so it
-//! holds what this boot added, not what merges left behind.
+//! holds what this boot added, not what merges left behind: a step's time
+//! at a time ([`Compaction`]), while no task runs.
 //!
 //! A pack the next boot reads whole converges on the code boots use: a boot
 //! leaves at most [`LEFT_EIGHTHS`] of the limit (the store sheds new entries
@@ -66,8 +67,8 @@
 //! every segment it holds go, for the rest of the boot: they stay in the
 //! file, and no merge runs, as one would leave them out.
 use super::pack::{
-    Arena, Delta, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS, Merge,
-    Merged, Pack, SEGMENT_BLOB, Segment, Settled, USED_BLOB, UsedKeys,
+    Arena, Compaction, Delta, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS,
+    Merge, Merged, Pack, SEGMENT_BLOB, Segment, Settled, USED_BLOB, UsedKeys,
 };
 use super::{Digest, Record};
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
@@ -400,6 +401,10 @@ pub struct Writer<'a> {
     arena: Arena<'a>,
     arena_full: bool,
     arena_reported: bool,
+    /// The arena's compaction under way, a step's share at a time: no task
+    /// runs and none begins until it is done, so the segments it moves
+    /// records of stay as they are.
+    compaction: Option<Compaction>,
     failed: bool,
     stats: Stats,
 }
@@ -457,6 +462,7 @@ impl<'a> Writer<'a> {
             arena: file.arena,
             arena_full: false,
             arena_reported: false,
+            compaction: None,
             failed: false,
             stats: Stats::default(),
         };
@@ -472,8 +478,9 @@ impl<'a> Writer<'a> {
         self.failed
     }
 
+    /// Whether no work is under way: no task, and no compaction.
     pub fn idle(&self) -> bool {
-        matches!(self.task, Task::Idle)
+        matches!(self.task, Task::Idle) && self.compaction.is_none()
     }
 
     /// The heap bytes of the segments laid out this boot that memory holds
@@ -503,14 +510,19 @@ impl<'a> Writer<'a> {
 
     /// Move a step's share of the records of a segment written to the
     /// arena, until it has no room even compacted: the first time, the
-    /// event that says so. `at` is the clock's last reading, moved on.
-    fn settle(&mut self, clock: &mut dyn FnMut() -> u64, at: &mut u64) -> Option<Event> {
-        let event = self.settle_timed(clock, at);
-        *at = self.lap(Part::Settle, *at, clock);
-        event
-    }
-
-    fn settle_timed(&mut self, clock: &mut dyn FnMut() -> u64, at: &mut u64) -> Option<Event> {
+    /// event that says so. Each piece ends once the clock passes
+    /// `deadline`; `at` is its last reading, moved on.
+    fn settle(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+        deadline: u64,
+        at: &mut u64,
+    ) -> Option<Event> {
+        if self.compaction.is_some() {
+            let compacted = self.compact(clock, deadline);
+            *at = self.lap(Part::Compact, *at, clock);
+            return compacted.and_then(|_| self.compacted(clock, deadline));
+        }
         // Without an arena (none was set aside) the records stay.
         let (used, left) = self.arena();
         if self.arena_full || self.released || used + left == 0 {
@@ -524,28 +536,41 @@ impl<'a> Writer<'a> {
         // own shares bound: the arena is the room the pack read leaves, and
         // a merge of read segments that hold one page each re-encodes that
         // page there while the read bytes stay for lookups.
-        if self.settle_next() != Some(Settled::Full) {
+        let settled = self.settle_next(clock, deadline);
+        *at = self.lap(Part::Settle, *at, clock);
+        if settled != Some(Settled::Full)
+            || matches!(self.task, Task::Merge(..) | Task::Write { .. })
+        {
             return None;
         }
-        *at = self.lap(Part::Settle, *at, clock);
-        let compacted = self.compact();
+        self.compaction = Some(Compaction::new());
+        let compacted = self.compact(clock, deadline);
         *at = self.lap(Part::Compact, *at, clock);
-        if compacted.is_some() && self.settle_next() == Some(Settled::Full) {
-            self.arena_full = true;
-            if !self.arena_reported {
-                self.arena_reported = true;
-                return Some(Event::ArenaFull {
-                    used: self.arena.used(),
-                    resident: self.resident(),
-                });
-            }
+        compacted.and_then(|_| self.compacted(clock, deadline))
+    }
+
+    /// The arena compacted: full when it still has no room for the next
+    /// record, until the next merge commits, the first time with the event
+    /// that says so.
+    fn compacted(&mut self, clock: &mut dyn FnMut() -> u64, deadline: u64) -> Option<Event> {
+        if self.settle_next(clock, deadline) != Some(Settled::Full) {
+            return None;
         }
-        None
+        self.arena_full = true;
+        if self.arena_reported {
+            return None;
+        }
+        self.arena_reported = true;
+        Some(Event::ArenaFull {
+            used: self.arena.used(),
+            resident: self.resident(),
+        })
     }
 
     /// Move a step's share of the first segment written with records
-    /// still in the heap: `None` when there is none.
-    fn settle_next(&mut self) -> Option<Settled> {
+    /// still in the heap, until the clock passes `deadline`: `None` when
+    /// there is none.
+    fn settle_next(&mut self, clock: &mut dyn FnMut() -> u64, deadline: u64) -> Option<Settled> {
         for segment in &mut self.segments {
             let Segment::Laid(layout) = segment else {
                 continue;
@@ -557,29 +582,44 @@ impl<'a> Writer<'a> {
             let Some(layout) = Arc::get_mut(layout) else {
                 continue;
             };
-            return Some(layout.settle(&mut self.arena, SETTLE_BYTES));
+            let mut over = || clock() >= deadline;
+            return Some(layout.settle_until(&mut self.arena, SETTLE_BYTES, &mut over));
         }
         None
     }
 
-    /// Compact the arena to the records the segments keep, unless a merge or
-    /// write in flight holds some of them: the bytes it gave back.
-    fn compact(&mut self) -> Option<u64> {
-        if matches!(self.task, Task::Merge(..) | Task::Write { .. }) {
-            return None;
-        }
+    /// Carry the arena's compaction on to the records the segments keep,
+    /// until the clock passes `deadline`: the bytes it gave back once done.
+    /// One that finds a layout held elsewhere, as no merge or write runs
+    /// meanwhile, is left; every layout reads whole between its steps.
+    fn compact(&mut self, clock: &mut dyn FnMut() -> u64, deadline: u64) -> Option<u64> {
         let mut layouts = Vec::with_capacity(self.segments.len() + self.waiting.len());
-        for segment in &mut self.segments {
-            if let Segment::Laid(layout) = segment {
-                layouts.push(Arc::get_mut(layout)?);
+        let mut alone = true;
+        let laid = self
+            .segments
+            .iter_mut()
+            .filter_map(|segment| match segment {
+                Segment::Laid(layout) => Some(layout),
+                Segment::Packed(_) => None,
+            });
+        for layout in laid.chain(&mut self.waiting) {
+            match Arc::get_mut(layout) {
+                Some(layout) => layouts.push(layout),
+                None => alone = false,
             }
         }
-        for layout in &mut self.waiting {
-            layouts.push(Arc::get_mut(layout)?);
+        if !alone {
+            self.compaction = None;
+            return None;
         }
-        // SAFETY: with no merge or write in flight and every layout held
-        // here alone, the segments hold every slice of the arena in use.
-        let given = unsafe { self.arena.compact(&mut layouts) };
+        let compaction = self.compaction.as_mut()?;
+        let mut over = || clock() >= deadline;
+        // SAFETY: no merge or write ran since the compaction began, and
+        // none runs until it is done (`step`): with every layout held here
+        // alone, the segments and those waiting, unchanged since its first
+        // step, hold every slice of the arena in use.
+        let given = unsafe { compaction.step(&mut self.arena, &mut layouts, &mut over) }?;
+        self.compaction = None;
         self.stats.compactions += 1;
         self.stats.compacted += given;
         Some(given)
@@ -696,6 +736,9 @@ impl<'a> Writer<'a> {
         if let Task::Merge(..) = self.task {
             self.task = Task::Idle;
         }
+        // A compaction under way leaves every layout whole: those let go
+        // take their records with them.
+        self.compaction = None;
         self.segments
             .retain(|segment| matches!(segment, Segment::Packed(_)));
         // Merges read segments from memory: with some let go, none runs.
@@ -1087,7 +1130,14 @@ impl<'a> Writer<'a> {
         let mut at = clock();
         events.extend(self.govern(entries));
         at = self.lap(Part::Govern, at, clock);
-        events.extend(self.settle(clock, &mut at));
+        events.extend(self.settle(clock, deadline, &mut at));
+        if self.compaction.is_some() {
+            // The arena compacts: the task waits, and entries that press
+            // are held for the next segment, as while busy.
+            self.hold(at, entries);
+            self.lap(Part::Hold, at, clock);
+            return Ok(events);
+        }
         if self.idle() {
             events.extend(self.begin(at, entries));
             at = self.lap(Part::Begin, at, clock);
@@ -1242,6 +1292,8 @@ impl<'a> Writer<'a> {
         if self.failed {
             return Err(String::from("the writer failed earlier"));
         }
+        // A compaction under way is left: every layout reads whole.
+        self.compaction = None;
         let mut layouts: Vec<Layout<'a>> = Vec::new();
         match core::mem::replace(&mut self.task, Task::Idle) {
             Task::Write {
