@@ -1015,7 +1015,8 @@ fn system_mode_compiles_locked_atomics_and_fences_for_concurrent_pes() {
     const DMB_SY: u32 = 0xd503_3fbf;
     const B_SELF: u32 = 0x1400_0000;
     const LOCK: u8 = 0xf0;
-    const MFENCE: [u8; 3] = [0x0f, 0xae, 0xf0];
+    /// `lock or dword [rsp],0`: the full barrier.
+    const LOCKED_BARRIER: [u8; 5] = [0xf0, 0x83, 0x0c, 0x24, 0x00];
     let source: Vec<u8> = [CASP_X2_X3_X4, LDAR_X0_X1, DMB_SY, B_SELF]
         .into_iter()
         .flat_map(u32::to_le_bytes)
@@ -1044,7 +1045,10 @@ fn system_mode_compiles_locked_atomics_and_fences_for_concurrent_pes() {
     .native
     .x86_64_code;
     assert!(code.contains(&LOCK), "{code:02x?}");
-    assert!(code.windows(MFENCE.len()).any(|window| window == MFENCE));
+    assert!(
+        code.windows(LOCKED_BARRIER.len())
+            .any(|window| window == LOCKED_BARRIER)
+    );
 }
 
 /// A fault applies exactly the entries covering its offset, SP as 31.
