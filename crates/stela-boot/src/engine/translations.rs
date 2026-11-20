@@ -1528,10 +1528,22 @@ pub fn write() {
     let writable = BOOT.with(|boot| boot.as_ref().is_some_and(|boot| boot.partition.is_some()));
     if let Some(mut held) = held.filter(|_| writable) {
         let stats = held.writer.stats();
+        // The longest each part of a step took at once: what a long step was.
+        let parts: Vec<String> = writer::Part::ALL
+            .iter()
+            .map(|&part| {
+                let ticks = stats.parts[part as usize];
+                format!(
+                    "{}:{}",
+                    part.name(),
+                    ticks * 1_000_000 / super::host::COUNTER_HZ
+                )
+            })
+            .collect();
         output::arguments(format_args!(
             "TRANSLATIONS writer steps={} longest_us={} segments={} records={} bytes={} \
              pressed={} held={} pairs={} merges={} sheds={} resident_peak={}M released={} \
-             arena={}M/{}M compacted={}/{}M\n",
+             arena={}M/{}M compacted={}/{}M parts_us={}\n",
             held.steps,
             held.longest * 1_000_000 / super::host::COUNTER_HZ,
             stats.deltas,
@@ -1548,6 +1560,7 @@ pub fn write() {
             (held.writer.arena().0 + held.writer.arena().1) >> 20,
             stats.compactions,
             stats.compacted >> 20,
+            parts.join(","),
         ));
         let name = pack_name(&translations::translator_id());
         let stopped = held.writer.stop(&mut Parts, &mut |execution| {

@@ -3302,6 +3302,14 @@
     "reason": "native timing of each region program against blocks; run explicitly in a release build on a quiet host"
   },
   {
+    "package": "stela-engine",
+    "test": "step_costs_of_a_long_session",
+    "source": "crates/stela-engine/src/translations/writer/tests/steps.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the pack writer's steps at a long session's size; run explicitly in a release build on a quiet host"
+  },
+  {
     "package": "stela-soc",
     "test": "original_j314s_display_ptd_view_is_the_pmgr_pmp_update_bank",
     "source": "crates/stela-soc/src/machine/display_resources/tests.rs",
