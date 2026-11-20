@@ -4,6 +4,8 @@ use crate::translations::translator_id;
 use alloc::collections::BTreeSet;
 use stela_formats::journal::Target;
 
+mod steps;
+
 /// Counter ticks per second, and the steps a second of a boot gives.
 const HZ: u64 = 1000;
 const STEPS_PER_SECOND: u64 = 10;

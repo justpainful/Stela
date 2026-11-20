@@ -223,9 +223,67 @@ pub enum Event {
     Released { room: u64, bytes: u64, lost: usize },
 }
 
+/// The parts of a step, each timed on the step's clock: the longest one
+/// took at once is in [`Stats::parts`], so a long step names its part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// Keeping the store's entries and the segments within the heap.
+    Govern,
+    /// Moving written records to the arena.
+    Settle,
+    /// Compacting the arena.
+    Compact,
+    /// Starting a write, a merge or a new segment.
+    Begin,
+    /// Taking entries that press while busy.
+    Hold,
+    /// A unit of a new segment's layout, or of a merge's.
+    Delta,
+    Merge,
+    /// A layout laid out: its write planned.
+    Plan,
+    /// A piece of a write queued, or its results taken.
+    Write,
+    /// A write finished: its commit and segment kept.
+    Commit,
+}
+
+impl Part {
+    pub const ALL: [Self; 10] = [
+        Self::Govern,
+        Self::Settle,
+        Self::Compact,
+        Self::Begin,
+        Self::Hold,
+        Self::Delta,
+        Self::Merge,
+        Self::Plan,
+        Self::Write,
+        Self::Commit,
+    ];
+
+    /// Its name in the boot's report.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Govern => "govern",
+            Self::Settle => "settle",
+            Self::Compact => "compact",
+            Self::Begin => "begin",
+            Self::Hold => "hold",
+            Self::Delta => "delta",
+            Self::Merge => "merge",
+            Self::Plan => "plan",
+            Self::Write => "write",
+            Self::Commit => "commit",
+        }
+    }
+}
+
 /// What the writer did while the guest ran.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
+    /// The longest each [`Part`] of a step took at once, in clock ticks.
+    pub parts: [u64; Part::ALL.len()],
     pub deltas: u64,
     pub delta_records: u64,
     pub delta_bytes: u64,
@@ -434,10 +492,25 @@ impl<'a> Writer<'a> {
         (self.arena.used(), self.arena.left())
     }
 
+    /// Count `part` as taking from `from` to the clock's next reading, and
+    /// answer that reading.
+    fn lap(&mut self, part: Part, from: u64, clock: &mut dyn FnMut() -> u64) -> u64 {
+        let now = clock();
+        let longest = &mut self.stats.parts[part as usize];
+        *longest = (*longest).max(now.saturating_sub(from));
+        now
+    }
+
     /// Move a step's share of the records of a segment written to the
     /// arena, until it has no room even compacted: the first time, the
-    /// event that says so.
-    fn settle(&mut self) -> Option<Event> {
+    /// event that says so. `at` is the clock's last reading, moved on.
+    fn settle(&mut self, clock: &mut dyn FnMut() -> u64, at: &mut u64) -> Option<Event> {
+        let event = self.settle_timed(clock, at);
+        *at = self.lap(Part::Settle, *at, clock);
+        event
+    }
+
+    fn settle_timed(&mut self, clock: &mut dyn FnMut() -> u64, at: &mut u64) -> Option<Event> {
         // Without an arena (none was set aside) the records stay.
         let (used, left) = self.arena();
         if self.arena_full || self.released || used + left == 0 {
@@ -451,10 +524,13 @@ impl<'a> Writer<'a> {
         // own shares bound: the arena is the room the pack read leaves, and
         // a merge of read segments that hold one page each re-encodes that
         // page there while the read bytes stay for lookups.
-        if self.settle_next() == Some(Settled::Full)
-            && self.compact().is_some()
-            && self.settle_next() == Some(Settled::Full)
-        {
+        if self.settle_next() != Some(Settled::Full) {
+            return None;
+        }
+        *at = self.lap(Part::Settle, *at, clock);
+        let compacted = self.compact();
+        *at = self.lap(Part::Compact, *at, clock);
+        if compacted.is_some() && self.settle_next() == Some(Settled::Full) {
             self.arena_full = true;
             if !self.arena_reported {
                 self.arena_reported = true;
@@ -1008,100 +1084,53 @@ impl<'a> Writer<'a> {
         if self.failed {
             return Ok(events);
         }
+        let mut at = clock();
         events.extend(self.govern(entries));
-        events.extend(self.settle());
+        at = self.lap(Part::Govern, at, clock);
+        events.extend(self.settle(clock, &mut at));
         if self.idle() {
-            events.extend(self.begin(clock(), entries));
+            events.extend(self.begin(at, entries));
+            at = self.lap(Part::Begin, at, clock);
         } else {
-            self.hold(clock(), entries);
+            self.hold(at, entries);
+            at = self.lap(Part::Hold, at, clock);
         }
         loop {
             self.task = match core::mem::replace(&mut self.task, Task::Idle) {
                 Task::Idle => break,
                 Task::Delta(mut delta, trigger) => {
-                    if !delta.step(STEP_WORK) {
+                    let done = delta.step(STEP_WORK);
+                    at = self.lap(Part::Delta, at, clock);
+                    if !done {
                         Task::Delta(delta, trigger)
                     } else {
-                        match delta.finish() {
-                            Some(layout) => {
-                                let layout = Arc::new(layout);
-                                match self.write_segment(layout.clone(), trigger) {
-                                    Some(task) => task,
-                                    None => {
-                                        events.push(Event::Waiting {
-                                            records: layout.records(),
-                                        });
-                                        self.waiting.push(layout);
-                                        Task::Idle
-                                    }
-                                }
-                            }
-                            None => Task::Idle,
-                        }
+                        let task = self.laid_delta(delta, trigger, &mut events);
+                        at = self.lap(Part::Plan, at, clock);
+                        task
                     }
                 }
                 Task::Merge(mut merge, merging) => {
-                    let merge_bound = merge.bound();
-                    if !merge.step(STEP_WORK) {
+                    let done = merge.step(STEP_WORK);
+                    at = self.lap(Part::Merge, at, clock);
+                    if !done {
                         Task::Merge(merge, merging)
                     } else {
-                        let Merged {
-                            layout,
-                            evicted,
-                            expired,
-                            invalid,
-                        } = merge.finish();
-                        events.push(Event::Merged {
-                            full: matches!(merging, Merging::Full),
-                            records: layout.records(),
-                            bytes: layout.bytes(),
-                            bound: merge_bound,
-                            evicted,
-                            expired,
-                            invalid,
-                        });
-                        let layout = Arc::new(layout);
-                        // A full merge replaces every segment and list; a
-                        // pair, the two it merged.
-                        let (replace, remove) = match merging {
-                            Merging::Full => (vec![SEGMENT_BLOB, USED_BLOB], Vec::new()),
-                            Merging::Pair(offsets) => (Vec::new(), offsets.to_vec()),
-                        };
-                        let change = Change {
-                            replace,
-                            remove,
-                            blobs: vec![Blob {
-                                kind: SEGMENT_BLOB,
-                                source: layout.clone(),
-                            }],
-                        };
-                        match self.plan(change) {
-                            Some(execution) => Task::Write {
-                                execution,
-                                done: Done::Merge(layout, merging),
-                            },
-                            // A pair's records grew past the room for both:
-                            // memory holds them merged, the file as they
-                            // were, and no pair merges again this boot.
-                            None if matches!(merging, Merging::Pair(_)) => {
-                                self.segments.push(Segment::Laid(layout));
-                                Task::Idle
-                            }
-                            None => {
-                                self.failed = true;
-                                return Err(String::from(
-                                    "a merged segment found no room beside the file's content",
-                                ));
-                            }
-                        }
+                        let task = self.merged(merge, merging, &mut events)?;
+                        at = self.lap(Part::Plan, at, clock);
+                        task
                     }
                 }
                 Task::Write {
                     mut execution,
                     done,
                 } => {
-                    match advance(&mut execution) {
-                        Some(Ok(true)) => events.push(self.finish(execution, done)),
+                    let advanced = advance(&mut execution);
+                    at = self.lap(Part::Write, at, clock);
+                    match advanced {
+                        Some(Ok(true)) => {
+                            events.push(self.finish(execution, done));
+                            self.lap(Part::Commit, at, clock);
+                        }
                         Some(Err(error)) => {
                             self.failed = true;
                             return Err(error);
@@ -1111,11 +1140,93 @@ impl<'a> Writer<'a> {
                     break;
                 }
             };
-            if clock() >= deadline {
+            if at >= deadline {
                 break;
             }
         }
         Ok(events)
+    }
+
+    /// A new segment laid out: its write, or it waits for room.
+    fn laid_delta(
+        &mut self,
+        delta: Box<Delta>,
+        trigger: Trigger,
+        events: &mut Vec<Event>,
+    ) -> Task<'a> {
+        let Some(layout) = delta.finish() else {
+            return Task::Idle;
+        };
+        let layout = Arc::new(layout);
+        match self.write_segment(layout.clone(), trigger) {
+            Some(task) => task,
+            None => {
+                events.push(Event::Waiting {
+                    records: layout.records(),
+                });
+                self.waiting.push(layout);
+                Task::Idle
+            }
+        }
+    }
+
+    /// A merge laid out: its write.
+    fn merged(
+        &mut self,
+        merge: Box<Merge<'a>>,
+        merging: Merging,
+        events: &mut Vec<Event>,
+    ) -> Result<Task<'a>, String> {
+        let bound = merge.bound();
+        let Merged {
+            layout,
+            evicted,
+            expired,
+            invalid,
+        } = merge.finish();
+        events.push(Event::Merged {
+            full: matches!(merging, Merging::Full),
+            records: layout.records(),
+            bytes: layout.bytes(),
+            bound,
+            evicted,
+            expired,
+            invalid,
+        });
+        let layout = Arc::new(layout);
+        // A full merge replaces every segment and list; a pair, the two it
+        // merged.
+        let (replace, remove) = match merging {
+            Merging::Full => (vec![SEGMENT_BLOB, USED_BLOB], Vec::new()),
+            Merging::Pair(offsets) => (Vec::new(), offsets.to_vec()),
+        };
+        let change = Change {
+            replace,
+            remove,
+            blobs: vec![Blob {
+                kind: SEGMENT_BLOB,
+                source: layout.clone(),
+            }],
+        };
+        match self.plan(change) {
+            Some(execution) => Ok(Task::Write {
+                execution,
+                done: Done::Merge(layout, merging),
+            }),
+            // A pair's records grew past the room for both: memory holds
+            // them merged, the file as they were, and no pair merges again
+            // this boot.
+            None if matches!(merging, Merging::Pair(_)) => {
+                self.segments.push(Segment::Laid(layout));
+                Ok(Task::Idle)
+            }
+            None => {
+                self.failed = true;
+                Err(String::from(
+                    "a merged segment found no room beside the file's content",
+                ))
+            }
+        }
     }
 
     /// At a stop: finish a new segment's write in flight (`run` carries a
