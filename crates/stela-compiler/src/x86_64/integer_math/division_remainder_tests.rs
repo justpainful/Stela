@@ -249,20 +249,23 @@ fn pinned_divide_remainder_commits_before_a_polled_exit() {
     let at = exit.offset - chain::POLLED_LINK_BYTES;
     // The link at offset 0 as the code's own would be at its offset: the
     // pad and point alike once the code lands at an aligned address.
-    let (body, link) = chain::link(at as u64, chain::POLLED_LINK_BYTES, 3, 1, 0).unwrap();
+    let gate = chain::LinkGate::for_target(crate::TargetCpu::detect());
+    let link = chain::link(at as u64, chain::POLLED_LINK_BYTES, 3, 1, 0, gate)
+        .unwrap()
+        .body();
     let mut code = block.native.x86_64_code;
     let point = chain::slot_patch(at as u64) as usize;
-    code[body as usize..body as usize + link.len()].copy_from_slice(&link);
-    code[point..point + chain::PATCH_BYTES].copy_from_slice(&chain::NOP5);
+    code[point..point + link.len()].copy_from_slice(&link);
 
     let mut control = chain::ChainControl {
-        budget: 1,
         interrupt_epoch: 2,
         observed_interrupt_epoch: 1,
+        quiet: chain::Quiet(0),
         ..Default::default()
     };
     let mut state = GuestState {
         nzcv: 0xb000_0000,
+        account: chain::Account::new(1).0,
         ..Default::default()
     };
     state.anchors[Anchor::Control] = &raw mut control as u64;
@@ -272,7 +275,11 @@ fn pinned_divide_remainder_commits_before_a_polled_exit() {
     expected.x[8] = 5;
     assert_eq!(run(&pinned::entered(&code), &mut state), PC.0);
     assert_eq!(state, expected);
-    assert_eq!((control.budget, control.retired, control.block), (1, 0, 0));
+    let account = chain::Account(state.account);
+    assert_eq!(
+        (account.budget(), account.retired(), control.block),
+        (1, 0, 0)
+    );
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))]

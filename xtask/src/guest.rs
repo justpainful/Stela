@@ -241,7 +241,11 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
 pub(crate) fn spelled(relative: &Path) -> Result<String> {
     Ok(relative
         .components()
-        .map(|part| part.as_os_str().to_str().context("a file name is not UTF-8"))
+        .map(|part| {
+            part.as_os_str()
+                .to_str()
+                .context("a file name is not UTF-8")
+        })
         .collect::<Result<Vec<_>>>()?
         .join("/"))
 }

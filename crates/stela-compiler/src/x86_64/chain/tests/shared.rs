@@ -97,7 +97,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
         }
         bytes[offset..offset + piece.len()].copy_from_slice(piece);
     };
-    let cell_tail = cell_tail(at(3), cell, ExitKind::Call, 3, probes).unwrap();
+    let cell_tail = rax_cell_tail(at(3), cell, ExitKind::Call, 3, probes).unwrap();
     put(0, &[0x48, 0x89, 0xf0]); // mov rax,rsi
     put(3, &cell_tail);
     put(64, &[0x48, 0x89, 0xf0]);
@@ -138,7 +138,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                 let (mut hits, mut exits) = (0u64, 0u64);
                 let mut round = 0u64;
                 while !stop.load(Ordering::Acquire) {
-                    control.budget = 1;
+                    frame.account = Account::new(1).0;
                     control.block = 0;
                     let target = if round.is_multiple_of(2) {
                         TARGET
@@ -150,7 +150,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                     // the block ABI and touches the frame's control and the
                     // tables, which outlive the runners.
                     let result = unsafe {
-                        crate::x86_64::native::enter(
+                        crate::x86_64::native::enter_counted(
                             code.0.add(entry) as *const u8,
                             &mut *frame,
                             target,

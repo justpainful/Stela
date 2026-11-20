@@ -62,8 +62,9 @@ pub struct Target {
     /// Its PE's line-change counter (`u64`), which the PE compares with
     /// the count it last saw before it halts and at every look.
     pub lines: u64,
-    /// Its PE's native chaining interruption epoch (`u64`), which chained
-    /// native code checks to leave its run.
+    /// Its PE's chaining control ([`stela_compiler::x86_64::chain::
+    /// ChainControl`]), whose interruption chained native code checks to
+    /// leave its run.
     pub interrupt: u64,
     /// Its PE's halted flag (`u8`; nonzero while it sleeps in its host
     /// halt, set before its last look at `lines`).
@@ -120,7 +121,10 @@ pub enum Sent {
 /// 4. Atomically OR 1 into `status` (SeqCst), keeping the old value: if it
 ///    was already set the request is done (that FIQ is pending already).
 /// 5. Add 1 to `lines` (SeqCst).
-/// 6. Add 1 to `interrupt` (Release) unless it is `u64::MAX`, which stays.
+/// 6. Post an interruption to the control at `interrupt`
+///    ([`stela_compiler::x86_64::chain::interrupt`]): add 1 to its epoch
+///    (SeqCst) unless it is `u64::MAX`, which stays, then zero its quiet
+///    word (SeqCst).
 /// 7. Load `sleeping` (SeqCst): nonzero, the target must be woken
 ///    ([`Sent::Wake`]); else done.
 ///
@@ -233,12 +237,11 @@ impl Table {
         }
         // SAFETY: a table's addresses are the board's atomics, for its life
         // (`Devices::fast_ipi_table`), each naturally aligned.
-        let (status, armed, lines, interrupt, sleeping) = unsafe {
+        let (status, armed, lines, sleeping) = unsafe {
             (
                 AtomicU64::from_ptr(target.status as *mut u64),
                 AtomicU8::from_ptr(target.armed as *mut u8),
                 AtomicU64::from_ptr(target.lines as *mut u64),
-                AtomicU64::from_ptr(target.interrupt as *mut u64),
                 AtomicU8::from_ptr(target.sleeping as *mut u8),
             )
         };
@@ -249,9 +252,13 @@ impl Table {
             return Sent::Done;
         }
         lines.fetch_add(1, Ordering::SeqCst);
-        let _ = interrupt.try_update(Ordering::Release, Ordering::Relaxed, |epoch| {
-            epoch.checked_add(1)
-        });
+        // SAFETY: as above; the control's epoch and quiet words are
+        // accessed atomically by all but their owner's acknowledgment.
+        unsafe {
+            stela_compiler::x86_64::chain::interrupt(
+                target.interrupt as *mut stela_compiler::x86_64::chain::ChainControl,
+            )
+        };
         if sleeping.load(Ordering::SeqCst) != 0 {
             Sent::Wake(target.pe as usize)
         } else {
@@ -291,12 +298,16 @@ mod tests {
     /// to wake, and exits that change nothing.
     #[test]
     fn the_reference_send_follows_its_contract() {
-        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use core::{
+            cell::UnsafeCell,
+            sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        use stela_compiler::x86_64::chain::{ChainControl, QUIET};
         struct Cpu {
             status: AtomicU64,
             armed: AtomicBool,
             lines: AtomicU64,
-            interrupt: AtomicU64,
+            control: UnsafeCell<ChainControl>,
             sleeping: AtomicBool,
         }
         let cpus: std::vec::Vec<Cpu> = (0..4)
@@ -304,10 +315,16 @@ mod tests {
                 status: AtomicU64::new(0),
                 armed: AtomicBool::new(false),
                 lines: AtomicU64::new(0),
-                interrupt: AtomicU64::new(0),
+                control: UnsafeCell::new(ChainControl::default()),
                 sleeping: AtomicBool::new(false),
             })
             .collect();
+        // The epoch, and whether the quiet word says one is pending.
+        let interrupt = |n: usize| {
+            // SAFETY: the send has returned; nothing else writes the control.
+            let control = unsafe { *cpus[n].control.get() };
+            (control.interrupt_epoch, control.quiet.0 != QUIET)
+        };
         // Two clusters of two; CPU 3 has no PE.
         let words: std::vec::Vec<Word> = (0..4)
             .map(|n| Word {
@@ -320,7 +337,7 @@ mod tests {
         let table = Table::new(&words, 3, |pe| {
             (
                 cpus[pe].lines.as_ptr() as u64,
-                cpus[pe].interrupt.as_ptr() as u64,
+                cpus[pe].control.get() as u64,
                 cpus[pe].sleeping.as_ptr() as u64,
             )
         });
@@ -330,22 +347,22 @@ mod tests {
             (
                 cpus[n].status.load(Ordering::SeqCst),
                 cpus[n].lines.load(Ordering::SeqCst),
-                cpus[n].interrupt.load(Ordering::SeqCst),
+                interrupt(n),
             )
         };
         // Running target in the sender's cluster.
         assert_eq!(table.send(0, Register::RequestLocal, 1), Sent::Done);
-        assert_eq!(counts(1), (1, 1, 1));
+        assert_eq!(counts(1), (1, 1, (1, true)));
         // Already pending: done, nothing moves.
         assert_eq!(table.send(0, Register::RequestLocal, 1), Sent::Done);
-        assert_eq!(counts(1), (1, 1, 1));
+        assert_eq!(counts(1), (1, 1, (1, true)));
         // A halted target in another cluster is to be woken.
         cpus[2].sleeping.store(true, Ordering::SeqCst);
         assert_eq!(
             table.send(0, Register::RequestGlobal, 1 << 16),
             Sent::Wake(2)
         );
-        assert_eq!(counts(2), (1, 1, 1));
+        assert_eq!(counts(2), (1, 1, (1, true)));
         // Exits that change nothing: self, armed, absent, other types,
         // stray bits, a cluster field in a local request, other registers.
         cpus[0].armed.store(true, Ordering::SeqCst);
@@ -367,10 +384,16 @@ mod tests {
             );
             assert_eq!((0..4).map(counts).collect::<std::vec::Vec<_>>(), before);
         }
-        // A saturated interruption epoch stays.
+        // A saturated interruption epoch stays, pending.
         cpus[1].status.store(0, Ordering::SeqCst);
-        cpus[1].interrupt.store(u64::MAX, Ordering::SeqCst);
+        // SAFETY: no send runs.
+        unsafe {
+            *cpus[1].control.get() = ChainControl {
+                interrupt_epoch: u64::MAX,
+                ..ChainControl::default()
+            };
+        }
         assert_eq!(table.send(0, Register::RequestLocal, 1), Sent::Done);
-        assert_eq!(counts(1), (1, 2, u64::MAX));
+        assert_eq!(counts(1), (1, 2, (u64::MAX, true)));
     }
 }

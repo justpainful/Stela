@@ -814,13 +814,11 @@ fn engine_counters(machine: &mut Machine<FakeHost, NoDevices>, retired: u64, now
     })
 }
 
-/// Write the instructions a native run retired into the machine's chain
-/// control, as the blocks it left would have.
+/// Write the instructions a native run retired into the account the entry
+/// gives native code, as the blocks it left would have.
 fn run_retired(machine: &mut Machine<FakeHost, NoDevices>, retired: u64) {
-    let control = machine.chain.address() as *mut chain::ChainControl;
-    // SAFETY: the machine's own control, which no native code runs over
-    // meanwhile.
-    unsafe { core::ptr::addr_of_mut!((*control).retired).write(retired) };
+    let account = chain::Account(machine.cpu.state.account);
+    machine.cpu.state.account = account.with_retired(retired).0;
 }
 
 /// PMC0 and PMC1 as their thunks read them within a native run, after it

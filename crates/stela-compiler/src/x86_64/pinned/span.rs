@@ -219,7 +219,8 @@ fn effects(operation: &Operation) -> Option<Effects> {
             takes_r8: false,
             memory: true,
         },
-        Operation::BranchCondition { condition, .. } if condition < 14 => alu(&[], Register::Zero),
+        // A region's branches that do not fall through.
+        Operation::BranchCondition { .. } | Operation::Branch { .. } => alu(&[], Register::Zero),
         Operation::BranchZero { source, .. } | Operation::BranchBit { source, .. } => {
             alu(&[source], Register::Zero)
         }

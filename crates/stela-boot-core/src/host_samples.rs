@@ -12,7 +12,8 @@
 //! stack: the PAC service ([`PAC_CALL`], the cipher of memo misses), whose
 //! calls end with known bytes, or another ([`CALL`]); [`NATIVE_OTHER`] when
 //! no return address is found. A sample outside native code is charged to
-//! the step loop's phase that holds it ([`charged`]).
+//! the step loop's phase that holds it ([`charged`]), but one taken while a
+//! waiting PE polls for a wake or halts is [`IDLE`] at once.
 
 use alloc::{boxed::Box, format, string::String};
 use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
@@ -45,7 +46,10 @@ pub const EXIT_OTHER: usize = GLUE + 4;
 pub const EXITS: usize = GLUE + 5;
 /// Between slices: host service.
 pub const HOST: usize = EXITS + EXIT_SLOTS;
-pub const CLASSES: usize = HOST + 1;
+/// A waiting PE's poll for a wake and its halt (`Host::profile_idle`):
+/// time with no guest work, apart from the scheduler's own.
+pub const IDLE: usize = HOST + 1;
+pub const CLASSES: usize = IDLE + 1;
 
 /// Events (cycles, instructions) by class.
 pub type Counts = [[u64; SAMPLED]; CLASSES];
@@ -65,6 +69,7 @@ pub fn class_name(class: usize, exit_names: &[&str; EXIT_SLOTS]) -> String {
         FETCH => String::from("fetch"),
         EXIT_OTHER => String::from("x:other"),
         HOST => String::from("host"),
+        IDLE => String::from("idle"),
         exit => format!("x:{}", exit_names[exit - EXITS]),
     }
 }

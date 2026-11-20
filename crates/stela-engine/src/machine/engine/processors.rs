@@ -452,7 +452,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     None => until,
                 };
                 let slept = self.host.counter();
-                if !self.poll_for_wake(slept, until) {
+                // The poll is idle time; the halt after it counts nothing.
+                self.profile_idle(true);
+                let polled = self.poll_for_wake(slept, until);
+                self.profile_idle(false);
+                if !polled {
                     let (blocked, halted) = self.outside_run(|machine| {
                         let halt = machine.host.counter();
                         machine.host.arm_timer(Some(until));
@@ -718,6 +722,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.peers[self.current] = Peer::Parked(Box::new(outgoing));
         self.current = next;
         self.statistics.switches += 1;
+        // The incoming PE's event streams are its own.
+        self.stream_sample = None;
         // The switch changes no device: what derives from the PE goes, the
         // devices' lines and deadline stay, and the incoming PE's mirrored
         // reads reopen as it left them.

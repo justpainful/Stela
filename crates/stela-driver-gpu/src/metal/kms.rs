@@ -54,12 +54,6 @@
 //! finished answers `EBUSY` and stays queued for the next flush; a newer
 //! frame meanwhile replaces the queued one in the same hidden buffer.
 //!
-//! A frame the GPU composes ([`Display::begin_gpu_frame`]) is written into
-//! the hidden buffer by the GPU, which imports it as a dma-buf
-//! ([`Display::export_buffer`]); the buffer takes no flip until the GPU is
-//! done ([`Display::finish_gpu_frame`]), which then queues it as a
-//! present does.
-//!
 //! Display sleep: [`Display::set_power`] turns every shown output's controller
 //! off, as Linux's fbdev helper does for a blanked console, and back on in its
 //! mode on the buffer on screen; like a flip, the request waits for a
@@ -103,6 +97,8 @@ const SET_OBJECT_PROPERTY: u32 = request::<SetProperty>(0xba);
 const GET_BLOB: u32 = request::<Blob>(0xac);
 const VERSION: u32 = request::<Version>(0x00);
 const PRIME_HANDLE_TO_FD: u32 = request::<PrimeHandle>(0x2d);
+/// `DRM_CLOEXEC | DRM_RDWR`: a dma-buf the GPU may write.
+const PRIME_FLAGS: u32 = 0o2_000_000 | 2;
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -326,6 +322,16 @@ struct Blob {
     data: u64,
 }
 
+/// `struct drm_mode_obj_set_property`.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct SetProperty {
+    value: u64,
+    id: u32,
+    object: u32,
+    kind: u32,
+}
+
 /// `struct drm_prime_handle`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -335,18 +341,14 @@ struct PrimeHandle {
     fd: i32,
 }
 
-/// `DRM_CLOEXEC | DRM_RDWR`: the dma-buf a buffer is exported as is
-/// written by another driver's device (the Metal device, composing).
-const PRIME_FLAGS: u32 = 0o2_000_000 | 0o2;
-
-/// `struct drm_mode_obj_set_property`.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-struct SetProperty {
-    value: u64,
-    id: u32,
-    object: u32,
-    kind: u32,
+/// A scanout buffer shared as a dma-buf, which the GPU composes frames
+/// into: named by its framebuffer, with its bytes between rows and size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedBuffer {
+    pub framebuffer: u32,
+    pub fd: i32,
+    pub pitch: usize,
+    pub bytes: usize,
 }
 
 /// What stops the display.
@@ -368,9 +370,6 @@ pub enum Error {
     Allocation,
     /// The display does not run the refresh rate asked for.
     NoRate,
-    /// The GPU is still writing the hidden buffer
-    /// ([`Display::begin_gpu_frame`]).
-    GpuWriting,
 }
 
 /// A DRM primary node of the bound GPU.
@@ -518,11 +517,6 @@ pub struct Display<D> {
     stale: [Range<usize>; 3],
     /// The hidden buffer holds a frame whose flip is not requested yet.
     queued: bool,
-    /// The GPU is writing a frame into the hidden buffer
-    /// ([`Self::begin_gpu_frame`]): no flip shows that buffer and no CPU
-    /// frame is made in it until [`Self::finish_gpu_frame`] or
-    /// [`Self::abandon_gpu_frame`].
-    gpu_writing: bool,
     /// The row a producer fills before it is copied to video memory.
     row: Vec<u8>,
     /// The outputs showing the picture; the first paces the flips and
@@ -626,17 +620,6 @@ struct Failed<D> {
     /// The connector of the output that gives the picture, when the
     /// driver refused its mode set: another output may give it.
     first: Option<u32>,
-}
-
-/// The hidden buffer as [`Display::begin_gpu_frame`] hands it to the GPU:
-/// its dumb handle (which [`Display::export_buffer`] exports), the bytes
-/// between its rows and its size, and the rows the GPU's frame must write.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GpuTarget {
-    pub handle: u32,
-    pub pitch: usize,
-    pub bytes: usize,
-    pub rows: Range<usize>,
 }
 
 /// A complete frame in the hidden buffer. Dropping it leaves the display
@@ -1871,7 +1854,6 @@ impl<D: Drm> Display<D> {
             // Each buffer holds black, and the front the console's text.
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
             queued: false,
-            gpu_writing: false,
             row: Vec::new(),
             heads,
             crtcs,
@@ -2414,9 +2396,6 @@ impl<D: Drm> Display<D> {
     /// Shows `rows`, blue-low pixels of [`Self::size`] top to bottom, at the
     /// next vertical blank.
     pub fn present(&mut self, rows: &[u8]) -> Result<(), Error> {
-        if self.gpu_writing {
-            return Err(Error::GpuWriting);
-        }
         let row = self.width as usize * BYTES_PER_PIXEL as usize;
         let expected = row * self.height as usize;
         if rows.len() != expected {
@@ -2446,11 +2425,6 @@ impl<D: Drm> Display<D> {
         damage: Option<Range<usize>>,
         mut fill: impl FnMut(usize, &mut [u8]) -> Result<(), Refusal>,
     ) -> Result<PreparedFrame<'_, D>, Refusal> {
-        if self.gpu_writing {
-            return Err(refuse!(
-                "the GPU is still writing the hidden scanout buffer"
-            ));
-        }
         let height = self.height as usize;
         let damage = damage.map_or(0..height, |rows| {
             rows.start.min(height)..rows.end.min(height)
@@ -2480,6 +2454,62 @@ impl<D: Drm> Display<D> {
         Ok(PreparedFrame(self))
     }
 
+    /// The three scanout buffers as dma-bufs, for the GPU to compose into,
+    /// where a request completes now; `None` elsewhere. The caller owns the
+    /// descriptors.
+    pub fn share_buffers(&mut self) -> Option<Result<[SharedBuffer; 3], Error>> {
+        if !self.drm.immediate() {
+            return None;
+        }
+        let mut shared = [SharedBuffer {
+            framebuffer: 0,
+            fd: -1,
+            pitch: 0,
+            bytes: 0,
+        }; 3];
+        for (out, buffer) in shared.iter_mut().zip(&self.buffers) {
+            let mut prime = PrimeHandle {
+                handle: buffer.handle,
+                flags: PRIME_FLAGS,
+                fd: -1,
+            };
+            if let Err(error) = call(&mut self.drm, PRIME_HANDLE_TO_FD, &mut prime) {
+                return Some(Err(error));
+            }
+            *out = SharedBuffer {
+                framebuffer: buffer.framebuffer,
+                fd: prime.fd,
+                pitch: buffer.pitch,
+                bytes: buffer.bytes,
+            };
+        }
+        Some(Ok(shared))
+    }
+
+    /// The buffer the next frame fills, by its framebuffer, and the rows of
+    /// it the GPU must compose: `damage` (`None`: every row) and the rows it
+    /// lacks of the newest frame. Until [`Self::present_drawn`] the CPU
+    /// fills no rows, and a frame the buffer held waits for no flip: the
+    /// GPU draws the newer frame over it, the rows it showed included.
+    pub fn draw_rows(&mut self, damage: Option<Range<usize>>) -> (u32, Range<usize>) {
+        self.queued = false;
+        let height = self.height as usize;
+        let damage = damage.map_or(0..height, |rows| {
+            rows.start.min(height)..rows.end.min(height)
+        });
+        for stale in &mut self.stale {
+            *stale = union(stale.clone(), damage.clone());
+        }
+        (self.buffers[2].framebuffer, self.stale[2].clone())
+    }
+
+    /// The GPU composed the rows [`Self::draw_rows`] named: queue the
+    /// hidden buffer's flip for the next vertical blank.
+    pub fn present_drawn(&mut self) -> Result<(), Error> {
+        self.stale[2] = 0..0;
+        self.queue()
+    }
+
     /// Whether a frame waits in the hidden buffer for its flip to be
     /// requested, or an output that follows the first waits for its flip
     /// to the newest buffer ([`Self::flush`]).
@@ -2488,98 +2518,6 @@ impl<D: Drm> Display<D> {
             || self.power.is_some()
             || self.retime.is_some()
             || self.heads.iter().any(|head| head.behind)
-    }
-
-    /// Hand the hidden buffer to the GPU for a frame it composes: the rows
-    /// `damage` names (`None`: every row) and those the buffer lacks since
-    /// it last held a frame, which [`GpuTarget::rows`] gives. A frame
-    /// queued there and not yet flipped is superseded: the GPU's frame is
-    /// the newer, and the buffer already holds the older's other rows.
-    /// Until [`Self::finish_gpu_frame`] or [`Self::abandon_gpu_frame`] the
-    /// buffer takes no flip and no CPU frame, so nothing the GPU has not
-    /// finished shows. The front and the buffer that shows until the last
-    /// flip lands are untouched.
-    pub fn begin_gpu_frame(&mut self, damage: Option<Range<usize>>) -> Result<GpuTarget, Error> {
-        if self.gpu_writing {
-            return Err(Error::GpuWriting);
-        }
-        let height = self.height as usize;
-        let damage = damage.map_or(0..height, |rows| {
-            rows.start.min(height)..rows.end.min(height)
-        });
-        for stale in &mut self.stale {
-            *stale = union(stale.clone(), damage.clone());
-        }
-        self.queued = false;
-        self.gpu_writing = true;
-        let hidden = &self.buffers[2];
-        Ok(GpuTarget {
-            handle: hidden.handle,
-            pitch: hidden.pitch,
-            bytes: hidden.bytes,
-            rows: self.stale[2].clone(),
-        })
-    }
-
-    /// What [`Self::begin_gpu_frame`] would hand the GPU for `damage`,
-    /// changing nothing: what a compose is prepared for before it is known
-    /// to run.
-    pub fn gpu_target(&self, damage: Option<Range<usize>>) -> GpuTarget {
-        let height = self.height as usize;
-        let damage = damage.map_or(0..height, |rows| {
-            rows.start.min(height)..rows.end.min(height)
-        });
-        let hidden = &self.buffers[2];
-        GpuTarget {
-            handle: hidden.handle,
-            pitch: hidden.pitch,
-            bytes: hidden.bytes,
-            rows: union(self.stale[2].clone(), damage),
-        }
-    }
-
-    /// The GPU finished the frame [`Self::begin_gpu_frame`] gave it: the
-    /// hidden buffer holds it whole, and its flip is queued (requested at
-    /// once where a request completes now, as a present's is).
-    pub fn finish_gpu_frame(&mut self) -> Result<(), Error> {
-        if !self.gpu_writing {
-            return Ok(());
-        }
-        self.gpu_writing = false;
-        self.stale[2] = 0..0;
-        self.queue()
-    }
-
-    /// The GPU's frame will not be shown (its work failed or was given up
-    /// on): the hidden buffer holds no known frame, so the next frame
-    /// fills it whole, and nothing is flipped.
-    pub fn abandon_gpu_frame(&mut self) {
-        if core::mem::replace(&mut self.gpu_writing, false) {
-            self.stale[2] = 0..self.height as usize;
-        }
-    }
-
-    /// Whether the GPU is writing the hidden buffer.
-    pub fn gpu_writing(&self) -> bool {
-        self.gpu_writing
-    }
-
-    /// The dma-buf of the buffer whose dumb handle is `handle` (one of
-    /// [`GpuTarget::handle`]'s), for the GPU that composes to import and
-    /// write; the caller owns the descriptor. The request waits for the
-    /// processor that serves requests where it is not this one, so it is
-    /// made where [`Drm::immediate`] holds.
-    pub fn export_buffer(&mut self, handle: u32) -> Result<i32, Error> {
-        if !self.buffers.iter().any(|buffer| buffer.handle == handle) {
-            return Err(Error::InvalidBuffer);
-        }
-        let mut prime = PrimeHandle {
-            handle,
-            flags: PRIME_FLAGS,
-            fd: -1,
-        };
-        call(&mut self.drm, PRIME_HANDLE_TO_FD, &mut prime)?;
-        Ok(prime.fd)
     }
 
     /// The refresh rates in millihertz the display runs its size at, fastest
@@ -2651,7 +2589,7 @@ impl<D: Drm> Display<D> {
         // output that is on paces until a look sets the first again; with
         // none on the frame stays queued.
         let pacer = self.heads.iter().position(|head| !head.off);
-        if let (true, false, Some(pacer)) = (self.queued, self.gpu_writing, pacer) {
+        if let (true, Some(pacer)) = (self.queued, pacer) {
             match self.flip(pacer, self.buffers[2].framebuffer) {
                 0 => {
                     self.queued = false;

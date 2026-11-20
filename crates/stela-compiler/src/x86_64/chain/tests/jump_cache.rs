@@ -4,7 +4,7 @@
 //! replacement, a context switch, a native transition's new contexts) takes
 //! the entry with it. Random runs against the plain tail.
 use super::super::*;
-use crate::GuestState;
+use super::Controlled;
 use alloc::{boxed::Box, vec::Vec};
 use core::ffi::c_void;
 unsafe extern "C" {
@@ -94,22 +94,22 @@ fn region() -> Pages {
     region
 }
 
-/// Run the stub at `stub` with the target in RSI: RAX and RDX it returns.
-fn run(region: &Pages, stub: usize, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    let mut frame = Box::new(GuestState::default());
-    frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+/// Run the stub at `stub` with the target in RSI, the control and its
+/// account: RAX and RDX it returns.
+fn run(region: &Pages, stub: usize, control: &mut Controlled, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stubs, tails and probes with the block
     // ABI; they touch the frame's control, the tables, the stamps and the
     // blocks, which outlive the call.
-    let result =
-        unsafe { crate::x86_64::native::enter(region.0.add(stub), &mut *frame, target, 0) };
+    let result = control.run(|frame| unsafe {
+        crate::x86_64::native::enter_counted(region.0.add(stub), frame, target, 0)
+    });
     (result as u64, (result >> 64) as u64)
 }
 
 struct World {
     table: LookupTable,
     itlb: LookupTable,
-    control: Box<ChainControl>,
+    control: Box<Controlled>,
     blocks: Pages,
     region: Pages,
 }
@@ -119,15 +119,17 @@ impl World {
         let mut table = LookupTable::new();
         let itlb = LookupTable::itlb();
         let stamps = table.new_stamps();
-        let control = Box::new(ChainControl {
-            budget: 1 << 20,
-            table: table.address(),
-            itlb: itlb.address(),
-            contexts: CONTEXTS,
-            salts: CONTEXTS.map(|context| itlb.salt(context)),
-            masks: [table.mask(), itlb.mask()],
-            stamps,
-            ..ChainControl::default()
+        let control = Box::new(Controlled {
+            control: ChainControl {
+                table: table.address(),
+                itlb: itlb.address(),
+                contexts: CONTEXTS,
+                salts: CONTEXTS.map(|context| itlb.salt(context)),
+                masks: [table.mask(), itlb.mask()],
+                stamps,
+                ..ChainControl::default()
+            },
+            account: Account::new(MAX_BUDGET),
         });
         World {
             table,
@@ -185,7 +187,7 @@ fn a_filled_entry_holds_until_its_page_goes() {
     assert_eq!(
         (
             world.control.hits,
-            world.control.retired,
+            world.control.account.retired(),
             world.control.block
         ),
         (1, u64::from(RAN), 3)
@@ -265,14 +267,19 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
     assert_eq!(world.control.hits, hits + 1);
     let branch = (REFUSING, ExitKind::Indirect as u64 | (RAN as u64) << 20);
     assert_eq!(world.run(32, REFUSING), branch);
-    // A spent budget returns with the word and the instructions run.
-    world.control.budget = 0;
+    // A spent budget returns with the word and the instructions run, the
+    // account unchanged.
+    world.control.account = world.control.account.with_budget(0);
+    let account = world.control.account;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    world.control.budget = 100;
-    // An interruption posted: the probe's gate exits.
-    world.control.interrupt_epoch = 1;
+    assert_eq!(world.control.account, account);
+    world.control.account = world.control.account.with_budget(100);
+    // An interruption posted: the probe's check exits.
+    world.control.interrupt();
+    let account = world.control.account;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    world.control.interrupt_epoch = 0;
+    assert_eq!(world.control.account, account);
+    world.control.acknowledge();
     assert_eq!(world.run(0, PC), (0x7705, 99));
 }
 
@@ -325,7 +332,7 @@ fn cached_tails_run_as_plain_tails() {
             _ => {
                 // The cached tail first: an entry of an earlier change
                 // must miss.
-                let mut plain = ChainControl { ..*world.control };
+                let mut plain = *world.control;
                 let got = world.run(0, pc);
                 let expected = run(&world.region, 16, &mut plain, pc);
                 assert_eq!(got, expected, "{pc:#x}");
@@ -333,10 +340,10 @@ fn cached_tails_run_as_plain_tails() {
                 assert_eq!(
                     (
                         world.control.block,
-                        world.control.retired,
+                        world.control.account.retired(),
                         world.control.hits
                     ),
-                    (plain.block, plain.retired, plain.hits),
+                    (plain.block, plain.account.retired(), plain.hits),
                     "{pc:#x}"
                 );
                 compared += 1;
@@ -369,4 +376,54 @@ fn empty_and_replaced_entries_take_the_probe() {
     assert_eq!(held(), PC);
     world.table.clear();
     assert_eq!(held(), 0);
+}
+
+/// An entry another PC's put beside its slot, then replaced there with the
+/// slot empty again or held: the older entry leaves its set and the jump
+/// caches, so a branch tail of a BTYPE the new entry refuses exits as the
+/// probe does, where the cache's entry of the older one entered, and the
+/// older one never comes back when the new one leaves.
+#[test]
+fn an_older_entry_beside_its_replacement_leaves_with_its_cache_entry() {
+    const PC: u64 = 0x4_0000_0200;
+    let key = block_key(0x4000_0000, 1);
+    let branch = (PC, ExitKind::Indirect as u64 | (RAN as u64) << 20);
+    for slot_held in [false, true] {
+        let mut world = World::new();
+        let slot = world.table.slot(PC, key);
+        // Another PC whose entry takes the same slot.
+        let other = (1..1 << 20)
+            .map(|step| PC + 0x1000 * step)
+            .find(|&pc| world.table.slot(pc, key) == slot)
+            .expect("a PC of the same slot");
+        let resident = LookupEntry {
+            pc: other,
+            key,
+            entry: world.blocks.0 as u64 + 64 * 7,
+            block: 7,
+            targets: 0b1111,
+        };
+        world.map(PC, key, 2, 0b1111);
+        // The other PC's entry puts it beside the slot.
+        world.table.insert(slot, resident);
+        assert_eq!(world.table.entry(neighbour(slot)).pc, PC);
+        // Filled by the BTYPE 2 probe from the entry beside, which accepts
+        // BTYPE 2, and taken from the cache.
+        assert_eq!(world.run(32, PC), (0x7702, 99));
+        assert_eq!(world.run(32, PC), (0x7702, 99));
+        if !slot_held {
+            world.table.forget_block(other, key, 7);
+        }
+        // The same block again, refusing BTYPE 2.
+        world.map(PC, key, 2, 0b0011);
+        assert_eq!(world.run(32, PC), branch, "slot held {slot_held}");
+        assert_eq!(world.table.entry(slot).targets, 0b0011);
+        let beside = world.table.entry(neighbour(slot));
+        assert_eq!(beside.pc, if slot_held { other } else { 0 });
+        // The new entry leaves with its block; nothing of the PC is left.
+        world.table.set(slot, LookupEntry::default());
+        let held = world.table.find(slot, PC, key);
+        assert!(!(held.pc == PC && held.key == key), "slot held {slot_held}");
+        assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
+    }
 }

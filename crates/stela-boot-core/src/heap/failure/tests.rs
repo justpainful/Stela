@@ -81,7 +81,7 @@ fn held_metadata_reports_unavailable_once() {
     assert_eq!(
         text.as_str(),
         "HEAP ALLOCATION FAILURE bytes=14 align=2 snapshot=unavailable\n\
-         HEAP AT FAILURE classes 16:0M 32:0M 64:0M 128:0M 256:0M 512:0M 1024:0M 2048:0M 4096:0M cores\n"
+         HEAP AT FAILURE classes 16:0M 32:0M 48:0M 64:0M 96:0M 128:0M 192:0M 256:0M 384:0M 512:0M 768:0M 1024:0M 1536:0M 2048:0M 3072:0M 4096:0M cores\n"
     );
     assert!(capture(&heap, Layout::new::<u8>()).is_none());
     drop(guard);

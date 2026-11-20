@@ -14,7 +14,7 @@ use stela_compiler::{
         BlockProfile, CompilationPlan, ExitKind, Features,
         PointerAuthenticationModifier as Modifier, PointerAuthenticationOperation as Operation,
     },
-    x86_64::{NativeSystem, block_entry, pinned},
+    x86_64::{NativeSystem, block_entry, pinned, pointer::inline::Cells},
 };
 
 /// Executable copies of native code, unmapped on drop.
@@ -444,9 +444,12 @@ fn native_completes(
     let (Kind::Sign, Some(key)) = (kind, key) else {
         return true;
     };
-    let layout = service.cipher.layouts[usize::from(pointer::key_index(key))][0];
-    let extension = layout.extension[usize::from(operand & layout.select != 0)];
-    operand & extension == 0 || operand & extension == extension
+    let data = matches!(
+        key,
+        PointerAuthenticationKey::Da | PointerAuthenticationKey::Db
+    );
+    let range = service.cipher.ranges[usize::from(data)][usize::from(operand & 1 << 55 != 0)];
+    operand & range.extension == range.canonical
 }
 
 /// Blocks given the cipher complete PAC instructions in line with the
@@ -587,6 +590,153 @@ fn blocks_compute_what_the_engine_computes() {
     }
 }
 
+/// A block ending with RETA*, BRA* or BLRA* authenticates the target in
+/// line and branches to it as RET, BR and BLR do, linking X30 for BLRA*,
+/// with what the engine's exit gives: every instruction key, the register,
+/// zero and SP modifiers, signed, corrupted and unsigned targets, enabled,
+/// disabled and closed keys, every PAC version and regime, through the
+/// cipher and through the memo. What the engine does not complete leaves at
+/// the instruction with its PAC exit, X30 unchanged.
+#[test]
+fn blocks_complete_branch_forms_as_the_engine_does() {
+    use stela_compiler::x86_64::chain;
+    use stela_contracts::pauth::Key;
+    // (word, key, target register, modifier register: None for SP, exit).
+    let forms: [(u32, Key, usize, Option<usize>, ExitKind); 10] = [
+        (0xd65f_0bff, Key::Ia, 30, None, ExitKind::Return), // retaa
+        (0xd65f_0fff, Key::Ib, 30, None, ExitKind::Return), // retab
+        (0xd71f_0865, Key::Ia, 3, Some(5), ExitKind::Indirect), // braa x3, x5
+        (0xd71f_0c65, Key::Ib, 3, Some(5), ExitKind::Indirect), // brab x3, x5
+        (0xd73f_0865, Key::Ia, 3, Some(5), ExitKind::Call), // blraa x3, x5
+        (0xd73f_0c65, Key::Ib, 3, Some(5), ExitKind::Call), // blrab x3, x5
+        (0xd61f_087f, Key::Ia, 3, Some(31), ExitKind::Indirect), // braaz x3
+        (0xd63f_0c7f, Key::Ib, 3, Some(31), ExitKind::Call), // blrabz x3
+        (0xd73f_0bc5, Key::Ia, 30, Some(5), ExitKind::Call), // blraa x30, x5
+        (0xd73f_087e, Key::Ia, 3, Some(30), ExitKind::Call), // blraa x3, x30
+    ];
+    let host = cells(TargetCpu::detect());
+    // Through the cipher where the host has it, and through the memo.
+    let paths: Vec<_> = [
+        host.cipher.map(|_| host),
+        Some(Cells {
+            cipher: None,
+            ..host
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut checked = [0usize; 2];
+    for cells in paths {
+        for (word, key, target, modifier_register, kind) in forms {
+            let options = stela_compiler::Options::new(
+                BlockProfile::new(Features::SYSTEM_MODE),
+                TargetCpu::detect(),
+            )
+            .with_native_system(NativeSystem {
+                pointer: Some(cells),
+                ..NativeSystem::NONE
+            });
+            let block = CompilationPlan::new(&word.to_le_bytes(), GuestAddress(PC), &options)
+                .unwrap()
+                .compile()
+                .unwrap();
+            let code = &block.native.x86_64_code;
+            // The engine finds the exit to the target where RET and BR put
+            // theirs (a linked BLR's ends with its continuation).
+            let ending = chain::without_failures(code);
+            let ending = &ending[ending.len() - chain::DYNAMIC_EXIT_BYTES..];
+            assert!(
+                kind == ExitKind::Call || chain::is_dynamic_exit(ending, kind),
+                "{word:#x}"
+            );
+            let code = Mapped::new(code);
+            for tcr in TCRS {
+                for version in VERSIONS {
+                    let inputs = super::tests::inputs(version, tcr);
+                    let mut native = Box::new(PointerService::new());
+                    let mut engine = PointerService::new();
+                    native.open(inputs);
+                    engine.open(inputs);
+                    for enable in [Enable::Enabled, Enable::Disabled, Enable::Closed] {
+                        native.close_native();
+                        if enable != Enable::Closed {
+                            native.reopen(key, enable == Enable::Enabled, false);
+                        }
+                        let (service, memo) = native.anchors();
+                        let mut state = GuestState::default();
+                        state.anchors[Anchor::Pointer] = service;
+                        state.anchors[Anchor::Memo] = memo;
+                        for (step, &base) in POINTERS.iter().enumerate() {
+                            let modifier = match modifier_register {
+                                Some(31) => 0,
+                                _ => 0xffff_fe10_0000_0000 ^ (step as u64) << 4 ^ tcr,
+                            };
+                            let mut operands = vec![base];
+                            if let Some(Ok((signed, _))) =
+                                engine.result(PointerOperation::Sign, key, base, modifier)
+                            {
+                                operands.extend([signed, signed ^ 1 << 50, signed ^ 1 << 62]);
+                            }
+                            for operand in operands {
+                                let expected = match enable {
+                                    Enable::Closed => None,
+                                    Enable::Disabled => Some(operand),
+                                    Enable::Enabled => match engine.result(
+                                        PointerOperation::Authenticate { combined: true },
+                                        key,
+                                        operand,
+                                        modifier,
+                                    ) {
+                                        Some(Ok((value, true))) => Some(value),
+                                        _ => None,
+                                    },
+                                };
+                                state.x = [0x7700; 31];
+                                match modifier_register {
+                                    None => state.sp = modifier,
+                                    Some(31) => state.sp = 0x5500,
+                                    Some(register) => state.x[register] = modifier,
+                                }
+                                state.x[target] = operand;
+                                let before = state.x;
+                                let exit = code.run(&mut state);
+                                let what = format!(
+                                    "{word:#x} {version:?} tcr={tcr:#x} {enable:?} {operand:#x} cipher={:?}",
+                                    cells.cipher
+                                );
+                                let mut after = before;
+                                match expected {
+                                    Some(value) => {
+                                        assert_eq!(exit, (value, kind as u64), "{what}");
+                                        if kind == ExitKind::Call {
+                                            after[30] = PC + 4;
+                                        }
+                                        checked[0] += 1;
+                                    }
+                                    None => {
+                                        assert_eq!(
+                                            exit,
+                                            (PC, ExitKind::PointerAuthentication as u64),
+                                            "{what}"
+                                        );
+                                        checked[1] += 1;
+                                    }
+                                }
+                                assert_eq!(state.x, after, "{what}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked[0] > 1000 && checked[1] > 1000,
+        "{checked:?} completed and left"
+    );
+}
+
 /// The schedule native code runs gives what the engine's cipher gives.
 #[test]
 fn schedules_follow_the_keys_words() {
@@ -613,8 +763,19 @@ fn schedules_follow_the_keys_words() {
             pauth::keyed::schedule(words)
         );
     }
-    assert_eq!(service.cipher.classic, 0);
-    assert_eq!(service.cipher.enhanced, u64::MAX);
+    // TCRS[0]: 39-bit ranges, TBI0 alone (for instructions too, without
+    // TBID0); FEAT_PAuth2's XOR.
+    let [instruction, data] = service.cipher.ranges;
+    assert_eq!(instruction, data);
+    assert_eq!(
+        data,
+        [
+            pointer::cipher::Range::new(0x00ff_ff80_0000_0000, false, false),
+            pointer::cipher::Range::new(0xffff_ff80_0000_0000, true, false),
+        ]
+    );
+    assert_eq!(data[1].authenticated, 0xff7f_ff80_0000_0000);
+    assert_eq!((data[1].signed, data[0].authenticated), (0, 0));
 }
 
 /// What a PAC operation costs natively, run by hand in a release build: an

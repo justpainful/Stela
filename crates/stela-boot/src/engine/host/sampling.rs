@@ -24,7 +24,8 @@
 //! and is charged to that phase: the native phase's own engine code
 //! (`glue`), scheduling, device work, fetches, or the exit it handled by
 //! kind (`x:` and the `PROFILE` line's exit name); one taken between slices
-//! is `host` service.
+//! is `host` service, and one taken while a waiting PE polls for a wake or
+//! halts ([`idle`]) is `idle` at once.
 //!
 //! Each sample weighs its counter's period, so the shares are of events.
 //! The NMIs stay under 0.2% of a PE's time: the handler times itself with
@@ -39,7 +40,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::Relaxed};
 use stela_boot_core::host_samples::{
-    CLASSES, Counts, NativeSample, OUTSIDE, PENDING, SAMPLED, Tags, charged, native, shares,
+    CLASSES, Counts, IDLE, NativeSample, OUTSIDE, PENDING, SAMPLED, Tags, charged, native, shares,
 };
 use stela_engine::machine::engine::step_timing::{self, CodeRegion, Phase};
 
@@ -108,6 +109,8 @@ struct Sampler {
     entry: u64,
     /// Inside a shadow page-fault fill ([`fill`]).
     filling: AtomicBool,
+    /// A waiting PE polls for a wake or halts ([`idle`]).
+    idle: AtomicBool,
     /// An NMI added to `pending` since the last charge.
     sampled: AtomicBool,
     /// The processor's private arena.
@@ -218,6 +221,7 @@ pub(super) fn start(pe: usize, counters: [u32; SAMPLED], clear: Option<u32>, rea
         samples: AtomicU64::new(0),
         entry: ENTRY_TICKS.max(read_ticks),
         filling: AtomicBool::new(false),
+        idle: AtomicBool::new(false),
         sampled: AtomicBool::new(false),
         arena: Tags::new(state.code_virtual, state.code_bytes),
         service_calls,
@@ -327,6 +331,8 @@ pub(crate) fn overflow(rip: u64, rsp: u64) -> u64 {
         return 0;
     }
     let top = slot(local::RECOVERY_RSP_OFFSET);
+    // An idle sample is counted at once: no phase charge owns it.
+    let idle = top == 0 && sampler.idle.load(Relaxed);
     let class = match top {
         0 => OUTSIDE,
         top => sampler.native_class(rip, rsp, top),
@@ -334,15 +340,19 @@ pub(crate) fn overflow(rip: u64, rsp: u64) -> u64 {
     let mut bits = 0;
     for (counter, &fired) in fired.iter().enumerate() {
         if fired {
-            add(
-                &sampler.pending[class][counter],
-                sampler.armed[counter].load(Relaxed),
-            );
+            let events = sampler.armed[counter].load(Relaxed);
+            if idle {
+                add(&sampler.counts[IDLE][counter], events);
+            } else {
+                add(&sampler.pending[class][counter], events);
+            }
             sampler.reload(counter);
             bits |= 1 << counter;
         }
     }
-    sampler.sampled.store(true, Relaxed);
+    if !idle {
+        sampler.sampled.store(true, Relaxed);
+    }
     if let Some(clear) = sampler.clear {
         wrmsr(clear, bits);
     }
@@ -376,6 +386,14 @@ pub(super) fn read(counter: usize, read: impl Fn(u32) -> u64) -> u64 {
 pub(super) fn fill(filling: bool) {
     if let Some(sampler) = sampler() {
         sampler.filling.store(filling, Relaxed);
+    }
+}
+
+/// Mark the start or end of a waiting PE's poll for a wake or halt
+/// (`Host::profile_idle`).
+pub(super) fn idle(idle: bool) {
+    if let Some(sampler) = sampler() {
+        sampler.idle.store(idle, Relaxed);
     }
 }
 

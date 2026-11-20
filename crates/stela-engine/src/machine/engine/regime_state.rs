@@ -45,9 +45,34 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.forget_derived();
         self.mirrors.transitions.forget();
         self.device_lines = None;
+        if self.step_timing.is_some() {
+            let paths = &mut self.system_exits.paths;
+            paths.closes += 1;
+            paths.cells_closed += self.mirrors.open_cells();
+        }
         self.mirrors.close_all();
         // Under step timing, the System exit being handled is charged with it.
         self.timed_closed |= self.timed_word.is_some();
+    }
+
+    /// A TCR write changed the layout of translation
+    /// (`system::layout`): what derives from System registers goes, PAC's
+    /// layout with it, but the mirror cells stay, as no System register
+    /// access traps on TCR or reads a value derived from it. Of the
+    /// transition records, those of SVC and ERET go, as after a write of
+    /// PAC's inputs ([`Self::forget_pointer_derived`]): EL2 and its guarded
+    /// level translate through one TCR, so a GENTER or GEXIT record changes
+    /// no input TCR gives, and the rest of what it keeps is checked where
+    /// it is used (the host's root and view) or moves with translation
+    /// (its lookup contexts, [`Self::layout_changed`]).
+    pub(super) fn layout_written(&mut self) {
+        self.forget_pointer_derived();
+        self.device_lines = None;
+        if self.step_timing.is_some() {
+            let paths = &mut self.system_exits.paths;
+            paths.layouts += 1;
+            paths.cells_kept += self.mirrors.open_cells();
+        }
     }
 
     /// An exception entry or return, GENTER or GEXIT moved the PE to another
@@ -90,6 +115,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the device lines.
     pub(super) fn forget_derived(&mut self) {
         self.timers = None;
+        // The event streams' controls may have changed.
+        self.stream_sample = None;
         self.mirrors.transitions.forget();
         self.forget_pstate_derived();
     }
@@ -229,7 +256,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some(),
+            regions: self.regions,
         })
+    }
+
+    /// Form regions ([`NativeSystem::regions`]), the default, or blocks
+    /// alone, from the next compilation on; the blocks compiled so far stay.
+    /// For tests that compare the two.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_regions(&mut self, on: bool) {
+        self.regions = on;
+        self.native_system = None;
     }
 
     /// Run self-loops inside their blocks ([`NativeSystem::self_loops`]),
@@ -292,6 +329,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let isolating = self.timing_start();
             self.host.isolate_predictions();
             isolated = Some(self.timing_since(isolating));
+        }
+        if self.exit_trace.in_service() {
+            self.exit_trace.sync(synced, isolated);
         }
         if self.step_timing.is_some() {
             let regimes = &mut self.system_exits.regimes;

@@ -167,10 +167,10 @@ struct TextureObject {
     cpu_copy: Option<BufferAllocation>,
     /// A two-plane texture's second plane's image; `image` is its first's.
     second_plane: Option<Image>,
-    /// An extended-range IOSurface texture's staging memory, which large
-    /// encodes write before copying it into the planes
-    /// ([`PlaneStaging`](crate::metal::pass::PlaneStaging)).
-    plane_staging: Option<BufferAllocation>,
+    /// An extended-range IOSurface texture's device memory laid out as its
+    /// planes: their device copy
+    /// ([`PlaneCopy`](crate::metal::pass::PlaneCopy)).
+    plane_memory: Option<BufferAllocation>,
 }
 
 /// A depth or stencil subresource's storage copy ([`TestedCopy`]): what it
@@ -690,7 +690,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy,
             second_plane: None,
-            plane_staging: None,
+            plane_memory: None,
         };
         Ok(TextureId(self.resources.textures.insert(texture)))
     }
@@ -734,7 +734,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     /// Frees a texture's buffer of its own: a CPU copy, decoded blocks or
-    /// plane staging memory.
+    /// a device copy of its planes.
     fn destroy_cpu_copy(&mut self, copy: BufferAllocation) {
         self.defer(Object::Buffer(copy.buffer));
         self.release_memory(copy.memory, copy.allocated);
@@ -931,7 +931,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: None,
-            plane_staging: None,
+            plane_memory: None,
         };
         Ok(TextureId(self.resources.textures.insert(view)))
     }
@@ -992,7 +992,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 dependents: 0,
                 cpu_copy: None,
                 second_plane: None,
-                plane_staging: None,
+                plane_memory: None,
             }
         } else {
             let plan = resource::linear_texture(
@@ -1038,7 +1038,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 dependents: 0,
                 cpu_copy: None,
                 second_plane: None,
-                plane_staging: None,
+                plane_memory: None,
             }
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
@@ -1231,7 +1231,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: Some(images[1]),
-            plane_staging: None,
+            plane_memory: None,
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         self.book_texture_over(buffer_id, descriptor);
@@ -1698,14 +1698,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let (region, strides) = self.block_run(id, region, strides)?;
         let region = &region;
         let (copy, rows) = self.cpu_region(id, region, strides, bytes.len())?;
-        if rows.tight() {
-            return self.write_region(id, &copy, &bytes[..rows.packed_bytes]);
-        }
-        let mut packed = Vec::with_capacity(rows.packed_bytes);
-        for row in rows.ranges() {
-            packed.extend_from_slice(&bytes[row]);
-        }
-        self.write_region(id, &copy, &packed)
+        self.write_region(
+            id,
+            &copy,
+            SourceRows {
+                layout: &rows,
+                bytes,
+            },
+        )
     }
 
     /// `getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:`.
@@ -1796,23 +1796,26 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok((copy, rows))
     }
 
-    /// Writes `region` from tightly packed bytes.
+    /// Writes `region` from the caller's rows, packed only where a path
+    /// needs them so: rows a CPU copy holds consecutively are written from
+    /// where the caller laid them.
     fn write_region(
         &mut self,
         id: TextureId,
         region: &BufferImageCopy,
-        bytes: &[u8],
+        source: SourceRows<'_>,
     ) -> Result<()> {
         let texture = self.resources.textures.get(id.0)?;
         self.cpu_access(texture)?;
         let image = texture.image.ok_or(Error::Invalid(
             "texture buffers are written through their buffer",
         ))?;
-        if self.write_aligned_rows(id, region, bytes)? {
+        if self.write_aligned_rows(id, region, &source)? {
             return Ok(());
         }
         let texture = self.resources.textures.get(id.0)?;
         let Some(copy) = &texture.cpu_copy else {
+            let bytes = &*source.packed();
             let description = texture.descriptor.pixel_format.describe();
             return match description.encoding() {
                 Encoding::Exact => self.backend.copy_to_image(image, region, bytes),
@@ -1829,7 +1832,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         let (memory, rows) = (
             copy.memory,
-            cpu_copy_rows(&texture.descriptor, region, bytes.len())?,
+            cpu_copy_rows(&texture.descriptor, region, source.packed_bytes())?,
         );
         let first = rows.first;
         // Vulkan's own rule for depth and stencil copies, which the upload is.
@@ -1838,8 +1841,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 "CPU writes of depth and stencil texels at offsets that are not multiples of four",
             ));
         }
-        for (offset, packed) in rows {
-            self.backend.write_memory(memory, offset, &bytes[packed])?;
+        if !source.layout.tight() && rows.contiguous() {
+            let length = source.packed_bytes() as u64;
+            self.backend
+                .write_memory_rows(memory, first, length, &mut source.chunks())?;
+        } else {
+            let bytes = source.packed();
+            for (offset, packed) in rows {
+                self.backend.write_memory(memory, offset, &bytes[packed])?;
+            }
         }
         let upload = BufferImageCopy {
             buffer_offset: first,
@@ -2247,8 +2257,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 if let Some(copy) = texture.cpu_copy {
                     self.destroy_cpu_copy(copy);
                 }
-                if let Some(staging) = texture.plane_staging {
-                    self.destroy_cpu_copy(staging);
+                if let Some(memory) = texture.plane_memory {
+                    self.destroy_cpu_copy(memory);
                 }
                 self.release_backing(texture.backing, texture.memory)?;
             }
@@ -2989,6 +2999,36 @@ fn make_aliasable(backing: &mut Backing) -> Result<Option<AliasedRanges>> {
     }
 }
 
+/// A CPU write's bytes and their validated rows ([`CpuRows`]).
+pub(super) struct SourceRows<'a> {
+    layout: &'a CpuRows,
+    bytes: &'a [u8],
+}
+
+impl<'a> SourceRows<'a> {
+    fn packed_bytes(&self) -> usize {
+        self.layout.packed_bytes
+    }
+
+    /// The rows, each a slice of the caller's bytes.
+    fn chunks(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+        let bytes = self.bytes;
+        self.layout.ranges().map(move |row| &bytes[row])
+    }
+
+    /// The rows tightly packed: the caller's bytes when they are.
+    pub(super) fn packed(&self) -> alloc::borrow::Cow<'a, [u8]> {
+        if self.layout.tight() {
+            return alloc::borrow::Cow::Borrowed(&self.bytes[..self.packed_bytes()]);
+        }
+        let mut packed = Vec::with_capacity(self.packed_bytes());
+        for row in self.chunks() {
+            packed.extend_from_slice(row);
+        }
+        alloc::borrow::Cow::Owned(packed)
+    }
+}
+
 /// Validated row layout in the caller's bytes.
 struct CpuRows {
     strides: Strides,
@@ -3051,6 +3091,13 @@ struct CopyRows {
     next: u64,
 }
 
+impl CopyRows {
+    /// Whether the region's rows lie consecutively in the copy, one span.
+    fn contiguous(&self) -> bool {
+        self.rows_per_copy == self.rows * self.images
+    }
+}
+
 impl Iterator for CopyRows {
     type Item = (u64, core::ops::Range<usize>);
 
@@ -3077,8 +3124,9 @@ fn stored_len(description: &Description, metal_len: usize) -> usize {
 }
 
 /// Bytes of each subresource's decode arguments after a decoded format's
-/// blocks.
-const DECODE_ARGUMENTS_STRIDE: u64 = 64;
+/// blocks: all of a [`TexelArguments`], so none overlaps the next.
+const DECODE_ARGUMENTS_STRIDE: u64 =
+    (TexelArguments::BYTES as u64).next_multiple_of(TexelArguments::ALIGNMENT);
 
 /// Where a decoded format's decode arguments start in its blocks' buffer.
 fn decode_arguments_offset(descriptor: &TextureDescriptor) -> u64 {

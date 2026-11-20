@@ -6,6 +6,8 @@
  */
 #include "Bundle.h"
 
+#include <stdatomic.h>
+
 static CFTimeInterval host_time(void)
 {
 	mach_timebase_info_data_t timebase;
@@ -330,13 +332,35 @@ static IOSurfaceRef surface_of(id object, BOOL *buffer)
 	return NULL;
 }
 
+/* The texture `object` views, or is, when the service keeps it in device
+ * memory; nil for any other object. */
+static StelaGPUTexture *copied_root(id object)
+{
+	for (int depth = 0; depth < 8 && [object isKindOfClass:[StelaGPUTexture class]]; depth++) {
+		StelaGPUTexture *texture = object;
+		if (!texture->_parent) {
+			return texture->_copied ? texture : nil;
+		}
+		object = texture->_parent;
+	}
+	return nil;
+}
+
+/* `SurfaceUse::SEED_ONLY`: a texture reported for its seed alone. */
+#define SURFACE_USE_SEED_ONLY 1u
+
 /* Each IOSurface object the command buffer used, once, with its surface's ID
  * and seed now, at its commit: the service refreshes its device-memory copy of
- * a sampled surface only when the seed changed, which the CPU's writes do. */
+ * a sampled surface only when the seed changed, which the CPU's writes do.
+ * Then each other live texture the service keeps in device memory whose seed
+ * changed since a commit last reported it: the command buffer may sample it
+ * unnamed, through an argument buffer or a residency set, and it keeps it
+ * until the service took the report. */
 - (void)reportSurfaces
 {
 	os_unfair_lock_lock(&_referencesLock);
 	NSMutableSet *seen = nil;
+	_seeds = nil;
 	for (NSUInteger i = 0; i < _retained.count; i++) {
 		id object = [_retained objectAtIndex:i];
 		BOOL buffer;
@@ -359,8 +383,67 @@ static IOSurfaceRef surface_of(id object, BOOL *buffer)
 			.buffer = buffer ? 1 : 0,
 		};
 		stela_stream_entry(&_stream, StelaCommandBufferCodeSurfaceUse, &use, sizeof(use), NULL, 0);
+		StelaGPUTexture *root = buffer ? nil : copied_root(object);
+		if (root) {
+			[self noteSeed:use.seed of:root];
+		}
+	}
+	NSArray *copied = [_device copiedTextures];
+	for (NSUInteger i = 0; i < copied.count; i++) {
+		StelaGPUTexture *texture = [copied objectAtIndex:i];
+		BOOL buffer;
+		IOSurfaceRef surface = surface_of(texture, &buffer);
+		if (!surface || texture->_parent || [self notedSeedOf:texture]) {
+			continue;
+		}
+		uint32_t seed = IOSurfaceGetSeed(surface);
+		if (atomic_load(&texture->_reportedSeed) == (STELA_SEED_KNOWN | seed)) {
+			continue;
+		}
+		StelaSurfaceUse use = {
+			.object = texture->_handle,
+			.surface = IOSurfaceGetID(surface),
+			.seed = seed,
+			.flags = SURFACE_USE_SEED_ONLY,
+		};
+		stela_stream_entry(&_stream, StelaCommandBufferCodeSurfaceUse, &use, sizeof(use), NULL, 0);
+		[_retained addObject:texture];
+		[self noteSeed:seed of:texture];
 	}
 	os_unfair_lock_unlock(&_referencesLock);
+}
+
+- (void)noteSeed:(uint32_t)seed of:(StelaGPUTexture *)texture
+{
+	if (!_seeds) {
+		_seeds = [NSMutableArray arrayWithCapacity:4];
+	}
+	/* No strong C array: its cleanup would need a landing pad, which the
+	 * bundle's link takes no unwind information for. */
+	[_seeds addObject:texture];
+	[_seeds addObject:[NSNumber numberWithUnsignedLongLong:seed]];
+}
+
+- (BOOL)notedSeedOf:(StelaGPUTexture *)texture
+{
+	for (NSUInteger i = 0; i < _seeds.count; i += 2) {
+		if ([_seeds objectAtIndex:i] == texture) {
+			return YES;
+		}
+	}
+	return NO;
+}
+
+/* Once the service accepted the commit: a later commit reports a seed again
+ * only when it changed since, and the service has seen this one first. */
+- (void)publishSeeds
+{
+	for (NSUInteger i = 0; i + 1 < _seeds.count; i += 2) {
+		StelaGPUTexture *texture = [_seeds objectAtIndex:i];
+		uint64_t seed = [[_seeds objectAtIndex:i + 1] unsignedLongLongValue];
+		atomic_store(&texture->_reportedSeed, STELA_SEED_KNOWN | seed);
+	}
+	_seeds = nil;
 }
 
 /* Under the queue's lock, so serials follow the order of enqueue. */
@@ -382,12 +465,14 @@ static IOSurfaceRef surface_of(id object, BOOL *buffer)
 		[self reportRefusal:&failure];
 	}
 	if (status != StelaStatusOk) {
+		_seeds = nil;
 		[self dropUnretained];
 		_kernelEnd = host_time();
 		[_device failed:self with:failure];
 		return;
 	}
 	stela_stream_free(&_stream);
+	[self publishSeeds];
 	_serial = serial.value;
 	_kernelEnd = host_time();
 	/* Noted first: a pooled buffer released with the references defers its

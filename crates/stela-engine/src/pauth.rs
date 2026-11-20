@@ -131,23 +131,19 @@ impl Layouts {
         self.tcr
     }
 
-    /// What native code computes `domain`'s signings or authentications
-    /// with (`x86_64::pointer::cipher::Layout`): the one pointer bit their
-    /// layout depends on, and the extension mask with it clear and set.
-    /// `regime_layout` selects TnSZ by that bit (55, or 63 for a signing
-    /// when neither range ignores the top byte) and TBI by bit 55, which it
-    /// ignores when it selects by bit 63, as neither range has TBI then.
-    pub(crate) fn native(&self, data: bool, signing: bool) -> (u32, [u64; 2]) {
+    /// What native code completes `domain`'s canonical pointers with
+    /// (`x86_64::pointer::cipher::Range`): the authentication layout's
+    /// extension mask with bit 55 clear and set. `Auth` selects TnSZ and TBI
+    /// by bit 55. So does `AddPAC` for a pointer whose extension is all
+    /// equal to bit 55: when it selects by bit 63 instead, neither range
+    /// ignores the top byte, so its extension holds bit 63, equal to bit 55.
+    pub(crate) fn native(&self, data: bool) -> [u64; 2] {
         let domain = if data {
             policy::Domain::Data
         } else {
             policy::Domain::Instruction
         };
-        let select = self.get(domain, 0, signing).select_shift;
-        (
-            select,
-            [0, 1 << select].map(|pointer| self.get(domain, pointer, signing).extension_mask()),
-        )
+        [0, 1 << 55].map(|pointer| self.get(domain, pointer, false).extension_mask())
     }
 
     fn get(&self, domain: policy::Domain, pointer: u64, signing: bool) -> policy::Layout {

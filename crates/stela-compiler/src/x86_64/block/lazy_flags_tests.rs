@@ -720,6 +720,9 @@ fn self_loops_keep_flags_across_joins_and_back_edges() {
                 // The last SUBS X2 left Z and C set.
                 assert_eq!(looped.nzcv, 0x6000_0000, "{label}");
                 looped.anchors = linked.anchors;
+                // The loop's settle before its exit, which the exit's rows
+                // complete where an engine counts them; no link counts here.
+                looped.account = linked.account;
                 assert_eq!(looped, linked, "{label}");
                 checked += 1;
             }

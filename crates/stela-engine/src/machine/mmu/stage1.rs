@@ -240,12 +240,36 @@ fn default_cacheable(controls: &Controls) -> bool {
 }
 
 /// Permission limits collected from table descriptors.
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Hierarchy {
     no_el0: bool,
     read_only: bool,
     pxn: bool,
     uxn: bool,
+}
+
+/// Where a walk read its last descriptor: the table, its level and the
+/// limits the tables above set. Every input address whose bits from the
+/// table's span up equal the walked one's reaches the same table through
+/// the same descriptors above, so a walk of it may start here, as a walk
+/// cache entry lets hardware start one (Arm ARM D8.17). The point holds
+/// for the controls of the walk that noted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Point {
+    table: u64,
+    level: i8,
+    hierarchy: Hierarchy,
+    /// log2 of the input bytes the table translates.
+    span_bits: u32,
+    /// The walked address's bits from `span_bits` up.
+    above: u64,
+}
+
+impl Point {
+    /// A walk of `address` reaches this point's table.
+    pub fn holds(&self, address: u64) -> bool {
+        address >> self.span_bits == self.above
+    }
 }
 
 #[cfg(test)]
@@ -256,20 +280,31 @@ pub fn translate(
     requester: Requester,
     memory: &mut dyn TableMemory,
 ) -> Outcome {
-    walk(controls, address, access, requester, None, memory).0
+    walk_from(
+        controls, address, access, requester, None, memory, None, &mut None,
+    )
+    .0
 }
 
 /// The stage-1 outcome, and for a mapping the descriptor's SH field, which a
 /// stage-2 combination uses before Device and Non-cacheable memory make it
 /// Outer Shareable. With `shape`, an access the memory type does not allow
 /// unaligned is an Alignment fault, ahead of a Permission fault.
-pub fn walk(
+///
+/// The walk starts from `start` when it holds the address (else from the
+/// translation table base) and notes in `reached` where it read its last
+/// descriptor. The outcome is the one a walk from the base gives while the
+/// descriptors above `start` are those the walk that noted it read.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_from(
     controls: &Controls,
     address: u64,
     access: Access,
     requester: Requester,
     shape: Option<MemoryCheck>,
     memory: &mut dyn TableMemory,
+    start: Option<&Point>,
+    reached: &mut Option<Point>,
 ) -> (Outcome, u8) {
     if controls.sctlr & SCTLR_M == 0 || default_cacheable(controls) {
         return disabled(controls, address, access, shape);
@@ -283,10 +318,13 @@ pub fn walk(
         shape,
         memory,
         &mut shareability,
+        start.filter(|point| point.holds(address)),
+        reached,
     );
     (outcome, shareability)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_enabled(
     controls: &Controls,
     address: u64,
@@ -295,6 +333,8 @@ fn walk_enabled(
     shape: Option<MemoryCheck>,
     memory: &mut dyn TableMemory,
     shareability_field: &mut u8,
+    start: Option<&Point>,
+    reached: &mut Option<Point>,
 ) -> Outcome {
     let upper = two_ranges(controls.regime) && address & (1 << 55) != 0;
     let range = range(controls, upper, access);
@@ -316,14 +356,28 @@ fn walk_enabled(
         Ok(granule) => Geometry::stage1(granule, input_bits),
         Err(unsupported) => return Outcome::Unsupported(unsupported),
     };
-    let alignment = geometry.start_table_bytes().max(MIN_TABLE_ALIGNMENT);
-    let mut table = range.ttbr & TTBR_BADDR & !(alignment - 1);
-    if table >> range.output_bits != 0 {
-        return fault(FaultKind::AddressSize, 0);
-    }
-    let mut level = geometry.start_level;
-    let mut hierarchy = Hierarchy::default();
+    // A point the caller holds was reached through descriptors that passed
+    // every check above it for the same controls and the same upper bits.
+    let (mut table, mut level, mut hierarchy) = match start {
+        Some(point) => (point.table, point.level, point.hierarchy),
+        None => {
+            let alignment = geometry.start_table_bytes().max(MIN_TABLE_ALIGNMENT);
+            let table = range.ttbr & TTBR_BADDR & !(alignment - 1);
+            if table >> range.output_bits != 0 {
+                return fault(FaultKind::AddressSize, 0);
+            }
+            (table, geometry.start_level, Hierarchy::default())
+        }
+    };
     loop {
+        let span_bits = geometry.shift(level) + geometry.index_bits(level);
+        *reached = Some(Point {
+            table,
+            level,
+            hierarchy,
+            span_bits,
+            above: address >> span_bits,
+        });
         let descriptor_address = table + geometry.index(address, level) * 8;
         let Some(descriptor) = memory.read_descriptor(descriptor_address) else {
             return fault(FaultKind::ExternalOnWalk, level);

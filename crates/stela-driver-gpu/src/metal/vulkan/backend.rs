@@ -25,7 +25,7 @@ use super::{
 use crate::metal::{
     binding::HeapArray,
     command_buffer::Segment,
-    error::{Error, Result},
+    error::{Error, Result, ensure},
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{any::Any, num::NonZeroU64};
@@ -236,6 +236,18 @@ pub trait Backend {
     /// The wired guest RAM of `ranges`, which the GPU reaches where it is.
     /// Destroying the memory lets [`Self::retired`] answer `token`.
     fn import_memory(&mut self, ranges: &[MemoryRange], token: NonZeroU64) -> Result<Memory>;
+    /// [`Self::import_memory`] of guest RAM the device reads for itself, as
+    /// a display layer's, whose destruction retires no token.
+    fn import_own(&mut self, _ranges: &[MemoryRange]) -> Result<Memory> {
+        Err(Error::Unsupported("imports of guest RAM for the device"))
+    }
+    /// The memory of a dma-buf another driver made, `bytes` long, which the
+    /// device reaches and nothing maps: a display's scanout buffer. The
+    /// driver owns `fd` once this succeeds; the caller still does after an
+    /// error.
+    fn import_dma_buf(&mut self, _fd: i32, _bytes: u64) -> Result<Memory> {
+        Err(Error::Unsupported("dma-buf imports"))
+    }
     /// Whether an import of exactly `ranges` takes back memory kept from
     /// an earlier one, with no driver call.
     fn keeps_import(&self, _ranges: &[MemoryRange]) -> bool {
@@ -383,6 +395,21 @@ pub trait Backend {
     }
     /// Copies into mapped memory and flushes it.
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()>;
+    /// Copies `rows` one after another into the `length` mapped bytes at
+    /// `offset`, which they fill, and flushes them: a caller's padded rows
+    /// without packing them first.
+    fn write_memory_rows(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+        rows: &mut dyn Iterator<Item = &[u8]>,
+    ) -> Result<()> {
+        let mut packed = Vec::with_capacity(length as usize);
+        rows.for_each(|row| packed.extend_from_slice(row));
+        ensure(packed.len() as u64 == length, "the rows fill the range")?;
+        self.write_memory(memory, offset, &packed)
+    }
     /// Invalidates mapped memory and copies out of it.
     fn read_memory(&mut self, memory: Memory, offset: u64, bytes: &mut [u8]) -> Result<()>;
     /// `vkFlushMappedMemoryRanges` after CPU writes through another mapping.
@@ -443,29 +470,6 @@ pub trait Backend {
 
     /// `vkGetCalibratedTimestampsKHR`: (host nanoseconds, GPU ticks).
     fn calibrated_timestamps(&mut self) -> Result<(u64, u64)>;
-
-    /// Imports the display's scanout buffer `handle`, the dma-buf `fd` of
-    /// `bytes`, for [`Self::compose`] to write: the driver takes the
-    /// descriptor on success, and the caller keeps it on failure. A backend
-    /// that composes no display frames refuses.
-    fn import_compose_target(&mut self, _handle: u32, _fd: i32, _bytes: u64) -> Result<()> {
-        Err(Error::Unsupported("display compose"))
-    }
-    /// Composes a display frame ([`crate::metal::compose`]) on the queue,
-    /// after the work submitted before it.
-    fn compose(
-        &mut self,
-        _job: &crate::metal::compose::Job<'_>,
-    ) -> Result<crate::metal::compose::Submitted> {
-        Err(Error::Unsupported("display compose"))
-    }
-    /// The host's view of the compose marker, which holds the low 32 bits
-    /// of the last composed frame's ticket once the GPU finished it,
-    /// readable from any processor while the backend lives; `None` before
-    /// the first scanout buffer was imported.
-    fn compose_marker(&self) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
-        None
-    }
 
     /// Gives the backend the platform's tick counter, which times the
     /// phases of its own calls that [`Self::take_split`] answers.

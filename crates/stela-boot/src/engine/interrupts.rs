@@ -374,6 +374,65 @@ stela_nmi_gate:
     answer = sym nmi_answer,
 );
 
+// The #PF gate: a fault from native code that the shadow fills from the
+// guest's tables returns without the full handler's extended-state save
+// and restore. The fill is soft-float Rust (`host::gate_fill`) that leaves
+// the vector registers as the fault found them, so the gate saves only the
+// registers the call may clobber. Every other fault, and one while an
+// entry image is outstanding (whose refusal the common path makes), goes
+// on to vector 14's stub with the stack as the processor left it. The
+// processor's frame with its error code leaves RSP on a 16-byte boundary;
+// nine pushes and eight bytes keep it there for the call.
+global_asm!(
+    r#"
+.global stela_pf_gate
+stela_pf_gate:
+    cmp qword ptr gs:[{active}], 0
+    jne stela_vector_14
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 8
+    cld
+    mov qword ptr gs:[{active}], 1
+    mov rdi, [rsp + 80]
+    mov rsi, [rsp + 88]
+    mov rdx, [rsp + 104]
+    call {fill}
+    mov qword ptr gs:[{active}], 0
+    add rsp, 8
+    test al, al
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jz stela_vector_14
+    add rsp, 8
+    iretq
+"#,
+    active = const host::local::XSTATE_ACTIVE_OFFSET,
+    fill = sym page_fault_gate,
+);
+
+/// Whether the #PF with error code `error` at `rip` with RFLAGS `rflags`
+/// is filled ([`host::gate_fill`]): the gate then returns to it.
+extern "sysv64" fn page_fault_gate(error: u64, rip: u64, rflags: u64) -> bool {
+    // A processor woken from an idle wait flushes what it skipped first.
+    crate::native_mmio::shootdown::wake();
+    host::gate_fill(error, rip, rflags, cr2())
+}
+
 /// Whether the NMI at `rip`, the interrupted stack at `rsp`, was owed by a
 /// `--profile` counter overflow ([`host::sampling::overflow`]), now
 /// sampled, or by a retirement's NMI, now answered
@@ -488,6 +547,7 @@ const _: () = ORDINARY_ENTRIES;
 unsafe extern "C" {
     static stela_vector_table: [usize; VECTOR_NUMBERS.len()];
     fn stela_nmi_gate();
+    fn stela_pf_gate();
 }
 
 fn gate(handler: usize, ist: u8) -> [u64; 2] {
@@ -673,6 +733,11 @@ unsafe fn install_tables(tables: &'static mut Tables, handler: Handler, parked: 
         (*idt)[2] = gate(
             stela_nmi_gate as *const () as usize,
             interrupt_image::NMI_IST,
+        );
+        // A #PF first tries a fill without saving extended state.
+        (*idt)[14] = gate(
+            stela_pf_gate as *const () as usize,
+            interrupt_image::ist(14),
         );
         let pointer = Pointer {
             limit: (size_of::<[[u64; 2]; 256]>() - 1) as u16,

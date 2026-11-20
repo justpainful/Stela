@@ -998,7 +998,7 @@ fn an_install_takes_the_code_lock_once_and_a_found_block_never() {
 
 /// A direct exit within its page to a PC that has no block yet waits for
 /// the fetch that compiles it without taking the code lock (the finder
-/// says so); that fetch's install and its link take one hold each, and the
+/// says so); that fetch's install links it in the same hold, and the
 /// block, which only the link enters, takes no block table entry. An exit
 /// to a PC that has a block links at once, in one hold.
 #[test]
@@ -1018,15 +1018,13 @@ fn an_exit_to_a_pc_without_a_block_waits_for_it_without_the_code_lock() {
             .direct_exit
             .is_some_and(|(block, _, target, _)| block == from && target == base + 8)
     );
+    let links = acquired(&first, board::LockSite::Link);
     let before = total(&first);
     let Ok(Fetched::Block(to)) = first.fetch_block(base + 8, false) else {
         panic!("a block")
     };
-    assert_eq!(
-        total(&first) - before - 1,
-        2,
-        "the install's and the link's"
-    );
+    assert_eq!(total(&first) - before - 1, 1, "the install's, which links");
+    assert_eq!(acquired(&first, board::LockSite::Link), links);
     assert!(first.code.blocks.record(from).chained(0));
     let pc = base + 8;
     let key = target_key(&first, pc);
@@ -1177,21 +1175,20 @@ fn entered(code: &board::Code, slot: usize, position: usize) -> Option<(usize, u
     let retired = u32::from(block.instructions) - u32::from(word.skipped);
     let near = block.code.0 as u64;
     let (point, fallback) = match exit.slot {
-        0 => (
-            chain::direct_patch(exit.site),
-            chain::Fallback::Return(word),
-        ),
-        bytes => (
-            chain::slot_patch(exit.site - u64::from(bytes)),
-            chain::Fallback::Jump(exit.site),
-        ),
+        0 => {
+            let point = chain::direct_patch(exit.site);
+            (point, chain::unlinked_return(point))
+        }
+        bytes => (chain::slot_patch(exit.site - u64::from(bytes)), exit.site),
     };
     let instruction = arena_bytes(arena, point, chain::PATCH_BYTES)?;
-    if exit.slot != 0 && instruction == chain::NOP5 {
+    if exit.slot != 0 && instruction == chain::LINKED_SLOT {
         let at = exit.site - u64::from(exit.slot);
-        let body = point + chain::PATCH_BYTES as u64;
-        return read_link(arena, body, near, |block, entry| {
-            chain::link(at, exit.slot.into(), retired, block, entry).map(|(_, bytes)| bytes)
+        return GATES.into_iter().find_map(|gate| {
+            read_link(arena, point, near, |block, entry| {
+                chain::link(at, exit.slot.into(), retired, block, entry, gate)
+                    .map(|linking| linking.body())
+            })
         });
     }
     // Else a `jmp rel32` to a thunk.
@@ -1200,10 +1197,15 @@ fn entered(code: &board::Code, slot: usize, position: usize) -> Option<(usize, u
     };
     let distance = i32::from_le_bytes(distance.try_into().ok()?);
     let thunk = (point + chain::PATCH_BYTES as u64).wrapping_add_signed(i64::from(distance));
-    read_link(arena, thunk, near, |block, entry| {
-        chain::thunk(thunk, retired, block, entry, fallback)
+    GATES.into_iter().find_map(|gate| {
+        read_link(arena, thunk, near, |block, entry| {
+            chain::thunk(thunk, retired, block, entry, fallback, gate)
+        })
     })
 }
+
+/// Either tier's links, whichever the machine's target took.
+const GATES: [chain::LinkGate; 2] = [chain::LinkGate::Jrcxz, chain::LinkGate::Pext];
 
 /// Check that block `slot`'s chained exit at `position` enters, by the
 /// bytes a core runs, a live block of its target at that block's code:
@@ -1479,7 +1481,13 @@ fn the_board_counts_why_it_compiles_a_block_again() {
         fetched += 1;
     }
     let counts = churn(&machine);
-    assert_eq!(counts.installs, machine.install_causes().installs);
+    let causes = machine.install_causes();
+    assert_eq!(counts.installs, causes.installs);
+    // Every block took its code and alignment from the window, and the
+    // window counts what else went there for them.
+    assert!(causes.window_pieces >= causes.installs, "{causes:?}");
+    assert!(causes.window_bytes >= causes.installed_bytes, "{causes:?}");
+    assert!(causes.window_bytes.is_multiple_of(16));
     // Ghosts are direct-mapped: one a collision lost counts as new.
     assert!(
         counts.new >= 512 && counts.new < counts.installs / 2,
@@ -1625,7 +1633,8 @@ fn open_part(ring: &board::Ring, stream: usize) -> usize {
 #[test]
 fn the_tenured_part_entered_least_goes_first_and_age_and_holes_bound_the_rest() {
     let grace = board::Grace::new(1);
-    let ring = board::Ring::new(16, 1024);
+    // A quarter young, so both generations hold several parts.
+    let ring = board::Ring::with_nursery(16, 1024, 4);
     assert_eq!(ring.young_parts, 4);
     // Young code fills the ring alone: first in, first out.
     let mut young = Vec::new();
@@ -1733,15 +1742,15 @@ fn a_part_another_part_jumps_into_waits_for_it() {
 
 /// A tenured part that stayed open while young code turned the ring past
 /// the age cap is old when a block takes its last bytes. The block's own
-/// PAC thunk then finds the part full and opens the next, and that advance
+/// CLREX thunk then finds the part full and opens the next, and that advance
 /// chooses a part to go: never the one the block's install still writes,
 /// which a choice by age counted from the part's opening took (finding 1
 /// of the engine audit: the block was then published into a part already
 /// taken away, and later ran another block's bytes).
 #[test]
 fn a_block_whose_thunk_fills_its_part_is_published_in_a_part_that_stays() {
-    const RETAA: u32 = 0xd65f_0bff;
-    let words = [RETAA, RET].repeat(2 * FETCH_PAGE as usize / 8);
+    const CLREX: u32 = 0xd503_3f5f;
+    let words = [CLREX, RET].repeat(2 * FETCH_PAGE as usize / 8);
     // The block's code as a machine alone compiles it, and its frame.
     let (block_bytes, physical) = {
         let mut memory = vec![0u8; 8 * 4096];
@@ -1867,4 +1876,66 @@ fn a_block_whose_part_is_chosen_before_it_publishes_is_installed_again() {
         "the block installed again is the one indexed"
     );
     assert_eq!(live_codes(&machine), [block.code.0]);
+}
+
+/// A board's block table doubles as its blocks fill it: every PE's lookups
+/// find the entries in the new table at once, each PE probes it from its
+/// next native run, and the old table goes only once the PEs inside their
+/// sections then passed their loops' tops.
+#[test]
+fn a_grown_block_table_reaches_every_pe_and_the_old_goes_after_a_grace() {
+    const BLOCKS: u64 = 64;
+    let mut memory = vec![0u8; 4 << 18];
+    let (mut first, mut second, hub) = shared_pair_of(&linked_groups(1), &mut memory);
+    let base = first.cpu.pc;
+    for group in 0..BLOCKS {
+        assert!(matches!(
+            first.fetch_block(base + 16 * group, false),
+            Ok(Fetched::Block(_))
+        ));
+    }
+    for machine in [&mut first, &mut second] {
+        machine.refresh_table();
+    }
+    let (old, old_mask) = first.code.table.current();
+    assert_eq!(first.chain.table(), old);
+    // The second PE is inside its section, holding the old table.
+    hub.board.grace.enter(1);
+    let code = Arc::clone(&first.code);
+    let live = 2 * chain::MIN_LOOKUP_ENTRIES;
+    let mut steps = 0;
+    while code.cache().targets.growths() == 0 {
+        compilation::grow_table(&mut code.cache(), first.grace(), live);
+        steps += 1;
+    }
+    assert!(steps > 1, "a growth in bounded steps");
+    let (new, new_mask) = first.code.table.current();
+    assert_eq!(new_mask, 2 * old_mask + 1);
+    assert_ne!(new, old);
+    // Lookups read the new table now; native code probes the old until
+    // the PE's next run.
+    for group in 0..BLOCKS {
+        let pc = base + 16 * group;
+        let key = target_key(&first, pc);
+        let entry = first.code.table.lookup(pc, key);
+        assert_eq!((entry.pc, entry.key), (pc, key));
+    }
+    assert_eq!((first.chain.table(), second.chain.table()), (old, old));
+    // The old table stays while the second PE has not passed its top.
+    compilation::grow_table(&mut code.cache(), first.grace(), live);
+    assert!(code.cache().targets.holds_retired());
+    hub.board.grace.pass(1);
+    compilation::grow_table(&mut code.cache(), first.grace(), live);
+    assert!(!code.cache().targets.holds_retired());
+    for machine in [&mut first, &mut second] {
+        machine.refresh_table();
+        assert_eq!(machine.chain.table(), new);
+        assert_eq!(machine.chain.masks()[0], new_mask);
+    }
+    let targets = code.report().targets;
+    assert_eq!(
+        (targets.entries, targets.growths),
+        (2 * chain::MIN_LOOKUP_ENTRIES as u64, 1)
+    );
+    hub.board.grace.leave(1);
 }

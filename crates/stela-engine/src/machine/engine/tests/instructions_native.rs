@@ -58,10 +58,9 @@ fn native(machine: &mut Machine<FakeHost, NoDevices>, chained: u64, before: u32)
         before,
     )
     .unwrap();
-    let control = machine.chain.address() as *mut chain::ChainControl;
-    // SAFETY: the machine's own control, which no native code runs over
-    // meanwhile.
-    unsafe { core::ptr::addr_of_mut!((*control).retired).write(chained) };
+    // The account the entry gives native code.
+    let account = chain::Account(machine.cpu.state.account);
+    machine.cpu.state.account = account.with_retired(chained).0;
     machine.cpu.state.x[10] = 0xdead;
     match run_native(machine, &thunk.code) {
         (pc, kind) if pc == BASE + 4 && kind == ExitKind::Fallthrough as u64 => {
@@ -93,7 +92,7 @@ fn native_instruction_reads_equal_the_engine_path_after_the_same_instructions() 
     assert_eq!(engine(&mut twin), 1_010);
     assert_eq!(machine.mirrors[INSTRUCTIONS_PLAIN].readable, 1);
     let mut entered = 10;
-    for (step, (chained, before)) in [(0, 0), (0, 3), (7, 0), (40, 2), (1 << 33, 9), (1, 1)]
+    for (step, (chained, before)) in [(0, 0), (0, 3), (7, 0), (40, 2), (1 << 30, 9), (1, 1)]
         .into_iter()
         .enumerate()
     {

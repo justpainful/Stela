@@ -127,7 +127,7 @@ fn call_and_return(callee: Callee) -> Vec<u8> {
         }
         Callee::Interrupted => {
             asm.place(Rcx, CONTROL);
-            asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 1);
+            post(&mut asm);
         }
         Callee::Exit => {
             asm.mov_imm32(Rdx, EXITED as u32);
@@ -149,8 +149,16 @@ fn call_and_return(callee: Callee) -> Vec<u8> {
     code.into_bytes()
 }
 
+/// An interruption posted to the control at RCX, as [`interrupt`] does.
+fn post(asm: &mut crate::x86_64::asm::Asm) {
+    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 1);
+    asm.mov_rm_imm32(Qword, Mem::base(Rcx, QUIET_OFFSET), 0);
+}
+
 struct Run {
     control: Box<ChainControl>,
+    /// The account each run enters with and leaves.
+    account: Account,
     epoch: Box<u64>,
 }
 
@@ -158,14 +166,17 @@ impl Run {
     fn new(bound: u32) -> Self {
         let mut epoch = Box::new(7);
         let control = Box::new(ChainControl {
-            budget: 100,
             block: CALLER,
             contexts: CONTEXTS,
             frame_room: bound * FRAME_BYTES as u32,
             retire_epoch: &raw mut *epoch as u64,
             ..ChainControl::default()
         });
-        Self { control, epoch }
+        Self {
+            control,
+            account: Account::new(100),
+            epoch,
+        }
     }
 
     /// Enter `code` at `at` with RSI = `target`: RAX and RDX of its exit.
@@ -173,13 +184,15 @@ impl Run {
     fn enter(&mut self, code: &Pages, at: usize, target: u64) -> (u64, u64) {
         let mut state = Box::new(GuestState::default());
         state.anchors[Anchor::Control] = &raw mut *self.control as u64;
+        state.account = self.account.0;
         let entry = (code.0 as usize + at) as *const u8;
         let before = stack_pointer();
         // SAFETY: the code has the block ABI and touches only the state,
         // the control, the epoch and the stack below the entry's return
         // address, which outlive the call.
-        let result = unsafe { crate::x86_64::native::enter(entry, &mut *state, target, 0) };
+        let result = unsafe { crate::x86_64::native::enter_counted(entry, &mut *state, target, 0) };
         assert_eq!(stack_pointer(), before);
+        self.account = Account(state.account);
         (result as u64, (result >> 64) as u64)
     }
 
@@ -205,11 +218,11 @@ fn a_return_to_its_call_takes_the_continuation() {
     // The return counted its block and named the caller again, with the
     // BTYPE a continuation enters with.
     assert_eq!(
-        (run.control.retired, run.control.block),
+        (run.account.retired(), run.control.block),
         (u64::from(RAN), CALLER & 0xffff_ffff)
     );
     // The continuation's own transfer spends the budget, not the return.
-    assert_eq!(run.control.budget, 100);
+    assert_eq!(run.account.budget(), 100);
 }
 
 #[test]
@@ -220,7 +233,7 @@ fn a_return_elsewhere_takes_the_lookup_and_leaves_the_frame() {
     // the exit's return reaches the entry all the same.
     assert_eq!(run.enter(&code, 0, OTHER), (OTHER, RETURNED));
     assert_eq!(run.pairs(), [0, 1, 0]);
-    assert_eq!(run.control.retired, 0);
+    assert_eq!(run.account.retired(), 0);
 }
 
 #[test]
@@ -262,7 +275,9 @@ fn what_runs_between_call_and_return_decides_the_frame() {
     // Acknowledged: the next run's frame matches.
     let code = pages(&call_and_return(Callee::Interrupted));
     run.enter(&code, 0, RETURN);
-    run.control.observed_interrupt_epoch = run.control.interrupt_epoch;
+    let epoch = run.control.interrupt_epoch;
+    // SAFETY: the run's control, which nothing runs on now.
+    unsafe { acknowledge(&mut *run.control, epoch) };
     let code = pages(&call_and_return(Callee::Return));
     assert_eq!(run.enter(&code, 0, RETURN), CONTINUED);
 }
@@ -271,7 +286,7 @@ fn what_runs_between_call_and_return_decides_the_frame() {
 fn no_budget_left_takes_the_exit() {
     let code = pages(&call_and_return(Callee::Return));
     let mut run = Run::new(DEFAULT_FRAME_BOUND);
-    run.control.budget = 0;
+    run.account = Account::new(0);
     assert_eq!(run.enter(&code, 0, RETURN), (RETURN, RETURNED));
     assert_eq!(run.pairs(), [0, 1, 0]);
 }
@@ -316,7 +331,7 @@ fn code_without_a_control_pushes_and_takes_no_frame() {
     let code = pages(&call_and_return(Callee::Return));
     let mut state = Box::new(GuestState::default());
     // SAFETY: as `Run::enter`, without a control.
-    let result = unsafe { crate::x86_64::native::enter(code.0, &mut *state, RETURN, 0) };
+    let result = unsafe { crate::x86_64::native::enter_counted(code.0, &mut *state, RETURN, 0) };
     // The call is its plain exit into the callee, whose return exits.
     assert_eq!((result as u64, (result >> 64) as u64), (RETURN, RETURNED));
 }
@@ -352,10 +367,16 @@ fn recursion_past_the_bound_refuses_the_deeper_frames() {
         let mut deepest = Box::new(0u64);
         let mut state = Box::new(GuestState::default());
         state.anchors[Anchor::Control] = &raw mut *run.control as u64;
+        state.account = run.account.0;
         let entered = stack_pointer();
         // SAFETY: as `Run::enter`; RDX names `deepest`.
         let result = unsafe {
-            crate::x86_64::native::enter(code.0, &mut *state, depth, &raw mut *deepest as u64)
+            crate::x86_64::native::enter_counted(
+                code.0,
+                &mut *state,
+                depth,
+                &raw mut *deepest as u64,
+            )
         };
         assert_eq!(
             (result as u64, (result >> 64) as u64),
@@ -369,7 +390,7 @@ fn recursion_past_the_bound_refuses_the_deeper_frames() {
             [pushed, 0, depth - 1 - pushed],
             "{bound} {depth}"
         );
-        assert_eq!(run.control.retired, pushed * u64::from(RAN));
+        assert_eq!(Account(state.account).retired(), pushed * u64::from(RAN));
         // The frames are all the stack the recursion took.
         let used = entered - *deepest;
         assert!(
@@ -397,7 +418,7 @@ fn recursion_ending(interrupt: bool) -> Vec<u8> {
     asm.bind(base);
     if interrupt {
         asm.place(Rcx, CONTROL);
-        asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 1);
+        post(&mut asm);
     } else {
         asm.mov_imm32(Rax, 0x5e);
         asm.mov_imm32(Rdx, EXITED as u32);
@@ -632,7 +653,10 @@ fn call_loop(paired: bool, sites: usize, base: u64) -> Vec<u8> {
 #[test]
 #[ignore = "manual: opt-in"]
 fn paired_and_looked_up_return_costs() {
-    const ITERATIONS: u64 = 1 << 22;
+    // Native runs of fewer pairs than MAX_BUDGET each.
+    const RUN: u64 = 1 << 15;
+    const RUNS: u64 = 128;
+    const ITERATIONS: u64 = RUN * RUNS;
     let key = block_key(0x4000_0000, 1);
     for sites in [1, SITES] {
         let mut results = Vec::new();
@@ -663,18 +687,21 @@ fn paired_and_looked_up_return_costs() {
             }
             let stamps = table.new_stamps();
             let mut run = Run::new(DEFAULT_FRAME_BOUND);
-            run.control.budget = u64::MAX / 2;
             run.control.table = table.address();
             run.control.itlb = itlb.address();
             run.control.salts = [itlb.salt(CONTEXTS[0]), itlb.salt(CONTEXTS[1])];
             run.control.masks = [table.mask(), itlb.mask()];
             run.control.stamps = stamps;
+            run.account = Account::new(MAX_BUDGET);
             assert_eq!(run.enter(&region, 0, 1 << 12), (1, 2));
             let mut best = f64::MAX;
             for _ in 0..5 {
                 let start = std::time::Instant::now();
-                assert_eq!(run.enter(&region, 0, ITERATIONS), (1, 2));
-                let ns = start.elapsed().as_secs_f64() * 1e9 / (ITERATIONS - 1) as f64;
+                for _ in 0..RUNS {
+                    run.account = Account::new(MAX_BUDGET);
+                    assert_eq!(run.enter(&region, 0, RUN), (1, 2));
+                }
+                let ns = start.elapsed().as_secs_f64() * 1e9 / (RUNS * (RUN - 1)) as f64;
                 best = best.min(ns);
             }
             let pairs = run.pairs();

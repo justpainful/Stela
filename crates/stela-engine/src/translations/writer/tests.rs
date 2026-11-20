@@ -1265,3 +1265,144 @@ fn a_full_pack_replaces_records_no_boot_used_since_with_new_ones() {
     assert!(unused < before.2, "{before:?} {now:?}");
     assert!(merges <= before.3 + u64::from(FULL_REFILLS));
 }
+
+/// What a second boot over a full first boot's pack left: the events, the
+/// writer's stats, the store's refused and shed entries, and of the pages
+/// it compiled, used from the pack, and the earlier pack's unused pages,
+/// those the file keeps.
+#[derive(Debug)]
+struct SecondBoot {
+    events: Vec<Event>,
+    stats: Stats,
+    unkept: u64,
+    shed: u64,
+    new: (usize, usize),
+    used: (usize, usize),
+    unused: (usize, usize),
+}
+
+/// A replay of run 20261119-052839's second boot, scaled to a limit of
+/// 1000 records: the first boot left 720 (545 of 755 MB); the second
+/// starts with a quiet second, then compiles past its share in a burst
+/// (sign-in) while it uses 500 of the 720, and then more slowly
+/// (launches).
+fn second_boot_over_a_full_pack() -> SecondBoot {
+    const ENTRY: usize = 4 << 10;
+    let record_bytes = {
+        let mut record = Record::new(translator_id(), page_key(0));
+        record.insert(entry(0, 0, ENTRY));
+        record.encode().len() as u64 + 56
+    };
+    let limit = 1000 * record_bytes;
+    let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
+    disk.track = false;
+    let mut arena = vec![0u8; limit as usize];
+    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
+    file.arena = Arena::new(&mut arena);
+    let mut run = Run::new(file, 1);
+    run.boot.entry_bytes = ENTRY;
+    run.boot.bound = 200;
+    for chunk in (0..720).collect::<Vec<u32>>().chunks(40) {
+        for &page in chunk {
+            run.boot.add_page(page);
+        }
+        run.run(&mut disk, 2).unwrap();
+    }
+    run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
+    run.stop(&mut disk).unwrap();
+    drop(run);
+    let file = load(&disk.bytes.clone(), limit);
+    let read: u64 = file.segments.iter().map(|pack| pack.bytes() as u64).sum();
+    let mut arena = vec![0u8; (limit - read) as usize];
+    let mut file: File<'_> = file;
+    file.arena = Arena::new(&mut arena);
+    let mut run = Run::new(file, 2);
+    run.boot.entry_bytes = ENTRY;
+    run.boot.bound = 200;
+    run.boot.heap_total = 64 * limit;
+    // Boot: it uses the first 100 pages and compiles a few.
+    run.boot.found = (0..100).map(page_key).collect();
+    let mut fresh = 10_000u32..;
+    for _ in 0..20 {
+        run.boot.add_page(fresh.next().unwrap());
+    }
+    run.run(&mut disk, QUIET_SECONDS + 3).unwrap();
+    // Sign-in: 60 new pages a second for ten seconds while it uses pages
+    // 100 to 500 of the pack.
+    for second in 0..10u32 {
+        run.boot.found = (0..100 + 40 * (second + 1)).map(page_key).collect();
+        for _ in 0..60 {
+            run.boot.add_page(fresh.next().unwrap());
+        }
+        run.run(&mut disk, 1).unwrap();
+    }
+    // Launches: 10 a second for a minute.
+    for _ in 0..60 {
+        for _ in 0..10 {
+            run.boot.add_page(fresh.next().unwrap());
+        }
+        run.run(&mut disk, 1).unwrap();
+    }
+    run.run(&mut disk, 3 * FIRST_DELTA_SECONDS).unwrap();
+    let stats = run.writer.stats();
+    run.stop(&mut disk).unwrap();
+    let kept = keys(&disk.bytes);
+    let of = |pages: &mut dyn Iterator<Item = u32>| {
+        let pages: Vec<u32> = pages.collect();
+        let kept = pages
+            .iter()
+            .filter(|&&page| kept.contains(&page_key(page)))
+            .count();
+        (kept, pages.len())
+    };
+    let compiled = fresh.next().unwrap();
+    SecondBoot {
+        events: run.events,
+        stats,
+        unkept: run.boot.unkept,
+        shed: run.boot.shed,
+        new: of(&mut (10_000..compiled)),
+        used: of(&mut (0..500)),
+        unused: of(&mut (500..720)),
+    }
+}
+
+/// Its pack full, the second boot refills: a merge of its segments that
+/// takes the pack just under its share frees no room, and the pack stays
+/// full until a refill made room. Before, the store shed every new page
+/// past the first segments for the rest of the boot and the file kept 260
+/// new pages, 340 used ones and 140 the boot never used (600 of what it
+/// ran); now no unused page stays and the file keeps 750 it ran.
+#[test]
+fn a_second_boot_over_a_full_pack_keeps_the_code_it_uses() {
+    let boot = second_boot_over_a_full_pack();
+    std::println!(
+        "SECOND BOOT unkept={} shed={} new={:?} used={:?} unused={:?} stats={:?}",
+        boot.unkept,
+        boot.shed,
+        boot.new,
+        boot.used,
+        boot.unused,
+        boot.stats
+    );
+    let shed_at = boot
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                Event::Shed {
+                    reason: ShedReason::Pack,
+                    ..
+                }
+            )
+        })
+        .expect("the pack fills");
+    let refills = boot.events[shed_at..]
+        .iter()
+        .filter(|event| matches!(event, Event::Merged { full: true, .. }))
+        .count();
+    assert_eq!(refills, usize::from(FULL_REFILLS), "{:?}", boot.events);
+    assert_eq!(boot.unused.0, 0, "{boot:?}");
+    assert!(boot.new.0 + boot.used.0 >= 700, "{boot:?}");
+}

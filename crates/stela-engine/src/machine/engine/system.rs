@@ -233,6 +233,18 @@ fn table_base(register: Register) -> bool {
     matches!(register, Register::TTBR0_EL1 | Register::TTBR0_EL2)
 }
 
+/// TCR of either regime: the layout of translation (the sizes, granules,
+/// walk attributes and table enables of each half, the ASID's width and
+/// which TTBR holds it) and the address bits PAC and tag checks leave
+/// alone. No System register access traps on it or reads a value derived
+/// from it, so a write keeps what native code completes of those accesses,
+/// while everything that translates goes ([`Machine::layout_changed`]), as
+/// does what else derives from System registers: PAC's layout, tag checks,
+/// the transition records.
+pub(super) fn layout(register: Register) -> bool {
+    matches!(register, Register::TCR_EL1 | Register::TCR_EL2)
+}
+
 /// Writes that change translation: shadow roots and fetch translations go.
 fn translates(register: Register) -> bool {
     matches!(
@@ -418,6 +430,9 @@ enum Translation {
     TableBase,
     /// Another translation control: all.
     All,
+    /// TCR, the layout of translation ([`layout`]): all that translates,
+    /// but nothing a System register access decides.
+    Layout,
     /// TLB maintenance: every fetch translation, of the shadow what the
     /// TLBI reaches, and of the lookup table what it reaches everywhere;
     /// and the scope other PEs apply, for one broadcast beyond this PE.
@@ -863,6 +878,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         });
         match translation {
             Translation::All => self.controls_changed(),
+            Translation::Layout => self.layout_changed(),
             Translation::TableBase => self.table_base_changed(),
             Translation::Maintenance(reach, everywhere, asid, broadcast) => {
                 self.tlb_maintained(reach, everywhere, asid);

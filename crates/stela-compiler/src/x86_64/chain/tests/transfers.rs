@@ -6,6 +6,7 @@
 //! read-modify-write, so a change to the transfer path shows here as
 //! numbers, not as a reading of its bytes.
 use super::super::*;
+use super::gate;
 use crate::{
     GuestState, Options, TargetCpu,
     block::{BlockProfile, CompilationPlan, Features},
@@ -319,13 +320,13 @@ impl Program {
                 }
                 let at = block.at + exit.offset as u64 - slot as u64;
                 let retired = block.instructions - u32::from(exit.skipped);
-                let (body, bytes) = link(at, slot, retired, target as u32, blocks[target].at)
+                let linking = link(at, slot, retired, target as u32, blocks[target].at, gate())
                     .expect("a link in reach");
                 let offset = |address: u64| (address - arena.at(0)) as usize;
-                arena.write(offset(body), &bytes);
+                arena.write(offset(linking.rest_at), &linking.rest);
                 let point = slot_patch(at);
                 assert!(patchable(point));
-                arena.write(offset(point), &NOP5);
+                arena.write(offset(point), &linking.point);
             }
         }
         // The entry: the pinned registers loaded around a jump to the
@@ -337,10 +338,7 @@ impl Program {
         stub[field..].copy_from_slice(&distance.to_le_bytes());
         assert!(stub.len() <= BLOCKS_AT);
         arena.write(STUB_AT, &stub);
-        let control = Box::new(ChainControl {
-            budget: 1 << 20,
-            ..ChainControl::default()
-        });
+        let control = Box::new(ChainControl::default());
         Self {
             arena,
             blocks,
@@ -348,10 +346,12 @@ impl Program {
         }
     }
 
-    /// A frame for a run: registers from `x`, every access in range.
+    /// A frame for a run: registers from `x`, every access in range, the
+    /// most transfers a run may allow.
     pub(super) fn frame(&mut self, x: &[(usize, u64)]) -> Box<GuestState> {
         let mut frame = Box::new(GuestState {
             lower_limit: Limit(0x7fff_ffff_ffff),
+            account: Account::new(MAX_BUDGET).0,
             ..GuestState::default()
         });
         for &(register, value) in x {
@@ -663,17 +663,23 @@ fn the_cost_decoder_classes_transfer_instructions() {
 #[test]
 fn transfers_cost_what_their_path_runs() {
     let costs = transfer_costs();
+    // A polled link's checks: PEXT and a JRCXZ, or two of each MOV and
+    // JRCXZ ([`LinkGate`]).
+    let polled = match gate() {
+        LinkGate::Pext => 0,
+        LinkGate::Jrcxz => 2,
+    };
     let expected = [
-        ("b forward", Cost::new(7, 1, 1, 2)),
-        ("b back", Cost::new(10, 3, 1, 2)),
-        ("cbz back, fallthrough", Cost::new(9, 1, 1, 2)),
-        ("cbz back, taken", Cost::new(13, 3, 1, 2)),
-        ("cbz forward, side exit", Cost::new(9, 1, 1, 2)),
+        ("b forward", Cost::new(6, 1, 1, 0)),
+        ("b back", Cost::new(6 + polled, 2, 1, 0)),
+        ("cbz back, fallthrough", Cost::new(8, 1, 1, 0)),
+        ("cbz back, taken", Cost::new(9 + polled, 2, 1, 0)),
+        ("cbz forward, side exit", Cost::new(8, 1, 1, 0)),
     ];
     assert_eq!(costs, expected);
     // An iteration inside a self-loop, and one through its polled link.
     assert_eq!(loop_iteration(true), Cost::new(6, 1, 0, 1));
-    assert_eq!(loop_iteration(false), Cost::new(13, 3, 1, 2));
+    assert_eq!(loop_iteration(false), Cost::new(9 + polled, 2, 1, 0));
 }
 
 /// The scanner's linked blocks count what they ran: its counts, the
@@ -686,13 +692,13 @@ fn a_linked_scanner_counts_every_transfer_and_instruction() {
     let mut program = Program::new(&SCANNER, 0, true);
     assert_eq!(program.blocks.len(), 6);
     let mut frame = scanner_frame(&mut program, &text);
-    let budget = program.control.budget;
+    let budget = Account(frame.account).budget();
     let (next, _) = program.run(&mut frame);
     assert_eq!(next, BASE + 15 * 4);
     assert_eq!((frame.x[9], frame.x[12], frame.x[14]), (words, lines, 0));
-    let control = &program.control;
-    assert_eq!(control.retired, retired);
-    assert_eq!(budget - control.budget, transfers);
+    let account = Account(frame.account);
+    assert_eq!(account.retired(), retired);
+    assert_eq!(budget - account.budget(), transfers);
 }
 
 /// The host time and instructions the scanner takes per guest instruction
@@ -713,7 +719,6 @@ fn scanner_time_on_this_host() {
     for _ in 0..5 {
         let start = std::time::Instant::now();
         for _ in 0..REPEATS {
-            program.control.budget = 1 << 20;
             let mut frame = scanner_frame(&mut program, &text);
             program.run(&mut frame);
         }

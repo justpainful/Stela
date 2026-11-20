@@ -1,21 +1,22 @@
 //! Compile workers: host processors that run no PE
 //! (`stela_boot_core::compile_workers`). They take the GPUs' deferred
 //! compile jobs and the GPUs' Linux work a PE whose guest waits would
-//! otherwise run (with `nvk`), and translate guest code ahead of execution
-//! (`translations::translate_ahead`).
+//! otherwise run (with `nvk`), and prepare blocks ahead of execution
+//! (`translations::prepare_ahead`) when no GPU work is ready.
 //!
 //! The loader reserves them past the PEs' executors and the APs' startup
 //! starts them like a PE's: each has its own Host and joins the shared TLB
 //! shootdowns, so the jobs it runs may map and fault as on any processor.
 //! Each then loops on its executor: it answers shootdowns, takes a GPU job
 //! at once (`gpu::gate::Taker::Worker`) and runs its slices back to back,
-//! translates a block ahead when no GPU work is ready, and sleeps until its
-//! doorbell while nothing waits. A guest call that waits for a GPU job
-//! rings the workers (`gate::job_waiting`), and a PE's processor leaves a
-//! job to them for `WORKER_GRACE_MILLIS` (`Taker::with_workers`), so the
-//! PEs keep their cores for their guests and a job still runs if every
-//! worker is held. A PE that queues blocks to translate ahead rings one
-//! sleeping worker ([`nudge`]), and none while every worker is awake.
+//! prepares blocks ahead when no GPU work is ready, reading their pages
+//! through its own Host as a waiting PE does, and sleeps until its doorbell
+//! while nothing waits. A guest call that waits for a GPU job rings the
+//! workers (`gate::job_waiting`), and a PE's processor leaves a job to them
+//! for `WORKER_GRACE_MILLIS` (`Taker::with_workers`), so the PEs keep their
+//! cores for their guests and a job still runs if every worker is held. A
+//! store that queues blocks to prepare ahead rings one sleeping worker
+//! ([`nudge`]), and none while every worker is awake.
 //!
 //! A worker has no slot in the guest's shared clock: it never holds guest
 //! time, however long a job runs.
@@ -23,6 +24,7 @@ use crate::{apic::Apic, engine::host, native_smp::executor::Processor, output};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use stela_boot_core::compile_workers::MOST;
+use stela_engine::machine::Host as _;
 
 /// Each started worker's APIC ID, the first [`COUNT`] of them.
 static APICS: [AtomicU32; MOST] = [const { AtomicU32::new(u32::MAX) }; MOST];
@@ -31,10 +33,6 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// The workers asleep, or about to be, by their index in [`APICS`]: those
 /// [`nudge`] may ring.
 static SLEEPING: AtomicU32 = AtomicU32::new(0);
-
-/// Whether the workers translate guest code ahead of execution: the PEs
-/// hand them the successors of each block they compile.
-const TRANSLATE_AHEAD: bool = true;
 
 /// Spins a worker makes while a GPU job waits that another processor holds,
 /// before it sleeps: about the length of a slice on a 3 GHz core, so that it
@@ -55,8 +53,7 @@ pub(in crate::engine) fn present() -> bool {
 /// Hands each of `workers`, started executors that run no PE, the worker
 /// loop for the rest of the boot, through `sender` with a TSC of `tsc_hz`.
 /// A worker whose mailbox refuses stays idle in its executor's loop, and
-/// the PEs' processors take its jobs. The workers translate ahead only
-/// when any started.
+/// the PEs' processors take its jobs.
 pub(in crate::engine) fn start(workers: &[Processor], sender: &Apic, tsc_hz: u64) {
     for processor in workers.iter().take(MOST) {
         let Ok(apic) = u32::try_from(processor.apic_id()) else {
@@ -68,8 +65,8 @@ pub(in crate::engine) fn start(workers: &[Processor], sender: &Apic, tsc_hz: u64
                 APICS[index].store(apic, Ordering::Relaxed);
                 COUNT.store(index + 1, Ordering::Release);
                 output::arguments(format_args!(
-                    "NATIVE COMPILE WORKER slot={} apic={apic:#x}: takes the GPUs' compile jobs, \
-                     translates ahead={TRANSLATE_AHEAD}\n",
+                    "NATIVE COMPILE WORKER slot={} apic={apic:#x}: takes the GPUs' compile jobs \
+                     and prepares blocks ahead\n",
                     processor.slot()
                 ));
             }
@@ -79,9 +76,6 @@ pub(in crate::engine) fn start(workers: &[Processor], sender: &Apic, tsc_hz: u64
             )),
         }
     }
-    super::translations::translate_ahead_with(
-        TRANSLATE_AHEAD && COUNT.load(Ordering::Acquire) != 0,
-    );
 }
 
 /// Rings `apics`' doorbells. Safe with interrupts on: the rings write this
@@ -109,8 +103,8 @@ pub(in crate::engine) fn wake() {
 }
 
 /// Rings one sleeping worker's doorbell, if any sleeps: a block to
-/// translate ahead waits. The worker marks itself sleeping before it looks
-/// at the queue a last time, and the PE looks at the marks after it queued,
+/// prepare ahead waits. The worker marks itself sleeping before it looks at
+/// the queue a last time, and the store looks at the marks after it queued,
 /// so one of the two sees the other.
 pub(in crate::engine) fn nudge() {
     core::sync::atomic::fence(Ordering::SeqCst);
@@ -128,10 +122,14 @@ pub(in crate::engine) fn nudge() {
 /// A worker's loop, on its executor with interrupts masked, for the rest of
 /// the boot: its Host is its executor's own, which the jobs reach through
 /// `host`'s per-processor state. Linux's ready work comes first, as a frame
-/// waits on it, then a GPU compile job, then a block to translate ahead;
-/// with none, it sleeps.
-fn run(_: &mut host::HostOwner, index: usize) {
+/// waits on it, then a GPU compile job, then blocks to prepare ahead until
+/// a GPU job waits; with none, it sleeps.
+fn run(owner: &mut host::HostOwner, index: usize) {
     let bit = 1u32 << index;
+    #[cfg(feature = "nvk")]
+    let gpu_waits = super::gpu::gate::jobs_pending;
+    #[cfg(not(feature = "nvk"))]
+    let gpu_waits = || false;
     // Spin rounds left while work another processor holds keeps waiting: a
     // worker whose wait outlasts them sleeps until a doorbell, as a PE that
     // waits for a GPU job or its Linux work rings the workers.
@@ -150,7 +148,17 @@ fn run(_: &mut host::HostOwner, index: usize) {
                 continue;
             }
         }
-        if super::translations::translate_ahead() {
+        if super::translations::ahead_pending() {
+            // The guest's pages through this processor's own Host, as a
+            // waiting PE reads them through its machine's, and at least one
+            // job a call: a GPU job another processor holds leaves the
+            // queue to drain rather than to spin on.
+            let mut host = owner.host();
+            let first = core::cell::Cell::new(true);
+            super::translations::prepare_ahead(
+                &mut |frame, bytes| host.read_ram(frame, bytes),
+                &|| !first.replace(false) && gpu_waits(),
+            );
             #[cfg(feature = "nvk")]
             {
                 spins_left = HELD_ROUNDS;

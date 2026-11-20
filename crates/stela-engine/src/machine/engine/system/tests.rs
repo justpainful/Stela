@@ -1722,6 +1722,161 @@ fn mirrored_cells_open_exactly_on_the_plain_reads() {
     );
 }
 
+/// Opens every mirrored read's cell at `pstate`, as native code's reads do.
+fn read_mirrored(machine: &mut TestMachine, pstate: Pstate) {
+    use super::super::MIRRORED;
+    for &encoding in &MIRRORED {
+        machine.cpu.pstate = pstate;
+        machine.cpu.pc = BASE;
+        let _ = machine.system_instruction(access(true, encoding, 1));
+    }
+    machine.cpu.pstate = pstate;
+    machine.cpu.pc = BASE;
+}
+
+/// Writes `value(machine)` to the register `encoding` names in every context
+/// where the write completes plainly, after every mirrored read opened its
+/// cell and every transition record was held, then calls `check` with the
+/// machine, the PSTATE, the case, the translation and device-read
+/// generations before the write and the machine's cells as the write left
+/// them. Returns how many writes completed.
+fn write_after_open_cells(
+    encoding: Encoding,
+    value: impl Fn(&TestMachine) -> u64,
+    mut check: impl FnMut(&mut TestMachine, Pstate, &str, (u64, u64), super::super::Mirrors),
+) -> usize {
+    let mut written = 0;
+    native_completion_contexts(|machine, pstate, case| {
+        read_mirrored(machine, pstate);
+        let generations = (
+            machine.translation_generation,
+            machine.device_read_generation,
+        );
+        // Every transition record holds.
+        let table = &mut machine.mirrors.transitions;
+        for record in table.records.iter_mut().flatten() {
+            record.generation = table.generation;
+        }
+        machine.cpu.state.x[0] = value(machine);
+        let exceptions = machine.statistics.exceptions;
+        let Ok(()) = machine.system_instruction(access(false, encoding, 0)) else {
+            return;
+        };
+        if (machine.cpu.pstate.el, machine.cpu.pc) != (pstate.el, BASE + 4)
+            || machine.statistics.exceptions != exceptions
+        {
+            return;
+        }
+        written += 1;
+        let after = *machine.mirrors;
+        check(machine, pstate, &case, generations, after);
+    });
+    written
+}
+
+/// That the GENTER and GEXIT transition records held on and SVC's and
+/// ERET's went, and that every cell `after` holds is the engine's own read
+/// when it opens it again. Returns how many cells were open.
+fn assert_cells_kept(
+    machine: &mut TestMachine,
+    pstate: Pstate,
+    case: &str,
+    after: super::super::Mirrors,
+) -> usize {
+    use super::super::{COUNT_MIRRORS, COUNTER_MIRRORS, MIRRORED};
+    use stela_compiler::x86_64::transition;
+    let table = &machine.mirrors.transitions;
+    for records in &table.records {
+        for (kind, record) in records.iter().enumerate() {
+            let kept = matches!(kind, transition::GUARDED_ENTER | transition::GUARDED_EXIT);
+            assert_eq!(record.generation == table.generation, kept, "{case} {kind}");
+        }
+    }
+    read_mirrored(machine, pstate);
+    let mut open = 0;
+    for index in 0..MIRRORED.len() {
+        let (cell, again) = (after[index], machine.mirrors[index]);
+        // The counts' cells hold what time moves; their plainness stays.
+        if COUNT_MIRRORS.contains(&index) || COUNTER_MIRRORS.contains(&index) {
+            assert_eq!(cell.readable, again.readable, "{case} {index}");
+        } else {
+            assert_eq!(cell, again, "{case} {index}");
+        }
+        open += usize::from(cell.readable != 0);
+    }
+    open
+}
+
+/// A TCR write that changes the layout of translation keeps every open
+/// mirrored-read cell exactly as the engine's own read after it opens it
+/// again, in every context where the write completes; what translates goes.
+/// Before, the write closed every cell, and each register native code then
+/// read took an exit to open its cell again.
+#[test]
+fn layout_writes_keep_exactly_the_cells_reads_open_again() {
+    const TCR_EL1: Encoding = Encoding::new(3, 0, 2, 0, 2);
+    const TBI0: u64 = 1 << 37;
+    let mut kept = 0;
+    let written = write_after_open_cells(
+        TCR_EL1,
+        |machine| machine.cpu.regime_tcr() ^ TBI0,
+        |machine, pstate, case, (translations, devices), after| {
+            assert!(machine.translation_generation > translations, "{case}");
+            assert!(machine.device_read_generation > devices, "{case}");
+            kept += assert_cells_kept(machine, pstate, case, after);
+        },
+    );
+    assert!(written > 0 && kept > 0, "{written} {kept}");
+}
+
+/// An SCTLR write that changes only PAC's key enables, as the guarded
+/// level's entry and return do, keeps every open cell and the GENTER and
+/// GEXIT records, in every context where it completes; one that changes
+/// another control (UCI) still closes every cell and record.
+#[test]
+fn pointer_enable_writes_keep_exactly_the_cells_reads_open_again() {
+    const SCTLR_EL1: Encoding = Encoding::new(3, 0, 1, 0, 0);
+    const ENIA: u64 = 1 << 31;
+    const ENDB: u64 = 1 << 13;
+    const UCI: u64 = 1 << 26;
+    let mut kept = 0;
+    let written = write_after_open_cells(
+        SCTLR_EL1,
+        |machine| machine.cpu.regime_sctlr() ^ (ENIA | ENDB),
+        |machine, pstate, case, _, after| {
+            assert_eq!(
+                machine.cpu.regime_sctlr() & (ENIA | ENDB),
+                machine.cpu.state.x[0] & (ENIA | ENDB),
+                "{case}"
+            );
+            kept += assert_cells_kept(machine, pstate, case, after);
+        },
+    );
+    assert!(written > 0 && kept > 0, "{written} {kept}");
+    let mut closed = 0;
+    let written = write_after_open_cells(
+        SCTLR_EL1,
+        |machine| machine.cpu.regime_sctlr() ^ UCI,
+        |machine, _, case, _, after| {
+            // Where UCI is reserved, the write changed nothing.
+            if machine.cpu.regime_sctlr() & UCI != machine.cpu.state.x[0] & UCI {
+                return;
+            }
+            let open =
+                (0..super::super::MIRRORED.len()).filter(|&index| after[index].readable != 0);
+            assert_eq!(open.count(), 0, "{case}");
+            let table = &machine.mirrors.transitions;
+            let mut records = table.records.iter().flatten();
+            assert!(
+                records.all(|record| record.generation != table.generation),
+                "{case}"
+            );
+            closed += 1;
+        },
+    );
+    assert!(written > 0 && closed > 0, "{written} {closed}");
+}
+
 #[test]
 fn rmr_el2_resets_into_aarch64_and_a_warm_reset_needs_a_reset_vector() {
     const RMR_EL2: Encoding = Encoding::new(3, 4, 12, 0, 2);

@@ -22,6 +22,7 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreText/CoreText.h>
 #import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceObjC.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
@@ -5587,11 +5588,16 @@ static void host_two_plane_render(Case *c, id<MTLCommandQueue> queue, NSDictiona
 	CFRelease(cleared);
 }
 
-/* What another process does to a texture and event this one shares. */
+/* What another process does to a texture and event this one shares, and
+ * what it reads of a surface this one renders. */
 @protocol Sharer
 - (void)writeRows:(NSData *)rows into:(MTLSharedTextureHandle *)texture
 	    after:(MTLSharedEventHandle *)event value:(uint64_t)value
 	    reply:(void (^)(NSString *error))reply;
+- (void)readSurface:(IOSurface *)surface
+	     format:(NSUInteger)format
+	     points:(NSData *)points
+	      reply:(void (^)(NSData *texels, NSString *error))reply;
 @end
 
 static NSString *const share_service = @"com.stela.metal-suite.share";
@@ -5633,6 +5639,55 @@ static NSString *const share_service = @"com.stela.metal-suite.share";
 	[cb commit];
 	[cb waitUntilCompleted];
 	reply(cb.error ? cb.error.localizedDescription : nil);
+}
+
+/* Opens its own texture of `format` over the surface's first plane, which
+ * only samples it, and reads it at each point as float4s, with a kernel it
+ * compiles itself. */
+- (void)readSurface:(IOSurface *)surface
+	     format:(NSUInteger)format
+	     points:(NSData *)points
+	      reply:(void (^)(NSData *texels, NSString *error))reply
+{
+	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+	IOSurfaceRef s = (__bridge IOSurfaceRef)surface;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)format
+										     width:IOSurfaceGetWidthOfPlane(s, 0)
+										    height:IOSurfaceGetHeightOfPlane(s, 0)
+										 mipmapped:NO];
+	d.usage = MTLTextureUsageShaderRead;
+	d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
+	id<MTLTexture> t = [device newTextureWithDescriptor:d iosurface:s plane:0];
+	NSError *error = nil;
+	id<MTLLibrary> library = [device newLibraryWithSource:@"#include <metal_stdlib>\n"
+							       "using namespace metal;\n"
+							       "kernel void read_points(texture2d<float, access::read> t [[texture(0)]],\n"
+							       "    constant uint2 *points [[buffer(0)]], device float4 *out [[buffer(1)]],\n"
+							       "    uint i [[thread_position_in_grid]]) { out[i] = t.read(points[i]); }\n"
+						      options:nil
+							error:&error];
+	id<MTLFunction> function = [library newFunctionWithName:@"read_points"];
+	id<MTLComputePipelineState> pipeline =
+		function ? [device newComputePipelineStateWithFunction:function error:&error] : nil;
+	if (!t || !pipeline) {
+		reply(nil, [NSString stringWithFormat:@"the service could not read the surface: %@",
+						      t ? error.localizedDescription : @"no texture"]);
+		return;
+	}
+	NSUInteger n = points.length / 8;
+	id<MTLBuffer> at = [device newBufferWithBytes:points.bytes length:points.length options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [device newBufferWithLength:n * 16 options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> cb = [[device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setComputePipelineState:pipeline];
+	[e setTexture:t atIndex:0];
+	[e setBuffer:at offset:0 atIndex:0];
+	[e setBuffer:out offset:0 atIndex:1];
+	[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(n, 1, 1)];
+	[e endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	reply([NSData dataWithBytes:out.contents length:n * 16], cb.error ? cb.error.localizedDescription : nil);
 }
 @end
 
@@ -5704,6 +5759,251 @@ static void host_share(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
 	[b endEncoding];
 	wait_for(read, c.spec);
 	put(c, @"props", 0, (uint32_t)event.signaledValue);
+}
+
+/* An RGB10A8_2P_XR10 surface ('b3a8'): 32-bit words of blue, green and red
+ * extended-range codes, then a plane of 8-bit alpha. */
+static IOSurfaceRef xr10_surface(size_t w, size_t height)
+{
+	size_t row = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, w * 4);
+	size_t alpha_row = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, w);
+	size_t alpha_offset = IOSurfaceAlignProperty(kIOSurfacePlaneOffset, row * height);
+	return make_surface(@{
+		(__bridge id)kIOSurfaceWidth : @(w), (__bridge id)kIOSurfaceHeight : @(height),
+		(__bridge id)kIOSurfacePixelFormat : @((uint32_t)'b3a8'),
+		(__bridge id)kIOSurfaceAllocSize : @(alpha_offset + alpha_row * height),
+		(__bridge id)kIOSurfacePlaneInfo : @[
+			@{(__bridge id)kIOSurfacePlaneWidth : @(w), (__bridge id)kIOSurfacePlaneHeight : @(height),
+			  (__bridge id)kIOSurfacePlaneBytesPerElement : @4, (__bridge id)kIOSurfacePlaneBytesPerRow : @(row),
+			  (__bridge id)kIOSurfacePlaneOffset : @0, (__bridge id)kIOSurfacePlaneSize : @(row * height)},
+			@{(__bridge id)kIOSurfacePlaneWidth : @(w), (__bridge id)kIOSurfacePlaneHeight : @(height),
+			  (__bridge id)kIOSurfacePlaneBytesPerElement : @1, (__bridge id)kIOSurfacePlaneBytesPerRow : @(alpha_row),
+			  (__bridge id)kIOSurfacePlaneOffset : @(alpha_offset), (__bridge id)kIOSurfacePlaneSize : @(alpha_row * height)},
+		],
+	});
+}
+
+/* The points a readers case looks at, as (x, y) pairs. */
+static NSData *reader_points(NSDictionary *h)
+{
+	NSArray *points = h[@"points"];
+	NSMutableData *data = [NSMutableData dataWithLength:points.count * 8];
+	uint32_t *at = data.mutableBytes;
+	for (NSUInteger i = 0; i < points.count; i++) {
+		at[i * 2] = (uint32_t)[points[i][0] unsignedIntValue];
+		at[i * 2 + 1] = (uint32_t)[points[i][1] unsignedIntValue];
+	}
+	return data;
+}
+
+/* Under a read lock, as a CPU reader of the surface: each point's color word
+ * (its codes, the two top bits cleared) and alpha byte, into `facts` from
+ * `first` on. */
+static NSUInteger xr10_cpu_facts(Case *c, IOSurfaceRef s, NSData *points, NSUInteger first)
+{
+	const uint32_t *at = points.bytes;
+	NSUInteger n = points.length / 8;
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *color = IOSurfaceGetBaseAddressOfPlane(s, 0), *alpha = IOSurfaceGetBaseAddressOfPlane(s, 1);
+	size_t row = IOSurfaceGetBytesPerRowOfPlane(s, 0), alpha_row = IOSurfaceGetBytesPerRowOfPlane(s, 1);
+	for (NSUInteger i = 0; i < n; i++) {
+		uint32_t word;
+		memcpy(&word, color + at[i * 2 + 1] * row + at[i * 2] * 4, 4);
+		put(c, @"facts", first + i * 2, word & 0x3fffffffu);
+		put(c, @"facts", first + i * 2 + 1, alpha[at[i * 2 + 1] * alpha_row + at[i * 2]]);
+	}
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	return first + n * 2;
+}
+
+/* Reads `t` at each point into `probes` from probe `first` on, in a command
+ * buffer of its own: bound to the kernel, or only through an argument buffer
+ * that names it by its resource ID, resident through a residency set, which
+ * names no texture to the command buffer. */
+static NSUInteger probe_points(Case *c, id<MTLCommandQueue> queue, id<MTLTexture> t, NSData *points, BOOL indirect,
+			       NSUInteger first)
+{
+	NSUInteger n = points.length / 8;
+	id<MTLBuffer> at = [c.device newBufferWithBytes:points.bytes length:points.length options:MTLResourceStorageModeShared];
+	id<MTLBuffer> probes = c.buffers[@"probes"];
+	if ((first + n) * 16 > probes.length)
+		@throw failure(@"no room for probes %lu to %lu", (unsigned long)first, (unsigned long)(first + n));
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	/* Kept until the command buffer completes. */
+	id residency = nil;
+	if (indirect) {
+		if (@available(macOS 15.0, *)) {
+			NSError *error = nil;
+			id<MTLResidencySet> set = [c.device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new]
+										    error:&error];
+			if (!set)
+				@throw failure(@"no residency set: %@", error.localizedDescription);
+			[set addAllocation:t];
+			[set commit];
+			[cb useResidencySet:set];
+			residency = set;
+		} else {
+			@throw [NSException exceptionWithName:@"CaseUnsupported" reason:@"residency sets need macOS 15" userInfo:nil];
+		}
+		id<MTLBuffer> table = [c.device newBufferWithLength:sizeof(MTLResourceID) options:MTLResourceStorageModeShared];
+		*(MTLResourceID *)table.contents = t.gpuResourceID;
+		[e setComputePipelineState:host_pipeline(c, @"probe_points_indirect")];
+		[e setBuffer:table offset:0 atIndex:2];
+	} else {
+		[e setComputePipelineState:host_pipeline(c, @"probe_points")];
+		[e setTexture:t atIndex:0];
+	}
+	[e setBuffer:at offset:0 atIndex:0];
+	[e setBuffer:probes offset:first * 16 atIndex:1];
+	[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(n, 1, 1)];
+	[e endEncoding];
+	wait_for(cb, c.spec);
+	residency = nil;
+	return first + n;
+}
+
+/* Draws `color` over the left half of `viewport` ([x, y, w, h]) of `t`, which
+ * the pass loads. */
+static void draw_rect(Case *c, id<MTLCommandQueue> queue, id<MTLRenderPipelineState> p, id<MTLTexture> t,
+		      NSArray *viewport, NSArray *color)
+{
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = t;
+	pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
+	MTLViewport v = {[viewport[0] doubleValue], [viewport[1] doubleValue], [viewport[2] doubleValue],
+			 [viewport[3] doubleValue], 0, 1};
+	float rgba[4] = {[color[0] floatValue], [color[1] floatValue], [color[2] floatValue], [color[3] floatValue]};
+	[e setRenderPipelineState:p];
+	[e setViewport:v];
+	[e setFragmentBytes:rgba length:sizeof rgba atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e endEncoding];
+	wait_for(cb, c.spec);
+}
+
+/* Each reader of an RGB10A8_2P_XR10 surface sees what was last written to
+ * it, whoever wrote it. A texture renders the surface, cleared whole and then
+ * a rectangle drawn over it; the CPU reads the planes under a lock after each
+ * (`facts`). Then its own kernel, a second texture over the surface that only
+ * samples it, and another process's texture read the points (`probes`). The
+ * CPU writes the first point's texel under a lock, and a kernel reads the
+ * texture only through an argument buffer and a residency set; a third
+ * texture draws another rectangle, and the argument buffer reads again, and
+ * the CPU once more. */
+static void host_xr10_readers(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
+{
+	size_t w = number(h, @"width", 1), height = number(h, @"height", 1);
+	NSData *points = reader_points(h);
+	NSError *error = nil;
+	id<MTLRenderPipelineState> p = host_render_pipeline(c, [MTLRenderPipelineDescriptor new], @"vert_left_half",
+							    @"frag_constant", 550, &error);
+	if (!p)
+		@throw failure(@"readers pipeline: %@", error.localizedDescription);
+	IOSurfaceRef s = xr10_surface(w, height);
+	MTLTextureUsage rendered = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> t = surface_texture(c, s, 0, 550, rendered);
+
+	/* The whole surface cleared: on a GPU of its own memory, an encode large
+	 * enough to go through device memory and a copy. */
+	NSArray *k = h[@"clear"];
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = t;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	pass.colorAttachments[0].clearColor =
+		MTLClearColorMake([k[0] doubleValue], [k[1] doubleValue], [k[2] doubleValue], [k[3] doubleValue]);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	[[cb renderCommandEncoderWithDescriptor:pass] endEncoding];
+	wait_for(cb, c.spec);
+	NSUInteger fact = xr10_cpu_facts(c, s, points, 0);
+	/* A small rectangle: an encode of the drawn area alone. */
+	draw_rect(c, queue, p, t, h[@"rect"], h[@"rect_color"]);
+	fact = xr10_cpu_facts(c, s, points, fact);
+
+	/* The GPU's readers. */
+	NSUInteger probe = probe_points(c, queue, t, points, NO, 0);
+	id<MTLTexture> sampled = surface_texture(c, s, 0, 550, MTLTextureUsageShaderRead);
+	probe = probe_points(c, queue, sampled, points, NO, probe);
+	NSXPCConnection *connection = [[NSXPCConnection alloc] initWithServiceName:share_service];
+	connection.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(Sharer)];
+	[connection resume];
+	__block NSString *problem = nil;
+	__block NSData *remote = nil;
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	id<Sharer> sharer = [connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
+		problem = e.localizedDescription ?: @"connection failed";
+		dispatch_semaphore_signal(done);
+	}];
+	[sharer readSurface:(__bridge IOSurface *)s
+		     format:550
+		     points:points
+		      reply:^(NSData *texels, NSString *error) {
+			      remote = texels;
+			      problem = error;
+			      dispatch_semaphore_signal(done);
+		      }];
+	long late = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+	[connection invalidate];
+	if (late)
+		@throw failure(@"the share service did not answer");
+	if (problem)
+		@throw failure(@"share service: %@", problem);
+	if (remote.length != points.length / 8 * 16)
+		@throw failure(@"the share service read %lu bytes", (unsigned long)remote.length);
+	memcpy((uint8_t *)c.buffers[@"probes"].contents + probe * 16, remote.bytes, remote.length);
+	probe += points.length / 8;
+
+	/* The CPU writes the first point's texel. */
+	uint32_t word = (uint32_t)number(h, @"cpu_word", 0);
+	uint8_t alpha = (uint8_t)number(h, @"cpu_alpha", 0);
+	const uint32_t *at = points.bytes;
+	IOSurfaceLock(s, 0, NULL);
+	uint8_t *color = IOSurfaceGetBaseAddressOfPlane(s, 0), *alphas = IOSurfaceGetBaseAddressOfPlane(s, 1);
+	memcpy(color + at[1] * IOSurfaceGetBytesPerRowOfPlane(s, 0) + at[0] * 4, &word, 4);
+	alphas[at[1] * IOSurfaceGetBytesPerRowOfPlane(s, 1) + at[0]] = alpha;
+	IOSurfaceUnlock(s, 0, NULL);
+	probe = probe_points(c, queue, t, points, YES, probe);
+
+	/* Another texture over the surface draws a rectangle. */
+	id<MTLTexture> other = surface_texture(c, s, 0, 550, rendered);
+	draw_rect(c, queue, p, other, h[@"other_rect"], h[@"other_color"]);
+	probe_points(c, queue, t, points, YES, probe);
+	xr10_cpu_facts(c, s, points, fact);
+	CFRelease(s);
+}
+
+/* A large two-plane surface only sampled, which a GPU of its own memory keeps
+ * in device memory: the CPU fills both planes with one color and a kernel
+ * reads it bound; the CPU fills them with another and a kernel reads it only
+ * through an argument buffer and a residency set, then bound again. */
+static void host_two_plane_indirect(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
+{
+	size_t w = number(h, @"width", 1), height = number(h, @"height", 1);
+	NSData *points = reader_points(h);
+	IOSurfaceRef s = two_plane_surface(w, height, w, height, 1, '444f');
+	NSArray *fills = h[@"fills"];
+	void (^fill)(NSArray *) = ^(NSArray *bytes) {
+		IOSurfaceLock(s, 0, NULL);
+		for (size_t plane = 0; plane < 2; plane++) {
+			uint8_t *base = IOSurfaceGetBaseAddressOfPlane(s, plane);
+			size_t stride = IOSurfaceGetBytesPerRowOfPlane(s, plane);
+			for (size_t y = 0; y < height; y++)
+				for (size_t x = 0; x < w * (plane + 1); x++)
+					base[y * stride + x] = (uint8_t)[bytes[plane ? 1 + x % 2 : 0] unsignedIntValue];
+		}
+		IOSurfaceUnlock(s, 0, NULL);
+	};
+	fill(fills[0]);
+	id<MTLTexture> t = surface_texture(c, s, 0, (MTLPixelFormat)number(h, @"format", 0), MTLTextureUsageShaderRead);
+	NSUInteger probe = probe_points(c, queue, t, points, NO, 0);
+	fill(fills[1]);
+	probe = probe_points(c, queue, t, points, YES, probe);
+	probe_points(c, queue, t, points, NO, probe);
+	CFRelease(s);
 }
 
 /* An archive given a compute and a render pipeline's functions, written to
@@ -8146,6 +8446,8 @@ static void run_host(Case *c, id<MTLCommandQueue> queue, NSDictionary *spec)
 		@"two_plane" : [NSValue valueWithPointer:host_two_plane],
 		@"two_plane_render" : [NSValue valueWithPointer:host_two_plane_render],
 		@"two_plane_frames" : [NSValue valueWithPointer:host_two_plane_frames],
+		@"two_plane_indirect" : [NSValue valueWithPointer:host_two_plane_indirect],
+		@"xr10_readers" : [NSValue valueWithPointer:host_xr10_readers],
 		@"share" : [NSValue valueWithPointer:host_share],
 		@"archive" : [NSValue valueWithPointer:host_archive],
 		@"errors" : [NSValue valueWithPointer:host_errors],

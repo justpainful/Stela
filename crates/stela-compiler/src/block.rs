@@ -15,6 +15,7 @@ pub mod pauth_memory;
 mod pointer_authentication;
 pub mod profile;
 mod recovery;
+pub(crate) mod region;
 pub mod scalable;
 pub mod scalar;
 pub mod system;
@@ -229,6 +230,8 @@ pub struct CompiledBlock {
     /// The block runs its iterations inside itself (`x86_64::block`'s
     /// self-loops), for the engine's counts.
     pub self_loop: bool,
+    /// The block is a region (`block::region`), for the engine's counts.
+    pub region: bool,
     /// The code offsets of its cold code, start to end: the slow paths moved
     /// out of line and the paths placed behind the jumps over them, which
     /// `--profile`'s host samples tell apart (`PES WHERE`). `(0, 0)` with
@@ -245,6 +248,7 @@ impl CompiledBlock {
             direct_exits: alloc::vec::Vec::new(),
             fault_recovery: alloc::vec::Vec::new(),
             self_loop: false,
+            region: false,
             cold: (0, 0),
         }
     }
@@ -639,6 +643,7 @@ impl CompilationPlan {
                     target,
                     options.memory_checks(),
                     options.native_system(),
+                    parsed.region,
                 )
             } else {
                 (
@@ -652,6 +657,7 @@ impl CompilationPlan {
                     crate::x86_64::block::Shape {
                         self_loop: false,
                         cold: (0, 0),
+                        exits: None,
                     },
                 )
             };
@@ -664,13 +670,17 @@ impl CompilationPlan {
                     .unwrap_or(parsed.next_pc)
                     .0
             });
-            let direct_exits = crate::x86_64::block::successor_exits(
-                &native,
-                &parsed.instructions,
-                parsed.terminal.as_ref(),
-                parsed.next_pc,
-                linked,
-            );
+            // A region lays its exits out itself.
+            let direct_exits = match shape.exits {
+                Some(exits) => exits,
+                None => crate::x86_64::block::successor_exits(
+                    &native,
+                    &parsed.instructions,
+                    parsed.terminal.as_ref(),
+                    parsed.next_pc,
+                    linked,
+                ),
+            };
             // Code moved after its exits were emitted: each patch point
             // the engine may link is made patchable where it lies. Only
             // system mode links; other profiles keep the ordinary bytes,
@@ -684,6 +694,7 @@ impl CompilationPlan {
                 direct_exits,
                 fault_recovery,
                 self_loop: shape.self_loop,
+                region: parsed.region,
                 cold: shape.cold,
             });
         };

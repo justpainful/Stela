@@ -88,38 +88,40 @@ pub(super) fn capture_in_rax(code: &mut Code, borrow: bool) {
     asm.setcc(Cond::O, Rax);
 }
 
-/// Whether the NZCV `instructions[index]` leaves is dead: the next
-/// instruction that touches NZCV defines all four flags without reading
-/// them, and every instruction before it neither reads them, nor can fault,
-/// exit or leave the frame, which must hold the exact NZCV at each of those.
-/// Only register operations the regions also take as pure qualify, so a
-/// block's last instruction's NZCV is never dead: an exit follows.
-pub(super) fn dead_after(instructions: &[crate::aarch64::Instruction], index: usize) -> bool {
-    dead_from(instructions, index + 1)
-}
-
-/// Whether NZCV is dead at `instructions[start]` ([`dead_after`]).
+/// Whether NZCV is dead at `instructions[start]`: the next instruction
+/// that touches NZCV defines all four flags without reading them, and
+/// every instruction before it neither reads them, nor can fault, exit or
+/// leave the frame, which must hold the exact NZCV at each of those. Only
+/// register operations the regions also take as pure qualify, so NZCV is
+/// never dead past a block's last instruction: an exit follows.
 pub(super) fn dead_from(instructions: &[crate::aarch64::Instruction], start: usize) -> bool {
-    use crate::aarch64::Operation;
     for instruction in instructions.iter().skip(start) {
-        match instruction.operation {
-            Operation::AddSub { flags, .. }
-            | Operation::AddSubRegister { flags, .. }
-            | Operation::AddSubExtended { flags, .. }
-            | Operation::LogicalImmediate { flags, .. }
-            | Operation::LogicalRegister { flags, .. } => {
-                if flags {
-                    return true;
-                }
-            }
-            Operation::MoveWide { .. }
-            | Operation::Bitfield(_)
-            | Operation::PcRelative(_)
-            | Operation::Nop => {}
-            _ => return false,
+        match defines(&instruction.operation) {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return false,
         }
     }
     false
+}
+
+/// Whether `operation` defines all of NZCV without reading it, `Some(true)`,
+/// or neither touches NZCV nor can fault, exit or leave the frame,
+/// `Some(false)` ([`dead_from`]); `None` for anything else.
+pub(super) fn defines(operation: &crate::aarch64::Operation) -> Option<bool> {
+    use crate::aarch64::Operation;
+    match *operation {
+        Operation::AddSub { flags, .. }
+        | Operation::AddSubRegister { flags, .. }
+        | Operation::AddSubExtended { flags, .. }
+        | Operation::LogicalImmediate { flags, .. }
+        | Operation::LogicalRegister { flags, .. } => Some(flags),
+        Operation::MoveWide { .. }
+        | Operation::Bitfield(_)
+        | Operation::PcRelative(_)
+        | Operation::Nop => Some(false),
+        _ => None,
+    }
 }
 
 /// The range of `code` from `start` that its pinned capture ([`capture`])

@@ -394,6 +394,21 @@ impl Scanout for MirroredScanout {
         self.scanout.refresh_rates()
     }
 
+    /// A frame the GPU composes is not kept here: the mirror holds the
+    /// frames the CPU composes.
+    fn try_present_gpu(
+        &mut self,
+        layers: &[stela_soc::scanout::Layer],
+        damage: Option<Range<usize>>,
+        physical: &dyn Fn(u64) -> Option<u64>,
+    ) -> Result<stela_soc::scanout::GpuPresent> {
+        self.scanout.try_present_gpu(layers, damage, physical)
+    }
+
+    fn take_gpu_stats(&mut self) -> stela_soc::scanout::GpuStats {
+        self.scanout.take_gpu_stats()
+    }
+
     fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
         self.scanout.set_refresh(millihertz)
     }

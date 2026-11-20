@@ -35,7 +35,7 @@ fn extract_commits_shrd_without_a_result_move() {
     let system = BlockProfile::new(Features::SYSTEM_MODE);
     for (profile, new_code, old_bytes, new_bytes, new_count) in [
         (BlockProfile::ORDINARY, Code::new as fn() -> Code, 29, 26, 4),
-        (system, Code::pinned as fn() -> Code, 17, 5, 1),
+        (system, Code::pinned as fn() -> Code, 21, 12, 2),
     ] {
         let mut old = new_code();
         old_extract(&mut old, &operand, 63);

@@ -79,7 +79,10 @@ fn chain_dump() {
     use stela_compiler::block::ExitKind;
     let output = std::env::var("DENSITY_OUT").expect("DENSITY_OUT names the output");
     let mut text = String::new();
-    let (_, body) = chain::link(0x10_0000, chain::LINK_BYTES, 5, 7, 0x20_0000).expect("a link");
+    let gate = chain::LinkGate::for_target(stela_compiler::TargetCpu::detect());
+    let body = chain::link(0x10_0000, chain::LINK_BYTES, 5, 7, 0x20_0000, gate)
+        .expect("a link")
+        .body();
     text += &format!("link {}\n", hex_of(&body));
     let dispatcher = chain::lookup_dispatcher(0).expect("the probes");
     text += &format!("cell {}\n", hex_of(&dispatcher[..chain::PROBE_ENTRY]));

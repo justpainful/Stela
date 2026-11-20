@@ -208,7 +208,11 @@ pub enum Command {
         pipeline: Pipeline,
     },
     PushConstants(PushConstants),
+    /// One viewport, which most passes set: no allocation.
+    SetViewport(Viewport),
     SetViewports(Vec<Viewport>),
+    /// One scissor rectangle, as [`Self::SetViewport`].
+    SetScissor(Rect),
     SetScissors(Vec<Rect>),
     SetDepthBias {
         enable: bool,
@@ -414,6 +418,13 @@ pub enum Command {
     /// upload's address: a buffer copy into or out of a PVRTC texture, whose
     /// level holds its blocks in Morton order.
     ReorderBlocks {
+        arguments: u64,
+        count: u32,
+    },
+    /// The backend's compose kernel over `count` pixels, with a
+    /// [`ComposeArguments`](crate::metal::binding::ComposeArguments)
+    /// upload's address: display layers blended into a scanout buffer.
+    Compose {
         arguments: u64,
         count: u32,
     },

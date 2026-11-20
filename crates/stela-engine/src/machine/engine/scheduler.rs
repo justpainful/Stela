@@ -14,6 +14,15 @@ pub(super) const HOT_SAMPLES: u8 = 2;
 /// Exits whose cells promotion steps read once that the PE keeps before
 /// it starts over, so a count stays recent.
 const SAMPLED_EXITS: usize = 4096;
+/// Fetches at once after System exits ([`Machine::continues_directly`])
+/// between two full steps of the run loop: what reaches the PE without
+/// moving its interrupt epoch (mail left for its next read, a device's
+/// reset or start) waits at most this many native runs more.
+const DIRECT_RUNS: u32 = 8;
+
+/// What a step left for the native run it entered: PSTATE, the device
+/// lines and the timer deadline ([`Machine::continues_directly`]).
+type Stepped = (Pstate, Option<(Lines, u64, usize)>, Option<Option<u64>>);
 
 impl<H: Host, D: Devices> Machine<H, D> {
     /// Run until a stop. `budget` limits executed blocks (0 = unlimited).
@@ -73,6 +82,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // The host may have changed the devices between runs (`devices` is
         // theirs too): their lines are asked again.
         self.device_lines = None;
+        self.direct_next = false;
         loop {
             if self.statistics.blocks >= self.block_limit
                 || deadline
@@ -84,12 +94,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if let Some(hub) = &self.parallel {
                 hub.pass(self.current);
             }
+            if core::mem::take(&mut self.direct_next) {
+                self.direct_runs += 1;
+                // The trace's schedule and devices take no time.
+                let now = self.timing_start();
+                for point in [
+                    step_timing::PATH_SCHEDULE,
+                    step_timing::PATH_SCHEDULED,
+                    step_timing::PATH_DEVICES,
+                ] {
+                    self.trace_point(point, now);
+                }
+                if let Err(stop) = self
+                    .step_at_pc()
+                    .or_else(|stop| self.undefined_instead(stop))
+                {
+                    self.leave_run_loop();
+                    return stop;
+                }
+                continue;
+            }
+            self.direct_runs = 0;
             let started = self.timing_start();
+            self.trace_point(step_timing::PATH_SCHEDULE, started);
             let scheduled = match deadline {
                 Some(deadline) => self.schedule_with_deadline(Some(deadline)),
                 None => self.schedule(),
             };
-            self.timing_charge(step_timing::Phase::Schedule, started);
+            let scheduled_at = self.timing_charge(step_timing::Phase::Schedule, started);
+            self.trace_point(step_timing::PATH_SCHEDULED, scheduled_at);
             if let Err(stop) = scheduled
                 .and_then(|()| self.step())
                 .or_else(|stop| self.undefined_instead(stop))
@@ -106,6 +139,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // What this PE kept of shared counts, for the reports and the ring.
         self.flush_exits();
         self.flush_entered();
+        self.exit_trace.abandon(&mut self.system_exits.paths);
         // Out of the wait, a PE in WFE has guest work the host's work keeps
         // from it (`clock`); one waiting for an interrupt or off has none.
         if !self.waits_for_interrupt() && !self.processor_paused(self.current) {
@@ -154,13 +188,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let started = self.timing_start();
         self.poll_due_devices()?;
         let delivered = self.deliver_interrupts();
-        self.timing_charge(step_timing::Phase::Devices, started);
+        let devices_at = self.timing_charge(step_timing::Phase::Devices, started);
+        self.trace_point(step_timing::PATH_DEVICES, devices_at);
         if let Some(reason) = self.devices.take_reset() {
             return Err(Stop::Reset(reason));
         }
         if delivered {
             return Ok(());
         }
+        self.step_at_pc()
+    }
+
+    /// The step's checks of the instruction at the PC, then its fetch and
+    /// run: what follows the devices and interrupts.
+    fn step_at_pc(&mut self) -> Step {
         let pc = self.cpu.pc;
         let mode = self.debug_mode();
         // Active-pending software step comes before every other exception
@@ -195,7 +236,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let single = mode.breakpoints || mode.step || pacm;
         let fetching = self.timing_start();
         let fetched = self.fetch_block(pc, single);
-        self.timing_charge(step_timing::Phase::Fetch, fetching);
+        let fetched_at = self.timing_charge(step_timing::Phase::Fetch, fetching);
+        self.trace_point(step_timing::PATH_FETCHED, fetched_at);
         let fetched = fetched?;
         // Between blocks a broadcast does not wait for this PE
         // (`Hub::applied`): mail that came meanwhile is read first, and the
@@ -260,6 +302,63 @@ impl<H: Host, D: Devices> Machine<H, D> {
         step
     }
 
+    /// Whether the run loop may fetch at once after the System exit at
+    /// `next_pc` that just completed, skipping its schedule and its device
+    /// step, as native code chains on: the instruction completed plainly
+    /// (the PC at the next word, no exception), and PSTATE, the device
+    /// lines and the timer deadline are those the last full step found
+    /// (`stepped`), so its interrupt delivery would find what it found, until
+    /// the count where its lines may change by time alone (`lines_until`);
+    /// no other PE or device moved the interrupt epoch, and none of the
+    /// schedule's own sources holds work (mail on return, power changes or
+    /// code to forward, a wait, a pause, the time slice's end, a progress
+    /// mark, due DMA); and no debug check applies. At most [`DIRECT_RUNS`]
+    /// such fetches follow one full step.
+    pub(super) fn continues_directly(&mut self, next_pc: u64, stepped: Stepped) -> bool {
+        let (pstate, lines, timers) = stepped;
+        let now = Pstate {
+            btype: pstate.btype,
+            ..self.cpu.pstate
+        };
+        let lines_until = self.mirrors.lines_until;
+        if self.direct_runs >= DIRECT_RUNS
+            || self.cpu.pc != next_pc.wrapping_add(INSTRUCTION)
+            || now != pstate
+            || pstate.pacm
+            || pstate.il
+            || lines.is_none()
+            || self.device_lines != lines
+            || timers.is_none()
+            || self.timers != timers
+            || interrupts::native_timer_registers(&self.cpu) != self.timer_registers
+            || lines_until == 0
+            || self.waiting.is_some()
+            || self.mail_returned != 0
+            || !self.forwarded_power.is_empty()
+            || !self.deferred_code.is_empty()
+            || !self.breakpoints.is_empty()
+            || !self.traces.is_empty()
+            || self.native_failure.is_some()
+            || self.statistics.blocks >= self.slice_end
+            || self.processor_paused(self.current)
+            || self.clock.mark_due(self.cpu.retired)
+            || self.chain.interrupt_moved()
+        {
+            return false;
+        }
+        let mode = self.debug_mode();
+        if mode.breakpoints || mode.step {
+            return false;
+        }
+        let counter = self.host.counter();
+        (lines_until == u64::MAX || self.clock.below(lines_until, || counter))
+            && (self.peers.len() < 2 || counter < self.slice_deadline)
+            && self
+                .devices
+                .dma_deadline()
+                .is_none_or(|deadline| self.clock.below(deadline, || counter))
+    }
+
     /// Blocks the next native run may chain into: none past the time slice
     /// or the run's limit.
     /// Under step timing, tell the other PEs what this one does in its
@@ -305,11 +404,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
         anchors
     }
 
+    /// Probe the block table the board published last from this PE's next
+    /// native run: a growth's successor (`compilation::grow_table`), whose
+    /// predecessor goes once every PE passed its loop's top.
+    pub(super) fn refresh_table(&mut self) {
+        let (table, mask) = self.code.table.current();
+        if self.chain.table() != table {
+            self.chain.set_block_table(table, mask);
+        }
+    }
+
     /// Run compiled block `index` and the blocks it chains into, up to
     /// `budget` of them, and complete the last one's exit or fault.
     pub(super) fn execute(&mut self, index: usize, budget: u64) -> Step {
+        // What the step before found, for a fetch at once after a System
+        // exit that changes none of it.
+        let stepped: Stepped = (self.cpu.pstate, self.device_lines, self.timers);
         let (budget, sampled) = self.sampled_budget(budget);
         let entry = self.code.blocks[index].code;
+        self.refresh_table();
         self.finish_transition(budget);
         self.refresh_transition_contexts(budget);
         // Whether a transition may continue in this run, logged where
@@ -317,7 +430,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.mirrors.transitions.chain = self.transition_chain();
         self.chain
             .set_frames(self.frame_bound, self.code.blocks.epoch_address());
-        self.chain.begin(index, budget);
+        self.cpu.state.account = self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
         self.mirrors.monitor = u64::from(self.cpu.monitor.is_some());
@@ -334,7 +447,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // SAFETY: installed by this machine since the last discard, for the system-mode block ABI;
         // chained blocks and thunks too.
         let exit = unsafe { self.host.execute(entry, &mut self.cpu.state) };
+        self.finish_trace();
+        // The account native code kept in a host register: what its return
+        // put home, or what a fault's capture holds. The chain keeps it; the
+        // state's home is clear between native calls.
+        self.chain.finish(match &exit {
+            NativeExit::Exit { .. } => self.cpu.state.account,
+            NativeExit::Fault(fault) => {
+                stela_compiler::x86_64::pinned::settled_account(&fault.registers)
+            }
+        });
+        self.cpu.state.account = 0;
         self.set_doing(step_timing::BLOCKER_RETURNED);
+        // Native code switched no thread, woke no PE and spun on no event.
+        let quiet = self.mirrors.switches.len == 0
+            && self.mirrors.fast_ipi.wakes == 0
+            && self.mirrors.spin.completed | self.mirrors.spin.missed | self.mirrors.spin.held == 0;
         if self.mail_returned == 0
             && let Some(hub) = &self.parallel
             && hub.pending(self.current)
@@ -347,7 +475,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if self.mirrors.fast_ipi.wakes != 0 {
             self.take_fast_ipi_wakes();
         }
-        if self.mirrors.spin.completed | self.mirrors.spin.missed | self.mirrors.spin.held != 0 {
+        let spin = &self.mirrors.spin;
+        if spin.completed | spin.missed | spin.held | spin.streamed != 0 {
             self.take_event_spins();
         }
         let transitions = self.mirrors.transitions.take_counts();
@@ -374,7 +503,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.cpu.pstate.pan = !self.cpu.pstate.pan;
             self.sync_host_regime(step_timing::SyncSource::NativePan);
         }
-        let remaining = self.chain.budget().load(Ordering::Relaxed);
+        let exhausted = self.chain.exhausted();
         let (block, retired, hits, _) = self.chain.completed();
         let (cell_probes, sampled_cell) = self.chain.cell_probes();
         self.statistics.cell_probes += cell_probes;
@@ -386,11 +515,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.promote_hot_exits();
         }
         // A link spends a transfer and counts nothing else.
-        let chained = if remaining > budget {
-            budget
-        } else {
-            budget - remaining
-        };
+        let chained = self.chain.chained();
         let last = (block & u64::from(u32::MAX)) as usize;
         // A block another PE retired since this run entered it is still
         // in its slot: the slot is given again only after this PE's grace.
@@ -402,7 +527,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // A sampled run whose budget ran out was in `last` at a uniformly
         // chosen transfer (`step_timing::HotBlocks`).
         if sampled
-            && remaining > budget
+            && exhausted
             && let Some(block) = self.code.blocks.get(last)
         {
             let level = step_timing::Level::of(self.cpu.pstate.el, self.cpu.pstate.guarded);
@@ -454,10 +579,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         match exit {
             NativeExit::Exit { next_pc, kind } => {
                 let (kind, skipped) = ExitWord::split(kind);
+                // What a loop or region retired past the rows of its exit
+                // (`GuestState::loop_retired`): its direct exits move it
+                // themselves, an exit at an instruction leaves it here.
+                let iterations = core::mem::take(&mut self.cpu.state.loop_retired);
                 self.cpu.retired = self
                     .cpu
                     .retired
                     .wrapping_add(retired)
+                    .wrapping_add(iterations)
                     .wrapping_sub(u64::from(skipped));
                 if transitioned {
                     // The last block's instructions, which its exit counts,
@@ -475,13 +605,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if let Some(count) = self.statistics.exit_kinds.get_mut(kind as usize) {
                     *count += 1;
                 }
-                let probed = self.lookup_miss(last, next_pc, kind, remaining > budget);
+                let probed = self.lookup_miss(last, next_pc, kind, exhausted);
                 if let Some(miss) = probed {
                     self.statistics.lookup_misses[miss] += 1;
                 }
                 let mut slot = kind as usize;
                 if kind == ExitKind::System as u64 && self.step_timing.is_some() {
-                    let word = self.timed_system_word(last, next_pc);
+                    let word = self.traced_system_word(last, next_pc, returned);
                     if word == step_timing::DEVICE_SITE_KEY {
                         slot = step_timing::DEVICE_SITE_SLOT;
                     }
@@ -494,9 +624,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     // (`step_timing::numerical_key`, `pointer_key`).
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
-                let spent = remaining > budget;
+                let spent = exhausted;
+                let direct = quiet
+                    && !transitioned
+                    && kind == ExitKind::System as u64
+                    && !self.device_stub(last, next_pc);
                 self.set_doing(step_timing::exit_blocker(slot, self.timed_word));
                 let exited = self.exit(last, next_pc, kind);
+                self.trace_point_now(step_timing::PATH_SERVED);
+                if direct && exited.is_ok() && self.continues_directly(next_pc, stepped) {
+                    self.direct_next = true;
+                    if self.step_timing.is_some() {
+                        self.system_exits.paths.direct += 1;
+                    }
+                }
                 if exited.is_ok()
                     && let Some(miss) = self.branch_miss(last, next_pc, kind, spent, probed)
                 {
@@ -519,6 +660,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     }
                 }
                 self.timing_exit(slot, returned);
+                self.trace_point_now(step_timing::PATH_CLOSED);
                 self.set_doing(0);
                 exited
             }
@@ -696,12 +838,39 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         let code = Arc::clone(&self.code);
-        let block = &code.blocks[index];
-        let record = code.blocks.record(index);
-        let find = || unlinked(&code);
         // Another PE may link or detach it meanwhile: found again under the
         // lock, for a block still installed.
         let mut cache = code.cache_at(board::LockSite::Link);
+        self.link_held(&code, &mut cache, index, next_pc, word)
+    }
+
+    /// [`Self::link`]'s work under the board's lock, `cache` its hold of
+    /// `code`: the exit of block `index` to `next_pc` with `word`, found
+    /// again, linked if both blocks are indexed.
+    pub(super) fn link_held(
+        &mut self,
+        code: &board::Code,
+        cache: &mut board::Cache,
+        index: usize,
+        next_pc: u64,
+        word: ExitWord,
+    ) -> bool {
+        let block = &code.blocks[index];
+        let record = code.blocks.record(index);
+        let find = || {
+            block
+                .successors
+                .iter()
+                .enumerate()
+                .position(|(position, exit)| {
+                    !record.linked(position) && exit.target.0 == next_pc && exit.word() == word
+                })
+        };
+        if self.variants[block.variant.0 as usize].single
+            || self.traces.binary_search(&next_pc).is_ok()
+        {
+            return false;
+        }
         // Only an indexed block links out: a detach finds the sources of
         // its links among the indexed blocks of the target's page, so a
         // link from a block an IC IVAU forgot would outlive its target.
@@ -721,12 +890,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // compiled never takes again. The fetch of the target that
             // follows translates its page and links the exit
             // ([`Self::link_direct_exit`]).
-            if self.translated_entry(&cache, next_pc).is_none() {
+            if self.translated_entry(cache, next_pc).is_none() {
                 self.direct_exit = Some((index, record.incarnation(), next_pc, word));
                 return false;
             }
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, false) {
+            if self.link_through_cell(cache, point, next_pc, retired, word, 0, false) {
                 record.settle(position);
                 return true;
             }
@@ -744,31 +913,37 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let site = exit.site;
         let entry = code.blocks[target].code.0 as u64;
         // A slot's body runs in the block's own code, once: its patch
-        // point falls into it once it is written ([`chain::link`]).
+        // point becomes the body's start once the rest is written
+        // ([`chain::link`]).
         if exit.slot != 0 && !record.used(position) {
             let at = site - u64::from(exit.slot);
             let point = chain::slot_patch(at);
-            let Some((body, bytes)) =
-                chain::link(at, exit.slot.into(), retired, target as u32, entry)
-                    .filter(|_| chain::patchable(point))
-            else {
+            let Some(linking) = chain::link(
+                at,
+                exit.slot.into(),
+                retired,
+                target as u32,
+                entry,
+                chain::LinkGate::for_target(self.target),
+            )
+            .filter(|_| chain::patchable(point)) else {
                 return false;
             };
-            self.patch_native(NativeCode(body as usize), &bytes);
-            self.patch_point(NativeCode(point as usize), chain::NOP5);
+            self.patch_native(NativeCode(linking.rest_at as usize), &linking.rest);
+            self.patch_point(NativeCode(point as usize), linking.point);
             record.set_linked(position, true, true);
             self.statistics.links += 1;
             return true;
         }
         // Otherwise a thunk: from the slot's point, back to the exit when
-        // no transfer is allowed; or from the exit's own point, which has
-        // loaded the target, returning.
+        // no transfer is allowed; or from the exit's own point, back to its
+        // unlinked path, which loads the target and returns.
         let (point, fallback) = match exit.slot {
-            0 => (chain::direct_patch(site), chain::Fallback::Return(word)),
-            slot => (
-                chain::slot_patch(site - u64::from(slot)),
-                chain::Fallback::Jump(site),
-            ),
+            0 => {
+                let point = chain::direct_patch(site);
+                (point, chain::unlinked_return(point))
+            }
+            slot => (chain::slot_patch(site - u64::from(slot)), site),
         };
         if !chain::patchable(point) {
             return false;
@@ -783,7 +958,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         }
         let (Some(bytes), Some(jump)) = (
-            chain::thunk(at, retired, target as u32, entry, fallback),
+            chain::thunk(
+                at,
+                retired,
+                target as u32,
+                entry,
+                fallback,
+                chain::LinkGate::for_target(self.target),
+            ),
             chain::jump(point, at),
         ) else {
             return false;
@@ -823,23 +1005,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// page and 0b01 elsewhere. Blocks are compiled per guarded page, so
     /// the page's BTYPE is the block's.
     ///
-    /// The exit of a BRA* thunk, which just authenticated `target`, first
-    /// compares the target with it ([`chain::predicted_tail`]): an arm64e
-    /// auth stub's BRAA X16, X17 has one target, and most BRA* transfers are
-    /// at such sites, so an equal target takes a direct exit linked through
-    /// a cell, which a hot site turns into a direct jump into the target's
-    /// block ([`chain::stamped_branch_tail`]). The thunk's memo still
-    /// authenticates every transfer: only which block an authenticated
-    /// target enters is cached, and validated as every cell is. RETA* and
-    /// BLRA* sites mostly see several targets, where the compare would cost
-    /// a mispredicted branch at each predicted one: they keep the lookup.
+    /// The exit of a BR or BLR form first compares the target with the one
+    /// it just took ([`chain::predicted_tail`]): an equal target takes a
+    /// direct exit linked through a cell, which a hot site turns into a
+    /// direct jump into the target's block ([`chain::stamped_branch_tail`]),
+    /// and any other the lookup. Most sites have one target, and at a site
+    /// of several the compare's cost is less than the jump cache misses it
+    /// saves (`spread_transfer_costs`: two random targets a site, 40 TSC
+    /// ticks a transfer against the lookup's 75 at 16384 sites). A PAC
+    /// form's thunk still authenticates every transfer: only which block an
+    /// authenticated target enters is cached, and validated as every cell
+    /// is. Returns keep their paired tails.
+    ///
+    /// A predicted tail's miss first returns to the engine
+    /// ([`chain::open_predicted_tail`]): the first other target it meets
+    /// becomes the site's second, whose own predicted tail the miss then
+    /// jumps to, its miss the lookup ([`Self::link_second`]).
     pub(super) fn link_dynamic(&mut self, index: usize, btype: u8, target: u64) {
         // Decided on the board borrowed: nearly every such exit has its
         // dispatcher already, and a clone of the board's `Arc` would write
         // a count every PE's exits write.
+        let record = self.code.blocks.record(index);
+        if !record.dynamic_open() {
+            if record.second().is_some_and(|(_, first)| first != target) {
+                self.link_second(index, btype, target);
+            }
+            return;
+        }
         let (point, kind, retired, predicted) = {
             let block = &self.code.blocks[index];
-            let record = self.code.blocks.record(index);
             let Some(site) = block.dynamic_site.filter(|_| {
                 !self.variants[block.variant.0 as usize].single && record.dynamic_open()
             }) else {
@@ -859,12 +1053,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return;
             }
             let retired = u32::from(block.instructions);
-            // Bit 11 selects the PAC forms of RET, BR and BLR, whose exit
-            // is their thunk's.
-            let predicted = matches!(
-                dynamic_branch(block.terminal),
-                Some((ExitKind::Indirect, _))
-            ) && block.terminal & 1 << 11 != 0;
+            let predicted = matches!(kind, ExitKind::Indirect | ExitKind::Call);
             (chain::dynamic_patch(site.get()), kind, retired, predicted)
         };
         let code = Arc::clone(&self.code);
@@ -881,11 +1070,45 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if predicted && self.translated_entry(&cache, target).is_none() {
             return;
         }
-        if (predicted
-            && self.redirect_through_prediction(&mut cache, point, retired, word, btype, target))
-            || self.redirect_through_lookup(&mut cache, point, retired, word, btype)
+        if predicted
+            && let Some(miss) = self
+                .redirect_through_prediction(&mut cache, point, retired, word, btype, target, true)
         {
+            record.open_second(miss, target);
             record.close_dynamic();
+        } else if self.redirect_through_lookup(&mut cache, point, retired, word, btype) {
+            record.close_dynamic();
+        }
+    }
+
+    /// Send the open miss of block `index`'s predicted tail to a predicted
+    /// tail of `target`, which just took it, as the site's second target,
+    /// whose own miss takes the lookup ([`Self::redirect_through_lookup`]);
+    /// to the lookup alone when that tail cannot be made. A target no
+    /// translation of this PE names yet leaves the miss open for the next.
+    fn link_second(&mut self, index: usize, btype: u8, target: u64) {
+        let Some((kind, _)) = dynamic_branch(self.code.blocks[index].terminal)
+            .or_else(|| transitions::transition_branch(self.code.blocks[index].terminal))
+        else {
+            return;
+        };
+        let retired = u32::from(self.code.blocks[index].instructions);
+        let code = Arc::clone(&self.code);
+        let record = code.blocks.record(index);
+        let mut cache = code.cache_at(board::LockSite::Dynamic);
+        if !record.live() || self.translated_entry(&cache, target).is_none() {
+            return;
+        }
+        let Some((miss, first)) = record.take_second() else {
+            return;
+        };
+        let word = kind.into();
+        let linked = self
+            .redirect_through_prediction(&mut cache, miss, retired, word, btype, target, false)
+            .is_some()
+            || self.redirect_through_lookup(&mut cache, miss, retired, word, btype);
+        if !linked {
+            record.open_second(miss, first);
         }
     }
 
@@ -894,8 +1117,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `btype`, to a [`chain::predicted_tail`] of its own for `target`: its
     /// direct exit to `target` is linked through a cell before the point
     /// jumps to the tail, and any other target takes the tail's lookup, as
-    /// [`Self::redirect_through_lookup`] would send it. False, with the
-    /// exit as it was, when the tail or the cell link cannot be made.
+    /// [`Self::redirect_through_lookup`] would send it, or for an `open`
+    /// tail its miss's dynamic exit ([`chain::open_predicted_tail`]). The
+    /// tail's miss's patch point; `None`, with the exit as it was, when the
+    /// tail or the cell link cannot be made.
+    #[allow(clippy::too_many_arguments)]
     fn redirect_through_prediction(
         &mut self,
         cache: &mut board::Cache,
@@ -904,27 +1130,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
         word: ExitWord,
         btype: u8,
         target: u64,
-    ) -> bool {
+        open: bool,
+    ) -> Option<u64> {
         if !chain::patchable(site) {
-            return false;
+            return None;
         }
-        let Some((probe, tail)) =
-            self.probe_and_tail(cache, site, btype, chain::PREDICTED_TAIL_BYTES)
-        else {
-            return false;
-        };
+        let (probe, tail) = self.probe_and_tail(cache, site, btype, chain::PREDICTED_TAIL_BYTES)?;
         let at = tail.0 as u64;
-        let (Some(code), Some(jump)) = (
-            chain::predicted_tail(
+        let code = match open {
+            true => chain::open_predicted_tail(at, GuestAddress(target), word),
+            false => chain::predicted_tail(
                 at,
                 GuestAddress(target),
                 word,
                 retired,
                 probe + chain::PROBE_ENTRY as u64,
             ),
-            chain::jump(site, at),
-        ) else {
-            return false;
+        };
+        let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
+            return None;
         };
         // Nothing reaches the tail before the point's jump: its direct exit
         // is linked first, so no predicted transfer returns to the engine.
@@ -932,12 +1156,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
         if !self.link_through_cell(cache, exit, target, retired, word, btype, false) {
-            return false;
+            return None;
         }
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.lookups += 1;
         self.statistics.predicted_tails += 1;
-        true
+        Some(chain::dynamic_patch(at + chain::PREDICTED_MISS as u64))
     }
 
     /// Send the exit of `word` whose patch point is at host address `site`
@@ -1081,7 +1305,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let stamped_cell = stamped.map(|(_, number)| number);
         let code = match stamped {
             Some((code, _)) => Some(code.to_vec()),
-            None => chain::cell_tail(at, cell, word, retired, entry).map(|code| code.to_vec()),
+            None => {
+                chain::cell_tail(at, cell, next_pc, word, retired, entry).map(|code| code.to_vec())
+            }
         };
         let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
             cache.targets.release_cells(site..=site);
@@ -1123,6 +1349,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// no entry yet waits for later samples; an exit whose block takes no
     /// transfer of its BTYPE keeps its cell tail, as does every hot exit
     /// while every stamped cell is held.
+    ///
+    /// A stamped cell whose entry changed since its tail was made (its
+    /// block went, and the cell took the entry of the block made again)
+    /// sends every transfer from the stamped tail on to the cell probe,
+    /// which no longer stamps it. Its samples give the exit a stamped tail
+    /// of the entry it holds now ([`Self::relink_stamped`]).
     pub(super) fn promote_hot_exits(&mut self) {
         let code = Arc::clone(&self.code);
         let mut cache = code.cache_at(board::LockSite::Link);
@@ -1132,7 +1364,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let Some((cell, link)) = cache.targets.sampled_link(address) else {
                 continue;
             };
-            if (cell as usize) < chain::STAMPED_CELLS {
+            let stamped = (cell as usize) < chain::STAMPED_CELLS;
+            if stamped && cache.targets.stamped_live(cell) {
                 continue;
             }
             let count = self.sampled_exits.entry(link.site).or_insert(0);
@@ -1150,6 +1383,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             };
             if link.btype != 0 && held.targets & 1 << link.btype == 0 {
+                continue;
+            }
+            if stamped {
+                self.relink_stamped(&mut cache, cell, link, held);
                 continue;
             }
             if !cache.targets.has_free_stamped() {
@@ -1175,6 +1412,56 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.statistics.cells_live = cache.targets.cells() as u64;
         self.statistics.cells_past = cache.targets.cells_past_stamped() as u64;
         self.statistics.cells_empty = cache.targets.cells_empty() as u64;
+    }
+
+    /// Give the hot exit of `link`, whose stamped cell `cell` holds `held`,
+    /// an entry other than the one its stamped tail jumps to, a stamped
+    /// tail of `held` in the same cell, its patch point's jump to it, and
+    /// then the cell's `live` word again
+    /// ([`chain::LookupTable::revive_stamped`]). The cell keeps its number,
+    /// so no other exit's tail names it; its stamps stay zero until the
+    /// word is set, after the jump, so a core still in the old tail misses
+    /// to the cell probe as it did. A tail that cannot be made leaves the
+    /// exit as it was.
+    fn relink_stamped(
+        &mut self,
+        cache: &mut board::Cache,
+        cell: u32,
+        link: chain::CellLink,
+        held: chain::LookupEntry,
+    ) {
+        if cache.targets.site_cell_number(link.site) != Some(cell) || !chain::patchable(link.site) {
+            return;
+        }
+        let Some((probe, tail)) =
+            self.probe_and_tail(cache, link.site, link.btype, chain::STAMPED_TAIL_BYTES)
+        else {
+            return;
+        };
+        let at = tail.0 as u64;
+        let (Some(code), Some(jump)) = (
+            chain::stamped_branch_tail(
+                at,
+                cache.targets.cell_address(cell),
+                cell,
+                link.pc,
+                link.word,
+                link.retired,
+                held.block,
+                held.entry,
+                probe + chain::STAMPING_PROBE_ENTRY as u64,
+                link.btype,
+            ),
+            chain::jump(link.site, at),
+        ) else {
+            return;
+        };
+        self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Stamped);
+        self.patch_point(NativeCode(link.site as usize), jump);
+        if cache.targets.revive_stamped(cell, held) {
+            self.statistics.stamped_tails += 1;
+        }
     }
 
     /// The probes of `btype` and room for a tail of `bytes` that calls

@@ -199,7 +199,8 @@ mod tests {
                 code.set_constant_time(dit);
                 emit(&mut code, &operand);
                 if pinned {
-                    assert_eq!(code, [0x41, 0x8b, 0xc5, 0x33, 0xc5, 0x49, 0x31, 0xc5]);
+                    // X17's slot takes X1's low half: mov [rdi + 136], ebp.
+                    assert_eq!(code, [0x89, 0xaf, 136, 0, 0, 0]);
                 } else {
                     assert_eq!(code, [0x8b, 0x87, 8, 0, 0, 0, 0x89, 0x87, 136, 0, 0, 0]);
                 }
@@ -232,11 +233,8 @@ mod tests {
                         ..operand
                     },
                 );
-                if pinned {
-                    assert_eq!(code, [0x41, 0x8b, 0xc5, 0x49, 0x31, 0xc5]);
-                } else {
-                    assert_eq!(code, [0xc7, 0x87, 136, 0, 0, 0, 0, 0, 0, 0]);
-                }
+                // X17's slot, pinned code or not: mov dword [rdi + 136], 0.
+                assert_eq!(code, [0xc7, 0x87, 136, 0, 0, 0, 0, 0, 0, 0]);
             }
         }
     }

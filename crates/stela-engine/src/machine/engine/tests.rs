@@ -130,8 +130,9 @@ pub(super) struct FakeHost {
     executables: Vec<crate::execution::platform::Mapping>,
     pub(super) patches: Vec<(usize, Vec<u8>)>,
     live_patch_start: usize,
-    /// The chaining state the next native run leaves, as thunks would.
-    pub(super) chained: Option<(*mut ChainControl, ChainControl)>,
+    /// The chaining state and account the next native run leaves, as
+    /// links would.
+    pub(super) chained: Option<(*mut ChainControl, ChainControl, chain::Account)>,
     /// What the next native blocks return, in order: unit tests do not
     /// run native code.
     pub(super) exits: Vec<NativeExit>,
@@ -182,6 +183,8 @@ pub(super) struct FakeHost {
     pub(super) host_work_at: Option<u64>,
     /// The code installs described ([`Host::profile_code`]).
     pub(super) described: Vec<Described>,
+    /// The idle marks of [`Host::profile_idle`], in order.
+    pub(super) idle_marks: Vec<bool>,
 }
 
 /// A described install: its code, length and regions.
@@ -326,14 +329,11 @@ impl Host for FakeHost {
             return exit;
         }
         assert!(!self.exits.is_empty(), "unit tests do not run native code");
-        if let Some((control, chained)) = self.chained.take() {
+        if let Some((control, chained, account)) = self.chained.take() {
+            state.account = account.0;
             // SAFETY: this fixture names the owner's live control
-            // outside native execution. Match native disjoint field writes;
-            // the budget is always accessed atomically, even in fixtures.
+            // outside native execution. Match native disjoint field writes.
             unsafe {
-                AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).budget))
-                    .store(chained.budget, Ordering::Relaxed);
-                core::ptr::addr_of_mut!((*control).retired).write(chained.retired);
                 core::ptr::addr_of_mut!((*control).block).write(chained.block);
                 core::ptr::addr_of_mut!((*control).contexts).write(chained.contexts);
                 core::ptr::addr_of_mut!((*control).table).write(chained.table);
@@ -394,6 +394,9 @@ impl Host for FakeHost {
         regions: &[(u32, step_timing::CodeRegion)],
     ) {
         self.described.push((code.0, bytes, regions.to_vec()));
+    }
+    fn profile_idle(&mut self, idle: bool) {
+        self.idle_marks.push(idle);
     }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
@@ -629,6 +632,7 @@ pub(super) fn board_on<D: Devices>(
         parts: Vec::new(),
         host_work_at: None,
         described: Vec::new(),
+        idle_marks: Vec::new(),
     };
     let profile = CpuProfile {
         name: "test",
@@ -1569,6 +1573,9 @@ fn host_breakpoints_end_blocks_and_stop_before_their_instruction() {
 fn system_address_pair_keeps_an_independent_add_entry_and_breakpoint() {
     let words = [0xb000_0000, 0x9100_2000, 0x17ff_ffff]; // adrp; add; b to ADD
     let mut grouped = machine(&words);
+    // A block, not the region its B back to the ADD makes, whose landing
+    // there keeps the pair apart.
+    grouped.set_regions(false);
     let Ok(Fetched::Block(head)) = grouped.fetch_block(BASE, false) else {
         panic!("address pair block");
     };
@@ -3002,11 +3009,22 @@ fn side_exits_retire_the_instructions_that_ran() {
     // Its body first, then the slot's patch point falls into it.
     let entry = machine.code.blocks[1].code.0 as u64;
     let slot = exit.site - exit.slot as u64;
-    let (body, code) = chain::link(slot, exit.slot.into(), 1, 1, entry).unwrap();
-    assert_eq!(machine.host.patches[0], (body as usize, code));
+    let linking = chain::link(
+        slot,
+        exit.slot.into(),
+        1,
+        1,
+        entry,
+        chain::LinkGate::for_target(machine.target),
+    )
+    .unwrap();
+    assert_eq!(
+        machine.host.patches[0],
+        (linking.rest_at as usize, linking.rest)
+    );
     assert_eq!(
         machine.host.patches[1],
-        (chain::slot_patch(slot) as usize, chain::NOP5.to_vec())
+        (chain::slot_patch(slot) as usize, linking.point.to_vec())
     );
 }
 
@@ -3044,10 +3062,18 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
         let site = from.code.0 + code.len() - chain::DIRECT_EXIT_BYTES;
         let slot = chain::link_slot(Some(from.pc), GuestAddress(target), ExitKind::Direct);
         let at = (site - slot) as u64;
-        let (body, expected) = chain::link(at, slot, 2, index, to.code.0 as u64).unwrap();
-        assert_eq!(patches[0], (body as usize, expected));
+        let linking = chain::link(
+            at,
+            slot,
+            2,
+            index,
+            to.code.0 as u64,
+            chain::LinkGate::for_target(machine.target),
+        )
+        .unwrap();
+        assert_eq!(patches[0], (linking.rest_at as usize, linking.rest));
         let point = chain::slot_patch(at) as usize;
-        assert_eq!(patches[1], (point, chain::NOP5.to_vec()));
+        assert_eq!(patches[1], (point, linking.point.to_vec()));
         let record = machine.code.blocks.record(1 - index as usize);
         assert!((0..from.successors.len()).all(|position| record.linked(position)));
     }
@@ -3057,12 +3083,11 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 2,
             block: 1,
             linked: 1,
             ..current
         },
+        chain::Account::new(CHAIN_LIMIT - 1).with_retired(2),
     ));
     machine.host.exits = vec![direct(base)];
     machine.step().unwrap();
@@ -3070,20 +3095,19 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     assert_eq!(machine.statistics.chained, 1);
     assert_eq!(machine.cpu.retired, retired + 4);
     assert_eq!(machine.cpu.pc, base);
-    // A run whose last thunk found no transfer left, wrapping the
-    // budget, chained the whole budget.
+    // A run whose last thunk found no transfer left, its account
+    // negative, chained the whole budget.
     let budget = machine.chain_budget();
     let (blocks, chained) = (machine.statistics.blocks, machine.statistics.chained);
     let current = machine.chain.snapshot();
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: u64::MAX,
-            retired: 2 * budget,
             block: 0,
             linked: budget,
             ..current
         },
+        chain::Account::spent(2 * budget),
     ));
     machine.host.exits = vec![direct(base + 12)];
     machine.step().unwrap();
@@ -3098,12 +3122,11 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 2,
             block: 1,
             linked: 1,
             ..current
         },
+        chain::Account::new(CHAIN_LIMIT - 1).with_retired(2),
     ));
     let offset = machine.code.blocks[1]
         .code
@@ -3332,6 +3355,92 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
         machine.cell_samples.push(address);
     }
     machine.promote_hot_exits();
+    assert_eq!(machine.host.patches.len(), patches + 2);
+}
+
+/// A stamped exit whose target block goes and is made again: its cell
+/// takes the new block's entry and stops being live, so the old stamped
+/// tail's transfers would all miss to the cell probe. Its samples give it
+/// a stamped tail of the new entry in the same cell, the site's jump to
+/// it, and the cell live again.
+#[test]
+fn a_stamped_exit_whose_block_was_made_again_gets_a_tail_of_the_new_one() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0; 1026];
+    words[0] = 0x1400_0400; // b .+0x1000
+    words[1024] = ADD;
+    words[1025] = RET;
+    let mut machine = machine(&words);
+    let base = machine.cpu.pc;
+    let far = base + 0x1000;
+    let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
+        next_pc,
+        kind: kind as u64,
+    };
+    machine.host.exits = vec![exit(far, ExitKind::Direct), exit(base, ExitKind::Return)];
+    machine.step().unwrap();
+    machine.step().unwrap();
+    let first = &machine.code.blocks[0];
+    let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
+    let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
+    let sample = |machine: &mut Machine<FakeHost, NoDevices>| {
+        let address = {
+            let cache = machine.code.cache();
+            let number = cache.targets.site_cell_number(site).expect("a cell");
+            cache.targets.cell_address(number)
+        };
+        for _ in 0..scheduler::HOT_SAMPLES {
+            machine.cell_samples.push(address);
+        }
+        machine.promote_hot_exits();
+    };
+    sample(&mut machine);
+    let number = {
+        let cache = machine.code.cache();
+        let number = cache.targets.site_cell_number(site).expect("a cell");
+        assert!((number as usize) < chain::STAMPED_CELLS, "{number}");
+        assert!(cache.targets.stamped_live(number));
+        number
+    };
+    // The block of `far` goes and is made again elsewhere.
+    let old = machine.code.blocks[1].code.0;
+    machine.evict_code(old..old + 1);
+    let Ok(Fetched::Block(again)) = machine.fetch_block(far, false) else {
+        panic!("a block of far");
+    };
+    let entry = machine.code.blocks[again].code.0 as u64;
+    assert_ne!(entry, old as u64);
+    {
+        let cache = machine.code.cache();
+        assert_eq!(cache.targets.site_cell_number(site), Some(number));
+        let held = cache.targets.site_cell(site).expect("a cell");
+        assert_eq!((held.pc, held.entry), (far, entry));
+        assert!(!cache.targets.stamped_live(number));
+    }
+    let patches = machine.host.patches.len();
+    sample(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches + 2);
+    let (tail, bytes) = machine.host.patches[patches].clone();
+    assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
+    let direct = (0..bytes.len() - 5).any(|at| {
+        bytes[at] == 0xe9 && {
+            let relative = i32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap());
+            (tail as u64 + at as u64 + 5).wrapping_add(relative as i64 as u64) == entry
+        }
+    });
+    assert!(direct, "no direct jump to the new block");
+    let jump = chain::jump(site, tail as u64).unwrap();
+    assert_eq!(
+        machine.host.patches[patches + 1],
+        (site as usize, jump.to_vec())
+    );
+    let cache = machine.code.cache();
+    assert_eq!(cache.targets.site_cell_number(site), Some(number));
+    assert!(cache.targets.stamped_live(number));
+    drop(cache);
+    // Live again: its samples relink it no more.
+    sample(&mut machine);
     assert_eq!(machine.host.patches.len(), patches + 2);
 }
 
@@ -3571,13 +3680,16 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
         let (tail, code) = &machine.host.patches[2 * index];
         let at = *tail as u64;
         let expected = if index == 0 {
-            let cell_at = u64::from_le_bytes(code[2..10].try_into().unwrap());
+            // MOVABS RAX with the target, then MOVABS R9 with the cell.
+            let target = u64::from_le_bytes(code[2..10].try_into().unwrap());
+            assert_eq!(target, cell.pc);
+            let cell_at = u64::from_le_bytes(code[12..20].try_into().unwrap());
             // SAFETY: the table keeps the cell at its address while its exit holds it.
             let raw = unsafe { *(cell_at as *const chain::LookupEntry) };
             let targets = raw.targets & chain::META_TARGETS;
             assert_eq!(chain::LookupEntry { targets, ..raw }, cell);
             let entry = probes + chain::CELL_PROBE_ENTRY as u64;
-            chain::cell_tail(at, cell_at, kind, ran, entry)
+            chain::cell_tail(at, cell_at, target, kind, ran, entry)
                 .unwrap()
                 .to_vec()
         } else {
@@ -4763,19 +4875,82 @@ fn sctlr_fields_outside_translation_keep_every_translation() {
     );
     assert_eq!(machine.translation_generation, generation);
     assert_eq!(machine.contexts(1, variant), contexts);
-    let last = machine.host.regimes[regimes..].last().unwrap();
-    assert_eq!(last.controls.sctlr & SCTLR_ENIA, 0);
+    // Nothing of the host's regime changes, so it is not synced.
+    assert_eq!(machine.host.regimes.len(), regimes);
     // M is translation's.
     machine.cpu.state.x[0] = sctlr ^ 1;
     machine.system_instruction(MSR_SCTLR_X0).unwrap();
     assert_ne!(machine.translation_generation, generation);
 }
 
-/// BLR and BR exits are redirected through lookup thunks that set their
-/// BTYPE: a BR through other than X16 or X17 sets 0b11 from a guarded
-/// page, whose blocks are compiled apart, and 0b01 elsewhere. A target
-/// in a guarded page accepts the BTYPEs its first instruction is
-/// compatible with.
+/// A BR's predicted tail misses to the engine until it meets another
+/// target, which becomes the site's second: the miss's patch point then
+/// jumps to a predicted tail of that target, whose own miss calls the
+/// table probe, and further targets stay in native code.
+#[test]
+fn indirect_branches_learn_a_second_target_at_their_first_miss() {
+    const BR_X0: u32 = 0xd61f_0000;
+    let mut words = vec![0; 0x801];
+    words[0] = BR_X0;
+    let mut machine = machine(&words);
+    let base = machine.cpu.pc;
+    let (first, second) = (base + 0x1000, base + 0x2000);
+    for target in [first, second] {
+        let Ok(Fetched::Block(_)) = machine.fetch_block(target, false) else {
+            panic!("the target's block");
+        };
+    }
+    let exit = |next_pc| NativeExit::Exit {
+        next_pc,
+        kind: ExitKind::Indirect as u64,
+    };
+    machine.host.exits = vec![exit(first)];
+    machine.cpu.pc = base;
+    machine.step().unwrap();
+    let index = machine.code.blocks.len() - 1;
+    assert_eq!(machine.code.blocks[index].pc, base);
+    let record = machine.code.blocks.record(index);
+    assert!(!record.dynamic_open());
+    let (miss, predicted) = record.second().expect("an open miss");
+    assert_eq!(predicted, first);
+    assert_eq!(machine.statistics.predicted_tails, 1);
+    // The first target again leaves the miss open; another takes it.
+    machine.host.exits = vec![exit(first), exit(second)];
+    for _ in 0..2 {
+        machine.cpu.pc = base;
+        machine.step().unwrap();
+    }
+    assert_eq!(machine.code.blocks.record(index).second(), None);
+    assert_eq!(machine.statistics.predicted_tails, 2);
+    let tail = machine
+        .host
+        .patches
+        .iter()
+        .rev()
+        .find(|(_, bytes)| bytes.len() == chain::PREDICTED_TAIL_BYTES)
+        .expect("the second predicted tail")
+        .0 as u64;
+    assert!(
+        machine
+            .host
+            .patches
+            .contains(&(miss as usize, chain::jump(miss, tail).unwrap().to_vec()))
+    );
+    let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
+    let cell = machine
+        .code
+        .cache()
+        .targets
+        .site_cell(exit)
+        .expect("its cell");
+    assert_eq!(cell.pc, second);
+}
+
+/// BLR and BR exits are redirected, once their target is translated,
+/// through tails that predict it and call the probes of their BTYPE: a BR
+/// through other than X16 or X17 sets 0b11 from a guarded page, whose
+/// blocks are compiled apart, and 0b01 elsewhere. A target in a guarded
+/// page accepts the BTYPEs its first instruction is compatible with.
 #[test]
 fn indirect_branches_go_through_lookups_that_check_the_target() {
     const BLR_X8: u32 = 0xd63f_0100;
@@ -4790,6 +4965,11 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     let mut machine = machine(&words);
     let base = machine.cpu.pc;
     let far = base + 0x1000;
+    // The target first: a branch to a target not yet translated leaves its
+    // exit open.
+    let Ok(Fetched::Block(target)) = machine.fetch_block(far, false) else {
+        panic!("the target's block");
+    };
     let exit = |kind: ExitKind| NativeExit::Exit {
         next_pc: far,
         kind: kind as u64,
@@ -4817,19 +4997,20 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     machine.cpu.pc = base + 8;
     machine.cpu.pstate.btype = 0;
     machine.step().unwrap();
-    assert_eq!(machine.code.blocks.len(), 4);
-    assert!(!machine.block_variant(2).guarded_page && machine.block_variant(3).guarded_page);
+    assert_eq!(machine.code.blocks.len(), 5);
+    assert!(!machine.block_variant(3).guarded_page && machine.block_variant(4).guarded_page);
     for (index, kind, btype) in [
-        (0, ExitKind::Call, 0b10),
-        (1, ExitKind::Indirect, 0b01),
+        (1, ExitKind::Call, 0b10),
         (2, ExitKind::Indirect, 0b01),
-        (3, ExitKind::Indirect, 0b11),
+        (3, ExitKind::Indirect, 0b01),
+        (4, ExitKind::Indirect, 0b11),
     ] {
         let dispatcher = chain::lookup_dispatcher(btype).unwrap();
         assert!(machine.host.installed.contains(&dispatcher), "{kind:?}");
         assert!(!machine.code.blocks.record(index).dynamic_open(), "{index}");
     }
     assert_eq!(machine.statistics.lookups, 4);
+    assert_eq!(machine.statistics.predicted_tails, 4);
     machine.fetch[page].as_mut().unwrap().guarded = false;
     // The target outside a guarded page accepts every BTYPE; in one, the
     // BTYPEs BTI c is compatible with.
@@ -4839,7 +5020,7 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
         kind: ExitKind::Fallthrough as u64,
     }];
     machine.step().unwrap();
-    let target = machine.code.blocks.len() - 1;
+    assert_eq!(machine.code.blocks.len(), 5);
     assert_eq!(machine.code.blocks[target].pc, far);
     assert_eq!(
         machine
@@ -4888,17 +5069,17 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 1,
             block: 0b10 << chain::BLOCK_BTYPE_SHIFT | target as u64,
             linked: 1,
             ..current
         },
+        chain::Account::new(CHAIN_LIMIT - 1).with_retired(1),
     ));
+    // From the block the step at the base enters, the BLR's.
     let offset = machine.code.blocks[target]
         .code
         .0
-        .wrapping_sub(machine.code.blocks[0].code.0);
+        .wrapping_sub(machine.code.blocks[1].code.0);
     machine.host.exits = vec![NativeExit::Fault(NativeFault {
         origin: crate::machine::NativeFaultOrigin::Exception,
         trap: 14,
@@ -7437,12 +7618,12 @@ fn a_wait_counts_its_host_halt_apart_from_its_poll() {
     assert!((300..400).contains(&spun), "{statistics:?}");
 }
 
-/// A RETAB's PAC thunk ends its completion with the exit to the target
-/// in RAX, which the first return through it redirects into a lookup.
-/// Neither the check failures after a block's last exit nor a side exit
-/// that leaves only the PAC terminal unrun hides that exit from its thunk.
+/// A RETAB authenticated in line ends its block's code with RET's exit to
+/// the target in RAX, its dynamic site, and no PAC thunk. Neither the
+/// check failures after a block's last exit nor a side exit before the
+/// RETAB hides that exit.
 #[test]
-fn what_follows_a_pac_exit_keeps_its_thunk() {
+fn what_follows_a_pac_return_keeps_its_dynamic_site() {
     const LOAD: u32 = 0xf940_0020; // ldr x0,[x1]
     const BRANCH: u32 = 0xb400_0080; // cbz x0,.+16
     const RETAB: u32 = 0xd65f_0fff;
@@ -7462,7 +7643,17 @@ fn what_follows_a_pac_exit_keeps_its_thunk() {
             SERVICE as usize as u64,
             pointer::native_cipher(machine.target),
         );
-        assert!(machine.host.installed.contains(&thunk.code), "{words:x?}");
+        assert!(!machine.host.installed.contains(&thunk.code), "{words:x?}");
+        let block = &machine.code.blocks[0];
+        let code = &machine.host.installed[block.code.0 / NATIVE_CODE_STRIDE - 1];
+        let site = block.dynamic_site.expect("the RET exit's site").get() as usize;
+        assert!(
+            chain::is_dynamic_exit(
+                &code[site - block.code.0..][..chain::DYNAMIC_EXIT_BYTES],
+                ExitKind::Return
+            ),
+            "{words:x?}"
+        );
     }
 }
 
@@ -7476,22 +7667,9 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         kind: ExitKind::Return as u64,
     }];
     machine.step().unwrap();
-    let thunk = x86_64_pointer::thunk(
-        x86_64_pointer::Form::of(block::PointerAuthenticationOperation::ReturnIbSp).unwrap(),
-        GuestAddress(base),
-        TAGS,
-        SERVICE as usize as u64,
-        pointer::native_cipher(machine.target),
-    );
-    let at = machine
-        .host
-        .installed
-        .iter()
-        .position(|code| *code == thunk.code)
-        .unwrap()
-        + 1;
-    let at = at * NATIVE_CODE_STRIDE;
-    let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
+    // The block authenticates in line and ends with RET's exit.
+    let site = machine.code.blocks[0].dynamic_site.expect("a dynamic site");
+    let site = chain::dynamic_patch(site.get());
     // The probes, then the RET's own tail, which takes its call's paired
     // frame with the authenticated target or calls the table probe.
     let installed = machine.host.installed.len();
@@ -7520,13 +7698,13 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     assert!(!machine.code.blocks.record(0).dynamic_open());
 }
 
-/// The first branch through a BRAA X16, X17's PAC thunk to a target this
-/// PE translates gives its exit a tail of its own that predicts the
-/// authenticated target: its direct exit to it is linked through a cell,
+/// The first branch through a BRAA X16, X17 authenticated in line to a
+/// target this PE translates gives its exit a tail of its own that
+/// predicts the authenticated target: its direct exit to it is linked through a cell,
 /// which starts with the target's entry, with the probes of the branch's
-/// BTYPE, before the exit jumps to the tail; any other target takes the
-/// table probe, as a lookup tail sends it. A branch before the target's
-/// first fetch leaves the exit open.
+/// BTYPE, before the exit jumps to the tail; any other target returns to
+/// the engine, which makes it the site's second. A branch before the
+/// target's first fetch leaves the exit open.
 #[test]
 fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
@@ -7551,28 +7729,9 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     assert_eq!(machine.statistics.predicted_tails, 0);
     machine.step().unwrap();
     machine.step().unwrap();
-    let thunk = x86_64_pointer::thunk(
-        x86_64_pointer::Form::of(block::PointerAuthenticationOperation::Branch {
-            key: block::PointerAuthenticationKey::Ia,
-            target: 16,
-            modifier: block::PointerAuthenticationModifier::Register(17),
-            link: false,
-        })
-        .unwrap(),
-        GuestAddress(base),
-        TAGS,
-        SERVICE as usize as u64,
-        pointer::native_cipher(machine.target),
-    );
-    let at = machine
-        .host
-        .installed
-        .iter()
-        .position(|code| *code == thunk.code)
-        .unwrap()
-        + 1;
-    let at = at * NATIVE_CODE_STRIDE;
-    let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
+    // The block authenticates in line and ends with BR's exit.
+    let site = machine.code.blocks[0].dynamic_site.expect("a dynamic site");
+    let site = chain::dynamic_patch(site.get());
     // The probes of BTYPE 0b01, the predicted tail, then its exit's cell
     // tail.
     let installed = machine.host.installed.len();
@@ -7580,17 +7739,10 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
         machine.host.installed[installed - 3],
         chain::lookup_dispatcher(0b01).unwrap()
     );
-    let probes = ((installed - 2) * NATIVE_CODE_STRIDE) as u64;
     let tail = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let cell_tail = (installed * NATIVE_CODE_STRIDE) as u64;
-    let predicted = chain::predicted_tail(
-        tail,
-        GuestAddress(target),
-        ExitKind::Indirect,
-        1,
-        probes + chain::PROBE_ENTRY as u64,
-    )
-    .unwrap();
+    let predicted =
+        chain::open_predicted_tail(tail, GuestAddress(target), ExitKind::Indirect).unwrap();
     let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
     let cell = machine
         .code
@@ -8150,6 +8302,64 @@ fn event_instructions_complete_natively_on_the_event_register() {
             value: machine.cpu.event_storage(),
         }
     );
+}
+
+/// Native WFEs sample the event stream the engine publishes from the PE's
+/// last sample: none before a sample or without a stream; the next edge
+/// and its period after one; what native code took becomes the PE's
+/// sample and stays published; the engine's own sample, a control write
+/// and a PE switch publish it again.
+#[test]
+fn native_waits_sample_the_event_stream_the_engine_publishes() {
+    use crate::machine::timer;
+    const STREAM: u64 = 1 << 2 | 3 << 4; // CNTHCTL_EL2.EVNTEN, EVNTI 3
+    let mut machine = machine_on(stela_contracts::Chip::AppleM2, &[]);
+    machine.cpu.pstate = Pstate::reset(2);
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::CNTHCTL_EL2, 0, STREAM);
+    machine.enter_events();
+    let none = register_read::EventStream::default();
+    assert_eq!(machine.mirrors.stream, none);
+    machine.event_sample = Some(99);
+    // Native code reads no count yet.
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream, none);
+    machine.clock.native((0, 1 << 32));
+    machine.event_sample = Some(100);
+    machine.enter_events();
+    let (next, period) = timer::sampled_event(&machine.cpu, 100).unwrap();
+    let period = period.unwrap();
+    let published = register_read::EventStream {
+        next,
+        period,
+        sampled: 100,
+    };
+    assert_eq!(machine.mirrors.stream, published);
+    // Native code took the edge at `next` at count next + 1.
+    machine.mirrors.stream = register_read::EventStream {
+        next: next + period,
+        sampled: next + 1,
+        ..published
+    };
+    machine.mirrors.spin.streamed = 1;
+    machine.take_event_spins();
+    assert_eq!(machine.event_sample, Some(next + 1));
+    let moved = machine.mirrors.stream;
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream, moved);
+    // The engine's own sample.
+    machine.sample_events(next + 3 * period);
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream.sampled, next + 3 * period);
+    let (again, _) = timer::sampled_event(&machine.cpu, next + 3 * period).unwrap();
+    assert_eq!(machine.mirrors.stream.next, again);
+    // A control write that ends the stream.
+    machine.cpu.registers.set(SystemRegister::CNTHCTL_EL2, 0, 0);
+    machine.derived_changed();
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream, none);
 }
 
 /// CLREX completes natively on the frame's monitor while the engine holds
@@ -10174,4 +10384,79 @@ fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {
     };
     assert!(during(1) < u64::MAX / 2, "a kernel lock may be held");
     assert_eq!(during(0), u64::MAX / 2);
+}
+
+/// What a TLBI of everything costs the engine (`tlb_maintained`, its host
+/// side aside) as launches issue it: eight processes' contexts, the ITLB
+/// fills since the last one and the leaves their fetches recorded. Run:
+/// `cargo test --release -p stela-engine --lib -- --ignored --nocapture
+/// whole_tlbi_benchmark`.
+#[test]
+#[ignore = "manual: opt-in"]
+fn whole_tlbi_benchmark() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
+    const ROUNDS: u64 = 2000;
+    let mut machine = machine(&[]);
+    let variant = machine.current_variant(false, false);
+    let el = machine.cpu.pstate.el;
+    let ttbr0 = machine.cpu.read(SystemRegister::TTBR0_EL1);
+    let mut measure = |fills: u64| {
+        let mut ns = 0u128;
+        for round in 0..ROUNDS {
+            for process in 0..8u64 {
+                machine.cpu.state.x[0] = ttbr0 ^ (process << 48) ^ (process << 14);
+                machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
+                let contexts = machine.contexts(el, variant);
+                for fill in 0..fills / 8 {
+                    let page =
+                        0x1_0000_0000 + (round * 131 + fill * 7 + process * 977) % 4096 * 0x4000;
+                    machine.log_fill(page, contexts[0]);
+                    machine.fetched_through(0, page, 0x4000, false);
+                    machine.log_fill(0xffff_fe00_0000_0000 + fill * 0x4000, contexts[1]);
+                }
+            }
+            let start = std::time::Instant::now();
+            machine.tlb_maintained(Reach::All, Everywhere::All, None);
+            ns += start.elapsed().as_nanos();
+        }
+        ns / u128::from(ROUNDS)
+    };
+    for fills in [0, 800, 4000] {
+        println!(
+            "TLBI VMALLE1 after {fills} ITLB fills: {} ns",
+            measure(fills)
+        );
+    }
+}
+
+/// The census of TLBIs of everything keeps the most frequent PCs, merges a
+/// PC it holds and orders them most first; a new PC takes the least
+/// frequent's place and count.
+#[test]
+fn whole_tlbi_sites_keep_the_most_frequent_pcs() {
+    let mut sites = WholeTlbiSites::default();
+    for (pc, count) in [
+        (0x10, 3),
+        (0x20, 1),
+        (0x30, 7),
+        (0x40, 2),
+        (0x50, 10),
+        (0x10, 1),
+    ] {
+        sites.add(pc, count);
+    }
+    assert_eq!(sites.0, [[0x50, 11], [0x30, 7], [0x10, 4], [0x40, 2]]);
+    let mut merged = WholeTlbiSites::default();
+    for [pc, count] in sites.0 {
+        merged.add(pc, count);
+    }
+    assert_eq!(merged, sites);
+    // Many single TLBIs at new PCs do not hide one PC that issued more.
+    let mut sites = WholeTlbiSites::default();
+    for round in 0..1000u64 {
+        sites.add(0x1000, 1);
+        sites.add(0x2000 + round, 1);
+    }
+    assert_eq!(sites.0[0][0], 0x1000);
 }

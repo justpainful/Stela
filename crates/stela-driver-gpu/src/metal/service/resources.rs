@@ -498,7 +498,7 @@ fn texture_response<B: Backend, C: Compiler>(
         first_mipmap_in_tail,
         tail_size,
         sparse: tail.is_some().into(),
-        reserved: 0,
+        copied: device.has_aligned_copy(texture).into(),
     })
 }
 

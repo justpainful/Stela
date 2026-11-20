@@ -1678,7 +1678,10 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
     assert!(
         line.contains(&format!(" gaps=1:{}/2:0/3:1/4-7:0/8+:0 ", pacing.gaps - 1))
             && line.contains(" burst_fps=")
-            && line.ends_with(" overlapped=1/1"),
+            && line.contains(" overlapped=1/1 ")
+            && line.ends_with(
+                " composed=gpu:0/cpu:0 gpu_frames=flipped:0/replaced:0 gpu_ms=0.00/0.00 gpu_copied_layers=0"
+            ),
         "{line}"
     );
     // A window in which nothing was submitted or shown is not reported.
@@ -2156,6 +2159,7 @@ fn a_present_that_moves_a_layer_whole_counts_as_moved() {
                 height: 32,
             },
             premultiplied: true,
+            id: 0,
         })
     };
     let shown = [layer(0, 0, 640), layer(10, 20, 32), None, None];
@@ -2670,330 +2674,6 @@ fn a_compose_outside_the_lock_presents_as_in_place() {
     }
     assert_eq!(shown[0].0.len(), 2);
     assert_eq!(shown[0], shown[1]);
-}
-
-/// What a [`GpuScreen`]'s host GPU does with a frame it is offered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GpuAnswer {
-    Decline,
-    Accept,
-    Refuse,
-}
-
-/// A [`GpuScreen`]'s record: the frames offered to its GPU (damage and
-/// layers), the frames the CPU presented, and how many polls the GPU
-/// takes to finish a frame.
-struct GpuState {
-    answer: GpuAnswer,
-    offered: Vec<(Option<core::ops::Range<usize>>, Vec<scanout::GpuLayer>)>,
-    cpu_frames: Vec<Vec<u8>>,
-    polls: u32,
-    done_after: u32,
-}
-
-/// A screen with a host GPU that declines, takes or refuses each frame as
-/// its state says; a frame it takes is done at its `done_after`th poll.
-#[derive(Clone)]
-struct GpuScreen(Rc<RefCell<GpuState>>);
-
-impl GpuScreen {
-    fn new(answer: GpuAnswer) -> Self {
-        Self(Rc::new(RefCell::new(GpuState {
-            answer,
-            offered: Vec::new(),
-            cpu_frames: Vec::new(),
-            polls: 0,
-            done_after: 3,
-        })))
-    }
-}
-
-impl Scanout for GpuScreen {
-    fn mode(&self) -> Mode {
-        MODE
-    }
-    fn present(&mut self, rows: &[u8]) -> Result<()> {
-        self.0.borrow_mut().cpu_frames.push(rows.to_vec());
-        Ok(())
-    }
-    fn try_present_layers(
-        &mut self,
-        frame: &scanout::GpuFrame<'_>,
-    ) -> Result<Option<scanout::GpuPending>> {
-        let mut state = self.0.borrow_mut();
-        assert_eq!(frame.mode, MODE);
-        state
-            .offered
-            .push((frame.damage.clone(), frame.layers.to_vec()));
-        match state.answer {
-            GpuAnswer::Decline => Ok(None),
-            GpuAnswer::Accept => {
-                state.polls = 0;
-                Ok(Some(scanout::GpuPending {
-                    ticket: state.offered.len() as u64,
-                }))
-            }
-            GpuAnswer::Refuse => Err(refuse!("the test GPU refuses the frame")),
-        }
-    }
-    fn gpu_pending_done(&mut self, pending: &scanout::GpuPending) -> bool {
-        let mut state = self.0.borrow_mut();
-        assert_eq!(pending.ticket, state.offered.len() as u64, "the last frame");
-        state.polls += 1;
-        state.polls >= state.done_after
-    }
-}
-
-/// Every callback queued, each answered at once: their tags and swap IDs.
-fn answered(methods: &mut Methods) -> Vec<([u8; 4], u32)> {
-    let mut made = Vec::new();
-    while let Some(callback) = methods.take_callback() {
-        let id = u32::from_le_bytes(callback.input[..4].try_into().unwrap());
-        made.push((callback.tag, id));
-        (callback.then)(methods, &[]).unwrap();
-    }
-    made
-}
-
-/// The frame `methods` shows composed whole on the CPU from `ram`.
-fn composed_whole(methods: &Methods, ram: &mut stela_contracts::dma::test_support::Ram) -> Vec<u8> {
-    use stela_contracts::dma::Memory;
-    let layers: Vec<scanout::Layer> = methods.shown.unwrap().iter().flatten().copied().collect();
-    scanout::compose(&layers, MODE, |dva, bytes| ram.read(GUEST + dva, bytes)).unwrap()
-}
-
-/// A sink whose GPU declines every frame is offered each one and has
-/// it composed on the CPU, showing the same frames and completing the
-/// same swaps as a sink without a GPU; nothing counts as GPU work.
-#[test]
-fn a_gpu_that_declines_leaves_the_cpu_compose_as_it_was() {
-    let run = |sink: Box<dyn Scanout>| {
-        let mut methods = Methods::new(sink, interface());
-        let mut ram = guest_ram();
-        let mut completed = Vec::new();
-        for (step, input) in compose_swaps(&mut methods).iter().enumerate() {
-            assert_eq!(returned(methods.call(*b"A407", input, 0xc)), [0; 12]);
-            let now = step as u64 * 1_000_000;
-            methods
-                .compose(now, DART_PAGE, resolve)
-                .expect("pages resolve")
-                .run(&mut ram);
-            assert!(methods.finish_compose(0).unwrap());
-            completed.extend(answered(&mut methods));
-        }
-        (completed, methods.pacing.clone())
-    };
-    let without = SharedScreen::default();
-    let without_frames = without.0.clone();
-    let (without_completed, _) = run(Box::new(without));
-    let declining = GpuScreen::new(GpuAnswer::Decline);
-    let state = declining.0.clone();
-    let (completed, pacing) = run(Box::new(declining));
-    let state = state.borrow();
-    assert_eq!(state.offered.len(), 2, "each frame is offered");
-    assert_eq!(state.cpu_frames, *without_frames.lock().unwrap());
-    assert_eq!(state.cpu_frames.len(), 2);
-    assert_eq!(completed, without_completed);
-    assert_eq!(
-        (pacing.gpu_frames, pacing.gpu_fallbacks, pacing.gpu.count),
-        (0, 0, 0)
-    );
-    assert_eq!(pacing.cpu_compose.count, 2);
-}
-
-/// A frame the host GPU takes is not composed on the CPU: the compose
-/// hands the GPU each layer's planes as merged guest physical runs, the
-/// swap completes only at the look that finds the GPU done, nothing else
-/// presents meanwhile, the CPU's kept rows are forgotten so its next
-/// present composes every row, and the pacing report counts the GPU frame
-/// and its time.
-#[test]
-fn a_frame_the_host_gpu_takes_completes_its_swap_only_once_the_gpu_is_done() {
-    let screen = GpuScreen::new(GpuAnswer::Decline);
-    let state = screen.0.clone();
-    let mut methods = Methods::new(Box::new(screen), interface());
-    let mut ram = guest_ram();
-    // The small layer, one pixel, at `x` on the second row.
-    let swap = |methods: &mut Methods, both: bool, x: u32| {
-        let id = start_swap(methods);
-        let layers: &[(usize, u32, u32, u64)] = if both {
-            &[(0, 4, 2, 0x1000), (1, 2, 2, 0x5000)]
-        } else {
-            &[(1, 2, 2, 0x5000)]
-        };
-        let mut input = fenced_submission(id, layers, 0, [7, 11, 0, 0]);
-        place(&mut input, 1, rect(0, 0, 1, 1), rect(x, 1, 1, 1));
-        assert_eq!(returned(methods.call(*b"A407", &input, 0xc)), [0; 12]);
-        id
-    };
-    // A frame the CPU composes, whose rows it keeps.
-    swap(&mut methods, true, 1);
-    methods
-        .compose(0, DART_PAGE, resolve)
-        .unwrap()
-        .run(&mut ram);
-    assert!(methods.finish_compose(0).unwrap());
-    assert!(methods.frame.keeps());
-    answered(&mut methods);
-
-    // The bottom surface changes and the GPU takes the next frame.
-    for byte in &mut ram.bytes[0x1000..0x1020] {
-        *byte = byte.wrapping_add(0x40);
-    }
-    state.borrow_mut().answer = GpuAnswer::Accept;
-    let shown = swap(&mut methods, true, 2);
-    let now = 1_000_000;
-    methods
-        .compose(now, DART_PAGE, resolve)
-        .unwrap()
-        .run(&mut ram);
-    assert_eq!(
-        state.borrow().cpu_frames.len(),
-        1,
-        "the CPU composed nothing"
-    );
-    {
-        let state = state.borrow();
-        let (damage, layers) = &state.offered[1];
-        assert_eq!(*damage, Some(0..2));
-        let plane = |address: u64, offset: u64, stride: u32| scanout::GpuPlane {
-            ranges: alloc::vec![stela_contracts::gate::MemoryRange {
-                address,
-                bytes: DART_PAGE,
-            }],
-            offset,
-            stride,
-        };
-        assert_eq!(layers.len(), 2);
-        assert_eq!(layers[0].planes, [plane(GUEST, 0x1000, 16)]);
-        assert_eq!(layers[1].planes, [plane(GUEST + 0x4000, 0x1000, 8)]);
-        assert_eq!(
-            layers[1].source,
-            scanout::Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1
-            }
-        );
-        assert_eq!(
-            layers[1].destination,
-            scanout::Rect {
-                x: 2,
-                y: 1,
-                width: 1,
-                height: 1
-            }
-        );
-        assert_eq!(
-            (layers[0].surface_id, layers[1].surface_id),
-            (Some(7), Some(11))
-        );
-        assert_eq!(layers[0].format, PixelFormat::Bgra8888);
-    }
-    // The GPU is done at its third poll: the first is the look that
-    // takes the compose back.
-    for poll in 1..3u64 {
-        let at = now + poll * 1000;
-        methods.observe(at);
-        assert!(!methods.finish_compose(0).unwrap(), "poll {poll}");
-        assert!(methods.composing());
-        // The next look comes within the GPU poll, not at the next vblank.
-        let poll_ticks = COUNTER_HZ * GPU_POLL_MICROS / 1_000_000;
-        assert!(
-            methods
-                .refresh_deadline()
-                .is_some_and(|due| due <= at + poll_ticks),
-            "poll {poll}: {:?}",
-            methods.refresh_deadline()
-        );
-        assert!(!methods.frame.keeps(), "the kept rows are forgotten");
-        assert!(
-            methods.take_callback().is_none(),
-            "no completion before the GPU is done"
-        );
-        assert!(methods.compose(at, DART_PAGE, resolve).is_none());
-        methods
-            .present(at, |_, _| panic!("no present while the GPU composes"))
-            .unwrap();
-    }
-    methods.observe(now + 3000);
-    assert!(methods.finish_compose(0).unwrap());
-    assert!(!methods.composing());
-    assert_eq!(answered(&mut methods), [(SWAP_COMPLETE, shown)]);
-    assert_eq!(
-        state.borrow().cpu_frames.len(),
-        1,
-        "the CPU composed nothing"
-    );
-
-    // The CPU composes the next frame, which moves only the small layer:
-    // every row, as the GPU's frame is not in its kept rows.
-    state.borrow_mut().answer = GpuAnswer::Decline;
-    swap(&mut methods, false, 3);
-    methods
-        .compose(2_000_000, DART_PAGE, resolve)
-        .unwrap()
-        .run(&mut ram);
-    assert!(methods.finish_compose(0).unwrap());
-    let whole = composed_whole(&methods, &mut ram);
-    assert_eq!(state.borrow().cpu_frames.last(), Some(&whole));
-
-    let pacing = &methods.pacing;
-    assert_eq!((pacing.gpu_frames, pacing.gpu_fallbacks), (1, 0));
-    let gpu = Latency {
-        count: 1,
-        total: 3000,
-        longest: 3000,
-    };
-    assert_eq!(pacing.gpu, gpu);
-    assert_eq!(pacing.cpu_compose.count, 2);
-    let text = Pacing {
-        ticks: PACING_WINDOW,
-        ..pacing.clone()
-    }
-    .to_string();
-    assert!(
-        text.contains(&format!(
-            " gpu_frames=1 gpu_fallbacks=0 gpu_ms={gpu} cpu_compose_ms={} gaps=",
-            pacing.cpu_compose
-        )),
-        "{text}"
-    );
-}
-
-/// A frame the host GPU refuses is composed on the CPU as it would have
-/// been, and counted; the refusal is reported once.
-#[test]
-fn a_frame_the_host_gpu_refuses_is_composed_on_the_cpu_and_counted() {
-    let screen = GpuScreen::new(GpuAnswer::Refuse);
-    let state = screen.0.clone();
-    let mut methods = Methods::new(Box::new(screen), interface());
-    let mut ram = guest_ram();
-    for (step, input) in compose_swaps(&mut methods).iter().enumerate() {
-        assert_eq!(returned(methods.call(*b"A407", input, 0xc)), [0; 12]);
-        let now = step as u64 * 1_000_000;
-        methods
-            .compose(now, DART_PAGE, resolve)
-            .unwrap()
-            .run(&mut ram);
-        assert!(methods.finish_compose(0).unwrap());
-        assert_eq!(answered(&mut methods)[0].0, SWAP_COMPLETE);
-        assert_eq!(
-            state.borrow().cpu_frames.last(),
-            Some(&composed_whole(&methods, &mut ram))
-        );
-    }
-    assert_eq!(state.borrow().offered.len(), 2);
-    let pacing = &methods.pacing;
-    assert_eq!((pacing.gpu_frames, pacing.gpu_fallbacks), (0, 2));
-    assert_eq!(pacing.cpu_compose.count, 2);
-    let reports = methods.take_unmodeled();
-    let refusals = reports
-        .iter()
-        .filter(|report| report.contains("the test GPU refuses the frame"))
-        .count();
-    assert_eq!(refusals, 1, "reported once: {reports:?}");
 }
 
 /// A compose that reaches a page the DART does not map is not made: the
@@ -3540,6 +3220,104 @@ fn the_ap_switches_the_monitor_between_the_rates_of_its_size() {
             "DCP macOS set the display to 144000 mHz (advertised timing 1)",
         ]
     );
+}
+
+/// Each offer's layer count and the physical address of its first pixel.
+type Offers = alloc::sync::Arc<std::sync::Mutex<Vec<(usize, Option<u64>)>>>;
+
+/// A screen whose GPU takes every frame, recording each offer, or declines
+/// with a reason.
+struct GpuScreen {
+    offers: Offers,
+    frames: alloc::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    declines: Option<&'static str>,
+}
+impl Scanout for GpuScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, rows: &[u8]) -> Result<()> {
+        self.frames.lock().unwrap().push(rows.to_vec());
+        Ok(())
+    }
+    fn try_present_gpu(
+        &mut self,
+        layers: &[scanout::Layer],
+        _: Option<core::ops::Range<usize>>,
+        physical: &dyn Fn(u64) -> Option<u64>,
+    ) -> Result<scanout::GpuPresent> {
+        self.offers
+            .lock()
+            .unwrap()
+            .push((layers.len(), physical(layers[0].surface.iova)));
+        Ok(match self.declines {
+            Some(reason) => scanout::GpuPresent::Declined(reason),
+            None => scanout::GpuPresent::Taken,
+        })
+    }
+}
+
+#[test]
+fn a_composed_present_goes_to_the_gpu_and_falls_back_to_the_cpu_reported_once() {
+    for declines in [None, Some("no GPU composition here")] {
+        let offers = Offers::default();
+        let frames = alloc::sync::Arc::default();
+        let screen = GpuScreen {
+            offers: alloc::sync::Arc::clone(&offers),
+            frames: alloc::sync::Arc::clone(&frames),
+            declines,
+        };
+        let mut methods = Methods::new(Box::new(screen), interface());
+        let mut ram = guest_ram();
+        let submits = compose_swaps(&mut methods);
+        let mut completed = 0;
+        for (step, input) in submits.iter().enumerate() {
+            assert_eq!(returned(methods.call(*b"A407", input, 0xc)), [0; 12]);
+            let compose = methods
+                .compose(step as u64 * 1_000_000, DART_PAGE, resolve)
+                .expect("pages resolve");
+            compose.run(&mut ram);
+            assert!(methods.finish_compose(0).unwrap());
+            while let Some(callback) = methods.take_callback() {
+                completed += usize::from(callback.tag == SWAP_COMPLETE);
+                (callback.then)(&mut methods, &[]).unwrap();
+            }
+        }
+        let offers = offers.lock().unwrap().clone();
+        assert_eq!(offers.len(), submits.len());
+        assert!(
+            offers
+                .iter()
+                .all(|&(layers, first)| layers >= 1 && first.is_some())
+        );
+        // Every swap completes either way; only the fallback composes rows.
+        assert_eq!(completed, submits.len());
+        let composed = (methods.pacing.gpu_composed, methods.pacing.cpu_composed);
+        let swaps = submits.len() as u32;
+        assert_eq!(
+            composed,
+            if declines.is_some() {
+                (0, swaps)
+            } else {
+                (swaps, 0)
+            }
+        );
+        let reports: Vec<_> = methods
+            .take_unmodeled()
+            .into_iter()
+            .filter(|line| line.contains("composes on the CPU"))
+            .collect();
+        match declines {
+            None => {
+                assert!(frames.lock().unwrap().is_empty());
+                assert!(reports.is_empty());
+            }
+            Some(reason) => {
+                assert!(!frames.lock().unwrap().is_empty());
+                assert_eq!(reports, [format!("IOMFB composes on the CPU: {reason}")]);
+            }
+        }
+    }
 }
 
 #[test]

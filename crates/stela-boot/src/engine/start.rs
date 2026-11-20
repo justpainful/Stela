@@ -339,6 +339,11 @@ fn start(handoff: u64) -> Started {
         Ok(options) => options,
         Err(error) => output::fatal(error),
     };
+    // A profile names the code holding the heap's blocks past the size
+    // classes, not only its largest.
+    if options.profile {
+        super::large_blocks::track_profile();
+    }
     // SAFETY: the loader handoff and all reservations stay pinned in the physmap.
     let native_processors = unsafe { crate::native_smp::validate(handoff, options.native_cores) }
         .unwrap_or_else(|error| output::fatal(error));
@@ -398,6 +403,15 @@ fn open_host(
         // region is the store's for the rest of the boot.
         .and_then(|file| translations::install(unsafe { bundle::contents_mut(file) }))
         .filter(|_| handoff.storage.present);
+    // The previous translator's pack, which a first boot refills from.
+    if let Some(file) = handoff.files[..handoff.file_count]
+        .iter()
+        .find(|file| file.name() == translations::PREVIOUS_FILE)
+    {
+        // SAFETY: the file is read here alone, once, and its region is the
+        // refill's for the rest of the boot.
+        translations::install_previous(unsafe { bundle::contents_mut(file) });
+    }
     // The Metal device's stored pipelines, before any GPU opens.
     #[cfg(feature = "nvk")]
     if let Some(file) = handoff.files[..handoff.file_count]
@@ -1455,7 +1469,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
                 "still"
             }
         ));
-        translations::share(handoff.heap.bytes as usize / parallel::SHARED_CODE_SHARE);
+        translations::share(handoff.kept_code as usize);
         parallel::spawn(
             &machine,
             &worker_bindings,

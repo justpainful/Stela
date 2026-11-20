@@ -32,6 +32,10 @@ pub struct Handoff {
     pub files: [File; MAX_FILES],
     pub file_count: usize,
     pub heap: Region,
+    /// The heap bytes for compiled code beside the code window: blocks the
+    /// PEs share as they compile and stored forms of blocks the window let
+    /// go (`host_memory::Sizes::kept`).
+    pub kept_code: u64,
     pub stack: Region,
     pub code: Region,
     /// Page-table frames: engine roots and shadow tables.

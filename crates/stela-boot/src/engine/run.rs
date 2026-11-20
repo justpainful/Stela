@@ -218,6 +218,112 @@ fn compression_report(compression: &[step_timing::Compression; 2], tsc_hz: u64) 
     ));
 }
 
+/// The keys `PES SYSTEM TOTAL` names.
+const SYSTEM_TOTAL_SHOWN: usize = 48;
+
+/// Add the beat's System exits (`exits`) to `total`, by key; at `due`, the
+/// end of a [`HOT_TOTAL_BEATS`] stretch, write `PES SYSTEM TOTAL
+/// count/ns_each/ms/closes`: the [`SYSTEM_TOTAL_SHOWN`] keys that took the
+/// most exit time over the stretch, each with its class
+/// (`step_timing::SystemClass`) and the exits of it that closed every mirror
+/// cell, then the rest summed, and start over. The
+/// beat's line names only its sixteen costliest keys, and a kernel spreads
+/// many exits over keys that each stay under that cut in every beat.
+fn system_total_report(
+    total: &mut BTreeMap<u32, step_timing::SystemExit>,
+    exits: &step_timing::SystemExits,
+    due: bool,
+    tsc_hz: u64,
+) {
+    for exit in exits.counted() {
+        let entry = total.entry(exit.key).or_insert(step_timing::SystemExit {
+            key: exit.key,
+            ..Default::default()
+        });
+        entry.count += exit.count;
+        entry.ticks += exit.ticks;
+        entry.closes += exit.closes;
+    }
+    if !due || total.is_empty() {
+        return;
+    }
+    let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+    let mut keys: Vec<step_timing::SystemExit> = total.values().copied().collect();
+    keys.sort_unstable_by_key(|exit| core::cmp::Reverse(exit.ticks));
+    let mut line = format!("PES SYSTEM TOTAL beats={HOT_TOTAL_BEATS} count/ns_each/ms/closes");
+    for exit in keys.iter().take(SYSTEM_TOTAL_SHOWN) {
+        let class =
+            step_timing::SystemClass::NAMES[step_timing::SystemClass::of(exit.key) as usize];
+        line.push_str(&format!(
+            " {}[{class}]={}/{}/{}/{}",
+            step_timing::system_key_name(exit.key),
+            exit.count,
+            nanos(exit.ticks) / u128::from(exit.count.max(1)),
+            nanos(exit.ticks) / 1_000_000,
+            exit.closes
+        ));
+    }
+    if let Some(rest) = rest(&keys, SYSTEM_TOTAL_SHOWN) {
+        line.push_str(&format!(
+            " rest={}/{}/{}/{}",
+            rest.count,
+            nanos(rest.ticks) / u128::from(rest.count.max(1)),
+            nanos(rest.ticks) / 1_000_000,
+            rest.closes
+        ));
+    }
+    output::arguments(format_args!("{line}\n"));
+    total.clear();
+}
+
+/// Add the beat's traced System exit round trips (`step_timing::ExitPaths`)
+/// to `total`, and at the end of a [`HOT_TOTAL_BEATS`] stretch write
+/// `PES EXIT PATH`: the exits traced and abandoned, the mean ns of each
+/// segment and their total, the traced services' host regime syncs and
+/// prediction isolations (per 100 traced exits, and ns each), the changes
+/// of derived state that closed every mirror cell with the open cells each
+/// closed, and the TCR writes that kept them with the open cells each kept;
+/// then start over.
+fn exit_path_report(
+    total: &mut step_timing::ExitPaths,
+    paths: &step_timing::ExitPaths,
+    due: bool,
+    tsc_hz: u64,
+) {
+    total.merge(paths);
+    if !due || *total == step_timing::ExitPaths::default() {
+        return;
+    }
+    let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+    let traced = u128::from(total.traced.max(1));
+    let mut line = format!(
+        "PES EXIT PATH beats={HOT_TOTAL_BEATS} traced={} abandoned={} ns",
+        total.traced, total.abandoned
+    );
+    let mut sum = 0;
+    for (index, (name, &ticks)) in step_timing::PATH_NAMES.iter().zip(&total.ticks).enumerate() {
+        let each = nanos(ticks) / traced;
+        sum += each;
+        let separator = if index == 0 { ' ' } else { ',' };
+        line.push_str(&format!("{separator}{name}={each}"));
+    }
+    let each = |ticks: u64, count: u64| nanos(ticks) / u128::from(count.max(1));
+    line.push_str(&format!(
+        ",total={sum} syncs={}/100@{} isolations={}/100@{} closes={} cells_each={} layouts={} kept_each={} direct={}",
+        u128::from(total.syncs) * 100 / traced,
+        each(total.sync_ticks, total.syncs),
+        u128::from(total.isolations) * 100 / traced,
+        each(total.isolation_ticks, total.isolations),
+        total.closes,
+        total.cells_closed / total.closes.max(1),
+        total.layouts,
+        total.cells_kept / total.layouts.max(1),
+        total.direct,
+    ));
+    output::arguments(format_args!("{line}\n"));
+    *total = step_timing::ExitPaths::default();
+}
+
 /// The exits of `exits` past the first `shown`, summed, if any.
 fn rest(exits: &[step_timing::SystemExit], shown: usize) -> Option<step_timing::SystemExit> {
     let rest = exits.get(shown..).filter(|rest| !rest.is_empty())?;
@@ -1481,6 +1587,13 @@ pub(super) struct Heartbeat {
     pub(super) dynamic: step_timing::DynamicSites,
     /// The hot blocks sampled since the first beat (`hot_total_report`).
     pub(super) hot_total: step_timing::HotBlocks,
+    /// Every System exit key's exits since the last `PES SYSTEM TOTAL`
+    /// line (`system_total_report`).
+    pub(super) system_total: BTreeMap<u32, step_timing::SystemExit>,
+    /// The traced System exit round trips of the current
+    /// [`HOT_TOTAL_BEATS`] stretch, for its `PES EXIT PATH` line
+    /// (`exit_path_report`).
+    pub(super) exit_paths: step_timing::ExitPaths,
 }
 
 /// The heartbeat's reports after its first part ([`Heartbeat::beat`]), in
@@ -1551,6 +1664,8 @@ impl Heartbeat {
             pmu: host::pmu::Seen::new(),
             dynamic: Default::default(),
             hot_total: Default::default(),
+            system_total: BTreeMap::new(),
+            exit_paths: step_timing::ExitPaths::default(),
         }
     }
 
@@ -1872,6 +1987,18 @@ impl Heartbeat {
             0 if profiling => {
                 let exits = parallel::system_exits(machine);
                 system_exits_report(&exits, tsc_hz);
+                system_total_report(
+                    &mut self.system_total,
+                    &exits,
+                    self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    tsc_hz,
+                );
+                exit_path_report(
+                    &mut self.exit_paths,
+                    &exits.paths,
+                    self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    tsc_hz,
+                );
                 barrier_waits_report(&exits.barriers, tsc_hz);
                 regime_syncs_report(&exits.regimes, tsc_hz);
                 device_exits_report(machine, &exits.devices, tsc_hz);
@@ -2048,10 +2175,12 @@ impl Heartbeat {
             // to it), compiled where it keys none (one instruction, a
             // device-site page), taken from the pack, taken from another
             // PE, rebased from an entry proven at another address during
-            // the boot.
+            // the boot; then, of the shared ones, blocks a waiting PE
+            // prepared ahead of any fetch.
             let mut store = String::from(concat!(
                 "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
                 "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
+                "/user_ahead/kernel_ahead",
             ));
             // Per PE: stamped tail hits and misses by cause, stamps written,
             // changed cells, table probe transfers (jump cache misses), stamped
@@ -2103,9 +2232,12 @@ impl Heartbeat {
             // before), the KiB of block code installed and evicted, and the
             // interval's share evicting. On a shared board one census
             // counts for the board: evicted by any PE, never on the board
-            // before, and never elsewhere.
+            // before, and never elsewhere. Then the KiB and pieces the PE
+            // took from the board's window: less in_kb, the link thunks,
+            // tails, dispatchers and other thunks beside the blocks, and
+            // their alignment.
             let mut installs = String::from(
-                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns",
+                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns/window_kb/pieces/gone_unfetched/gone_fetched_once/gone_fetched_again/again_1s/again_10s/again_60s/again_later",
             );
             let tsc_percent = |ticks: u64| u128::from(ticks) * 100 / u128::from(elapsed.max(1));
             // With `--profile`: the exits of every PE together, by kind, as
@@ -2123,7 +2255,7 @@ impl Heartbeat {
             // spins that missed, the WFEs an exclusive monitor kept from
             // spinning and the time spins took.
             let mut levels = String::from(
-                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns",
+                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns/wfe_stream/tval_state/tval_closed/tval_lines_dev/tval_lines_pmu/tval_lines_ipi/tval_high/tval_now/tval_native",
             );
             let mut totals = parallel::Counts::default();
             // Per PE in any boot: its shares of the interval idle, in guest
@@ -2318,9 +2450,12 @@ impl Heartbeat {
                     now.store_sources.as_flattened(),
                     before.store_sources.as_flattened(),
                 );
+                for (now, before) in now.ahead_installs.iter().zip(&before.ahead_installs) {
+                    store.push_str(&format!("/{}", now.saturating_sub(*before)));
+                }
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     cause.installs.saturating_sub(was.installs),
                     cause.thrash.saturating_sub(was.thrash),
                     cause.elsewhere.saturating_sub(was.elsewhere),
@@ -2335,7 +2470,15 @@ impl Heartbeat {
                     cause
                         .upper_instructions
                         .saturating_sub(was.upper_instructions),
+                    cause.window_bytes.saturating_sub(was.window_bytes) / 1024,
+                    cause.window_pieces.saturating_sub(was.window_pieces),
+                    cause.departed[0].saturating_sub(was.departed[0]),
+                    cause.departed[1].saturating_sub(was.departed[1]),
+                    cause.departed[2].saturating_sub(was.departed[2]),
                 ));
+                for (now, before) in cause.reinstall_ages.iter().zip(&was.reinstall_ages) {
+                    installs.push_str(&format!("/{}", now.saturating_sub(*before)));
+                }
                 phases.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.phases.iter().zip(before.phases).enumerate() {
                     if slot > 0 {
@@ -2345,7 +2488,7 @@ impl Heartbeat {
                 }
                 let level = now.levels.since(&before.levels);
                 levels.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     tsc_percent(level.ticks[step_timing::Level::User as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Kernel as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Guarded as usize]),
@@ -2361,6 +2504,15 @@ impl Heartbeat {
                     level.wfe_held,
                     u128::from(level.wfe_spin_counts) * 1_000_000_000
                         / u128::from(host::COUNTER_HZ),
+                    level.wfe_streamed,
+                    level.timer_value_exits[0],
+                    level.timer_value_exits[1],
+                    level.timer_value_exits[2],
+                    level.timer_value_exits[3],
+                    level.timer_value_exits[4],
+                    level.timer_value_exits[5],
+                    level.timer_value_exits[6],
+                    level.timer_value_exits[7],
                 ));
                 for (total, (now, before)) in
                     exits.iter_mut().zip(now.exits.iter().zip(before.exits))
@@ -2516,6 +2668,32 @@ impl Heartbeat {
             output::arguments(format_args!("{paths}\n"));
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
+            // Where TLBIs of everything came from, over the whole run: the
+            // guest PCs that issued the most, merged over the PEs.
+            let mut sites = stela_engine::machine::engine::WholeTlbiSites::default();
+            let mut times = [0u64; 3];
+            for counts in per_pe.iter() {
+                for [pc, count] in counts.whole_tlbi_sites.0 {
+                    sites.add(pc, count);
+                }
+                for (total, count) in times.iter_mut().zip(counts.whole_tlbi_times) {
+                    *total += count;
+                }
+            }
+            let all = sites.0.iter().map(|site| site[1]).sum::<u64>().max(1);
+            let [live, engine_ticks, host_ticks] = times;
+            let ns = |ticks: u64| {
+                (u128::from(ticks) * 1_000_000_000 / u128::from(host::COUNTER_HZ * all)) as u64
+            };
+            let mut line = format!(
+                "PES WHOLE TLBI live={live} engine_ns_each={} host_ns_each={} pc=count",
+                ns(engine_ticks),
+                ns(host_ticks)
+            );
+            for [pc, count] in sites.0.into_iter().filter(|site| site[1] != 0) {
+                line.push_str(&format!(" {pc:#x}={count}"));
+            }
+            output::arguments(format_args!("{line}\n"));
             output::arguments(format_args!("{transitions}\n"));
             let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
                 transition_misses[kind * 9..kind * 9 + 9]
@@ -2665,14 +2843,17 @@ fn board_code(
         ));
     }
     // Block table entries jump cache hits would add: taken, refused under
-    // the lock, refused without it, put off.
+    // the lock, refused without it, put off; then the table's entries now
+    // and its growths so far.
     let (targets, was_targets) = (now.targets, was.targets);
     let targets = format!(
-        " targets=inserted/raced/unindexed/deferred:{}/{}/{}/{}",
+        " targets=inserted/raced/unindexed/deferred/entries/growths:{}/{}/{}/{}/{}/{}",
         targets.inserted.saturating_sub(was_targets.inserted),
         targets.raced.saturating_sub(was_targets.raced),
         targets.unindexed.saturating_sub(was_targets.unindexed),
         targets.deferred.saturating_sub(was_targets.deferred),
+        targets.entries,
+        targets.growths,
     );
     // Installs: never on the board before; again after their block went
     // with its ring part, an IC IVAU, a part taken for want of a slot or
@@ -2775,7 +2956,13 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
         .class_live()
         .iter()
         .enumerate()
-        .map(|(class, &bytes)| format!("{}:{}M", 16 << class, bytes >> 20))
+        .map(|(class, &bytes)| {
+            format!(
+                "{}:{}M",
+                stela_boot_core::heap::class_bytes(class),
+                bytes >> 20
+            )
+        })
         .collect();
     line.push_str(&format!(" classes={}", classes.join(",")));
     // The size-class slabs, and the bytes of free blocks they keep.

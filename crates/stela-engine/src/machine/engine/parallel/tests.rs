@@ -129,11 +129,12 @@ fn duplicate_safe_attachment_refuses_without_replacing_the_live_owner() {
         first.enter_parallel(Arc::clone(&hub)),
         Err(ParallelAdmissionError::MachineAttached)
     );
-    first.chain.budget().store(17, Ordering::Relaxed);
+    first.chain.finish(17);
     hub.interrupt(0);
-    assert_eq!(first.chain.budget().load(Ordering::Relaxed), 17);
+    assert_eq!(first.chain.account().0, 17);
     let pending = first.chain.snapshot();
     assert_ne!(pending.interrupt_epoch, pending.observed_interrupt_epoch);
+    assert_eq!(pending.quiet, stela_compiler::x86_64::chain::Quiet(0));
     drop(first);
     second.enter_parallel(Arc::clone(&hub)).unwrap();
     assert!(second.attached.as_ref().unwrap().epoch > epoch);
@@ -152,10 +153,10 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
     let (resume_tx, resume_rx) = mpsc::channel();
     let foreign = Arc::clone(&hub);
     let reader = std::thread::spawn(move || {
-        let epoch = foreign.inboxes[0].chain.interrupt_epoch();
+        let chain = &foreign.inboxes[0].chain;
         ready_tx.send(()).unwrap();
         resume_rx.recv().unwrap();
-        epoch.fetch_add(1, Ordering::Release);
+        chain.notify();
     });
     ready_rx.recv().unwrap();
     drop(attached);
@@ -178,8 +179,8 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
     let snapshot = control.snapshot();
     assert_eq!(
         (
-            snapshot.budget,
-            snapshot.retired,
+            control.account().budget(),
+            control.account().retired(),
             snapshot.hits,
             snapshot.linked
         ),
@@ -190,6 +191,7 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
         (2, 21, [22, 23])
     );
     assert_ne!(snapshot.interrupt_epoch, snapshot.observed_interrupt_epoch);
+    assert_eq!(snapshot.quiet, stela_compiler::x86_64::chain::Quiet(0));
     assert_eq!(hub.inboxes[0].owner.load(Ordering::Acquire), next.epoch);
     drop(control);
     drop(next);
@@ -1217,17 +1219,23 @@ fn notification_after_drain_survives_native_budget_reset() {
     machine.read_mail().unwrap();
     let drained = machine.chain.snapshot();
     assert_eq!(drained.interrupt_epoch, drained.observed_interrupt_epoch);
+    assert_eq!(
+        drained.quiet,
+        stela_compiler::x86_64::chain::Quiet::default()
+    );
     // This is the old lost-notification window: the owner has drained,
     // then a peer posts before the owner initializes its next budget.
     hub.post(0, |mail| mail.event = true);
     machine.chain.begin(0, 4096);
     let entered = machine.chain.snapshot();
-    assert_eq!(entered.budget, 4096);
+    assert_eq!(machine.chain.account().budget(), 4096);
     assert_ne!(entered.interrupt_epoch, entered.observed_interrupt_epoch);
     assert_eq!(entered.observed_interrupt_epoch, drained.interrupt_epoch);
+    assert_eq!(entered.quiet, stela_compiler::x86_64::chain::Quiet(0));
     machine.read_mail().unwrap();
     let next = machine.chain.snapshot();
     assert_eq!(next.interrupt_epoch, next.observed_interrupt_epoch);
+    assert_eq!(next.quiet, stela_compiler::x86_64::chain::Quiet::default());
 }
 
 #[test]
@@ -1246,6 +1254,7 @@ fn epoch_exhaustion_is_sticky_across_drain_detach_and_reuse() {
     let exhausted = machine.chain.snapshot();
     assert_eq!(exhausted.interrupt_epoch, u64::MAX);
     assert_eq!(exhausted.observed_interrupt_epoch, u64::MAX - 1);
+    assert_eq!(exhausted.quiet, stela_compiler::x86_64::chain::Quiet(0));
     drop(machine);
     let (_, mut next) = Attached::new(&hub, 0, false).unwrap();
     next.initialize(11, 14, [12, 13], [0xffff, 0xfff]);
@@ -1254,6 +1263,7 @@ fn epoch_exhaustion_is_sticky_across_drain_detach_and_reuse() {
     let reused = next.snapshot();
     assert_eq!(reused.interrupt_epoch, u64::MAX);
     assert_eq!(reused.observed_interrupt_epoch, u64::MAX - 1);
+    assert_eq!(reused.quiet, stela_compiler::x86_64::chain::Quiet(0));
 }
 
 #[test]
@@ -1277,14 +1287,14 @@ fn mail_reaches_running_pes_and_kicks_only_a_sleeping_one() {
 #[test]
 fn a_broadcast_is_applied_once_every_running_pe_acknowledged_it() {
     let (hub, kicks) = hub(3);
-    let (attached, control) = Attached::new(&hub, 1, false).unwrap();
-    control.budget().store(4096, Ordering::Relaxed);
+    let (attached, mut control) = Attached::new(&hub, 1, false).unwrap();
+    control.begin(0, 4096);
     let mut posted = hub.broadcast(0, &[Maintenance::Code(None)]);
     assert_eq!(posted, [(1, 1), (2, 1)]);
     assert!(!hub.applied(&mut posted));
     // The running PE leaves native code at its next chained transfer.
     drop(attached);
-    assert_eq!(control.budget().load(Ordering::Relaxed), 4096);
+    assert_eq!(control.account().budget(), 4096);
     let interrupted = control.snapshot();
     assert_ne!(
         interrupted.interrupt_epoch,
@@ -1961,10 +1971,7 @@ fn the_fast_ipi_table_completes_a_request_through_the_hubs_words() {
     let entry = *table.target(0, 1).unwrap();
     assert_eq!(entry.lines, hub.inboxes[1].lines.as_ptr() as u64);
     assert_eq!(entry.sleeping, hub.inboxes[1].sleeping.as_ptr() as u64);
-    assert_eq!(
-        entry.interrupt,
-        hub.inboxes[1].chain.interrupt_epoch().as_ptr() as u64
-    );
+    assert_eq!(entry.interrupt, hub.inboxes[1].chain.control());
     assert_eq!(entry.pe, 1);
     let epoch = hub.inboxes[1].lines.load(Ordering::SeqCst);
     let interrupt = hub.inboxes[1]
@@ -2981,6 +2988,72 @@ fn passive_registers_are_read_without_the_devices_lock() {
     assert_eq!(worker.read_scalar(1, 0x40, 4, 0), ScalarRead::Served(Ok(3)));
     assert_eq!(worker.read_scalar(1, 0x48, 8, 0), ScalarRead::Served(Ok(3)));
     assert_eq!(home.with(|devices| devices.reads), 2);
+    // A word read without its cell is not kept for native code.
+    assert_eq!(
+        worker.read_scalar(1, 0x40, 8, 0),
+        ScalarRead::Served(Ok(11))
+    );
+    assert!(worker.take_plain_read().is_none());
+}
+
+/// A passive word served from its own cell is a plain read whose epoch is
+/// the cell: native code's read (`device_read_thunk`) holds exactly while
+/// the cell still has the value the engine read, at any count, and a write
+/// of another value ends it.
+#[test]
+fn passive_words_are_kept_for_native_reads_while_they_hold_their_value() {
+    use super::super::PassiveRegisters;
+    struct Cell(Arc<AtomicU64>);
+    impl PassiveRegisters for Cell {
+        fn read(&self, physical: u64, bytes: u8) -> Option<u64> {
+            self.word(physical, bytes)
+                .map(|word| word.load(Ordering::Acquire))
+        }
+        fn word(&self, physical: u64, bytes: u8) -> Option<Arc<AtomicU64>> {
+            (physical == 0x40 && bytes == 8).then(|| Arc::clone(&self.0))
+        }
+    }
+    #[derive(Default)]
+    struct Board {
+        cell: Option<Arc<Cell>>,
+    }
+    impl Devices for Board {
+        fn passive_registers(&self) -> Option<Arc<dyn PassiveRegisters>> {
+            self.cell
+                .as_ref()
+                .map(|cell| Arc::clone(cell) as Arc<dyn PassiveRegisters>)
+        }
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Ok(3)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+    }
+    let word = Arc::new(AtomicU64::new(9));
+    let cell = Arc::new(Cell(Arc::clone(&word)));
+    let (hub, _) = hub(2);
+    let home = SharedDevices::new(Board { cell: Some(cell) }, hub);
+    let mut worker = home.worker();
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 5), ScalarRead::Served(Ok(9)));
+    let plain = worker.take_plain_read().expect("kept");
+    assert!(Arc::ptr_eq(&plain.epoch, &word));
+    assert_eq!((plain.seen, plain.value, plain.until), (9, 9, u64::MAX));
+    // What the native read checks: the epoch word against what it saw.
+    assert_eq!(plain.epoch.load(Ordering::Acquire), plain.seen);
+    word.store(10, Ordering::Release);
+    assert_ne!(plain.epoch.load(Ordering::Acquire), plain.seen);
+    // The next read keeps the new value; another width keeps nothing.
+    assert_eq!(
+        worker.read_scalar(1, 0x40, 8, 5),
+        ScalarRead::Served(Ok(10))
+    );
+    assert_eq!(worker.take_plain_read().map(|plain| plain.value), Some(10));
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 5), ScalarRead::Served(Ok(3)));
+    assert!(worker.take_plain_read().is_none());
 }
 
 #[test]
@@ -3397,6 +3470,24 @@ fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
     hub.home.store(0, Ordering::Relaxed);
     wfe(&mut machine).unwrap();
     assert_eq!(machine.statistics.short_waits, 0);
+    // Under step timing the spin, and a pass's poll, are idle time; only
+    // under it.
+    assert!(machine.host.idle_marks.is_empty());
+    for home in [1, 0] {
+        let (hub, mut machine) = start(6);
+        hub.home.store(home, Ordering::Relaxed);
+        machine.set_step_timing(true);
+        wfe(&mut machine).unwrap();
+        let marks = &machine.host.idle_marks;
+        assert!(
+            !marks.is_empty() && marks.len() % 2 == 0,
+            "{home} {marks:?}"
+        );
+        assert!(
+            marks.chunks(2).all(|pair| pair == [true, false]),
+            "{home} {marks:?}"
+        );
+    }
 }
 
 /// A WFE that spins on its Exclusives monitor, as XNU's ticket waiters do,
@@ -4059,6 +4150,7 @@ fn engine_waits_open_native_event_spins_only_where_other_pes_run() {
         counts: 96,
         start: 7,
         turns: 9,
+        streamed: 4,
     };
     machine.take_event_spins();
     let levels = machine.step_timing().unwrap().levels;
@@ -4067,9 +4159,10 @@ fn engine_waits_open_native_event_spins_only_where_other_pes_run() {
             levels.wfe_spun,
             levels.wfe_spin_missed,
             levels.wfe_held,
-            levels.wfe_spin_counts
+            levels.wfe_spin_counts,
+            levels.wfe_streamed
         ],
-        [2, 3, 1, 96]
+        [2, 3, 1, 96, 4]
     );
     assert_eq!(machine.mirrors.spin, EventSpin::default());
 }

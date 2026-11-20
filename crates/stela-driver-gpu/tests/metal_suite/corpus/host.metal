@@ -101,6 +101,24 @@ kernel void surface_probe(texture2d<float, access::sample> t [[texture(0)]],
     probes[first + i] = t.read(at);
 }
 
+/* A texture's texels at points, bound to the kernel. */
+kernel void probe_points(texture2d<float, access::read> t [[texture(0)]], constant uint2 *points [[buffer(0)]],
+                         device float4 *out [[buffer(1)]], uint i [[thread_position_in_grid]])
+{
+    out[i] = t.read(points[i]);
+}
+
+struct Probed {
+    texture2d<float, access::read> t;
+};
+
+/* The same through an argument buffer that names the texture by resource ID. */
+kernel void probe_points_indirect(constant uint2 *points [[buffer(0)]], device float4 *out [[buffer(1)]],
+                                  constant Probed &probed [[buffer(2)]], uint i [[thread_position_in_grid]])
+{
+    out[i] = probed.t.read(points[i]);
+}
+
 kernel void archived(device uint *data [[buffer(0)]], constant uint &unused [[buffer(1)]], uint i [[thread_position_in_grid]])
 {
     data[i] = data[i] * 3u + 1u;

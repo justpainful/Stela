@@ -422,6 +422,12 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
     fn profile_exit(&mut self, slot: usize, now: u64) {
         self.local.profile_exit(slot, now);
     }
+    fn profile_idle(&mut self, idle: bool) {
+        self.local.profile_idle(idle);
+    }
+    fn native_stamps(&self) -> [u64; 2] {
+        self.local.native_stamps()
+    }
     fn profile_code(
         &mut self,
         code: NativeCode,

@@ -661,14 +661,10 @@ impl Coprocessor {
             .compose(now, page, resolve)
     }
 
-    /// Finish at counter `now` the present a compose left once it ended,
-    /// or once the host GPU it handed the frame to is done
+    /// Finish the present a compose left once it ended
     /// ([`iomfb::Methods::finish_compose`]).
-    pub fn finish_compose(&mut self, now: u64) -> Result<bool> {
-        let mut link = self.link.borrow_mut();
-        let methods = link.service_mut();
-        methods.observe(now);
-        methods.finish_compose(0)
+    pub fn finish_compose(&mut self) -> Result<bool> {
+        self.link.borrow_mut().service_mut().finish_compose(0)
     }
 
     pub fn present(&mut self, now: u64, port: &mut Port<'_, '_>) -> Result<()> {

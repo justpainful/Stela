@@ -540,3 +540,165 @@ fn posix_ram_layout_does_not_mint_a_freestanding_target_proof() {
         Err(RegistrationError::NativeTarget)
     ));
 }
+
+/// Guest RAM for the fill-walk benchmark, 16-byte aligned.
+struct BenchRam(UnsafeCell<alloc::vec::Vec<u128>>);
+// SAFETY: written before registration only; afterwards every read goes
+// through the registered owner's scalar accesses.
+unsafe impl Sync for BenchRam {}
+
+/// A walk's descriptor reads through the registered owner, as the boot's
+/// shadow fills read guest tables (`GuestTables`).
+struct Reader<'a>(super::DescriptorReader<'a>);
+
+impl crate::machine::mmu::TableMemory for Reader<'_> {
+    fn read_descriptor(&mut self, physical: u64) -> Option<u64> {
+        self.0.read_descriptor(physical).ok()
+    }
+    fn update_descriptor(&mut self, _: u64, _: u64, _: u64) -> Option<bool> {
+        None
+    }
+}
+
+/// What a shadow fill's walks cost: a fault's walk and fault-around's walks
+/// of the three other 16 KiB leaves of its 64 KiB window, each a full walk
+/// (before) or starting at the fault's leaf table (after), over an XNU-like
+/// 16 KiB-granule, 47-bit lower half (levels 1 to 3) in registered guest
+/// RAM. Faults land on random pages of 64 MiB of mapped user memory.
+#[test]
+#[ignore = "manual: opt-in"]
+fn fill_walks_benchmark() {
+    use crate::machine::mmu::{
+        self, Access, Controls, Outcome, Requester, translate, translate_from, translate_noting,
+    };
+    const BASE: u64 = 0x8_0000_0000;
+    const BYTES: usize = 8 << 20;
+    const GRANULE: u64 = 1 << 14;
+    const MAPPED: u64 = 64 << 20;
+    let ram = Arc::new(BenchRam(UnsafeCell::new(alloc::vec![0u128; BYTES / 16])));
+    // SAFETY: the vector is not reallocated; this is before registration.
+    let base = unsafe { (*ram.0.get()).as_mut_ptr().cast::<u64>() };
+    let write = |pa: u64, value: u64| {
+        // SAFETY: inside the buffer, before registration.
+        unsafe { base.add(((pa - BASE) / 8) as usize).write(value) }
+    };
+    // Tables: L1 at BASE, L2 at BASE + 16 KiB, two L3 tables after it,
+    // mapping VA 0x1_0000_0000.. (64 MiB) with 16 KiB pages, user RW, nG,
+    // their outputs scattered over the RAM's upper part.
+    let table = |n: u64| BASE + n * GRANULE;
+    let va_base = 0x1_0000_0000u64;
+    write(table(0) + (va_base >> 36 & 0x7ff) * 8, table(1) | 0b11);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut random = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for l2 in 0..MAPPED >> 25 {
+        let va = va_base + (l2 << 25);
+        write(table(1) + (va >> 25 & 0x7ff) * 8, table(2 + l2) | 0b11);
+        for l3 in 0..2048u64 {
+            let page =
+                BASE + (1 << 22) + (random() % ((BYTES as u64 - (1 << 22)) / GRANULE)) * GRANULE;
+            let descriptor = page | 0b11 | 1 << 10 | 1 << 11 | 0b01 << 6 | 0b11 << 8 | 1 << 53;
+            write(table(2 + l2) + l3 * 8, descriptor);
+        }
+    }
+    let ranges = [ReservedSystemRamRange {
+        source_pa: BASE,
+        host_pa: 0x1_0000_0000,
+        host_base: NonNull::new(base.cast::<u8>()).unwrap(),
+        bytes: BYTES,
+    }];
+    // SAFETY: the buffer backs the range and stays alive with the
+    // registration; nothing else writes it from here on.
+    validate(&ranges).unwrap();
+    // SAFETY: as above.
+    let (regions, views, system) = unsafe { bindings(&ranges, Arc::clone(&ram), 64, 8) }.unwrap();
+    let domain = MemoryDomain::new(Arc::clone(&system), views, TargetCpu::Baseline).unwrap();
+    let registered = RegisteredSystemRam {
+        regions,
+        domain,
+        system,
+        target: TargetCpu::Baseline,
+        erg_bytes: 64,
+    };
+    let controls = Controls {
+        sctlr: mmu::SCTLR_M | 1 << 2 | 1 << 12,
+        // 16 KiB granules, T0SZ 17 and T1SZ 25, 48-bit IPS, TBI0, A1 clear.
+        tcr: 17 | 2 << 14 | 25 << 16 | 1 << 30 | 5 << 32 | 1 << 37,
+        ttbr0: BASE | 0x42 << 48,
+        ttbr1: BASE,
+        mair: 0xff44_04ff,
+        regime: mmu::Regime::El20,
+        ..Controls::default()
+    };
+    let requester = Requester {
+        el: 0,
+        pan: false,
+        unprivileged: false,
+        guarded: false,
+    };
+    let faults: alloc::vec::Vec<u64> = (0..200_000)
+        .map(|_| va_base + (random() % (MAPPED / GRANULE)) * GRANULE + 0x123)
+        .collect();
+    let window = |address: u64| {
+        let first = address & !(0x1_0000 - 1);
+        (0..4)
+            .map(move |leaf| first + leaf * GRANULE)
+            .filter(move |&leaf| leaf != address & !(GRANULE - 1))
+    };
+    let measure = |name: &str, run: &mut dyn FnMut(u64) -> u64| {
+        let start = std::time::Instant::now();
+        let mut count = 0;
+        for &fault in &faults {
+            count += run(fault);
+        }
+        let ns = start.elapsed().as_nanos() as f64 / faults.len() as f64;
+        std::println!("{name}: {ns:.1} ns per fill, {count} leaves mapped");
+        (ns, count)
+    };
+    let (full, full_count) = measure("full walks", &mut |fault| {
+        let mut reader = Reader(registered.descriptor_reader());
+        let mut count = u64::from(matches!(
+            translate(&controls, fault, Access::Read, requester, &mut reader),
+            Outcome::Mapped(_)
+        ));
+        for leaf in window(fault) {
+            let mut reader = Reader(registered.descriptor_reader());
+            count += u64::from(matches!(
+                translate(&controls, leaf, Access::Read, requester, &mut reader),
+                Outcome::Mapped(_)
+            ));
+        }
+        count
+    });
+    let (from_table, table_count) = measure("from the fault's table", &mut |fault| {
+        let mut reader = Reader(registered.descriptor_reader());
+        let (outcome, table) =
+            translate_noting(&controls, fault, Access::Read, requester, &mut reader);
+        let mut count = u64::from(matches!(outcome, Outcome::Mapped(_)));
+        let table = table.expect("a walk");
+        for leaf in window(fault) {
+            let mut reader = Reader(registered.descriptor_reader());
+            count += u64::from(matches!(
+                translate_from(
+                    &controls,
+                    &table,
+                    leaf,
+                    Access::Read,
+                    requester,
+                    &mut reader
+                ),
+                Outcome::Mapped(_)
+            ));
+        }
+        count
+    });
+    assert_eq!(table_count, full_count);
+    std::println!(
+        "walk time per fill: {full:.1} -> {from_table:.1} ns ({:.2}x)",
+        full / from_table
+    );
+}

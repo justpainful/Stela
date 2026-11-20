@@ -45,9 +45,7 @@ use stela_linux::{
 };
 use stela_loader::{apple_device_tree::DeviceTree, stela_gpu};
 
-type Shared = SharedService<NativeBackend, AirCompiler>;
-/// A GPU's Metal service, as the display composing on it reaches it.
-pub(super) type SharedDevice = Shared;
+pub(super) type Shared = SharedService<NativeBackend, AirCompiler>;
 
 /// A process's main stack, as big as the deepest compile LLVM bounds.
 pub(super) const STACK_BYTES: usize = 16 << 20;
@@ -63,6 +61,8 @@ static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
 /// The bound GPU, by its index (its DRM minor), of each service, in the
 /// services' order.
 static SERVED: AtomicPtr<Vec<usize>> = AtomicPtr::new(ptr::null_mut());
+/// The name of each service's GPU, in the same order.
+static SERVICE_GPUS: AtomicPtr<Vec<String>> = AtomicPtr::new(ptr::null_mut());
 
 /// The compile stacks ([`open_gpu`]), whose jobs [`run`] runs with the
 /// shootdown vector open; a GPU past these runs its jobs masked.
@@ -72,8 +72,9 @@ fn run(stack: u64, body: &mut dyn FnMut()) {
     let job = COMPILE_STACKS
         .iter()
         .any(|compile| compile.load(Ordering::Relaxed) == stack);
-    // SAFETY: a service's stack lives for the boot, and only the opener, a
-    // turn's holder or the compile lock's holder is here.
+    // SAFETY: the opener keeps the stack mapped for its call, an open
+    // service's lives for the boot, and only the opener, a turn's holder or
+    // the compile lock's holder is here.
     let mut on_stack = || unsafe { stack::on_stack(stack, &mut *body) };
     if job {
         // SAFETY: a job runs where long host work is allowed, from a run
@@ -965,24 +966,31 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         ));
     }
     // Pipeline work in turns: the jobs turns left, with what making them
-    // (each stage's NIR copied for its job) took, and the pipelines turns
-    // created themselves.
+    // (each stage's NIR copied for its job) took, the pipelines turns
+    // created themselves, and the store lookups turns made, found or missed.
     let [
         [left, copied, copy_longest],
         [created, create, create_longest],
         [looked, look, look_longest],
+        [found, find, find_longest],
+        [missed, miss, miss_longest],
     ] = native::take_pipeline_turn_work();
-    if left != 0 || created != 0 || looked != 0 {
+    if left != 0 || created != 0 || looked != 0 || found != 0 || missed != 0 {
         output::arguments(format_args!(
             "GPU PIPELINE TURNS jobs_left={left} copy_us={} copy_longest_us={} created={created} \
              create_us={} create_longest_us={} archive_looks={looked} look_us={} \
-             look_longest_us={}\n",
+             look_longest_us={} store_found={found} found_us={} found_longest_us={} \
+             store_missed={missed} missed_us={} missed_longest_us={}\n",
             micros(copied),
             micros(copy_longest),
             micros(create),
             micros(create_longest),
             micros(look),
             micros(look_longest),
+            micros(find),
+            micros(find_longest),
+            micros(miss),
+            micros(miss_longest),
         ));
     }
     // Where the time of the slowest operations went, phase by phase.
@@ -1299,8 +1307,13 @@ pub(in crate::engine) fn open_service() {
             ));
         }
     }
+    let names: Vec<String> = opened
+        .iter()
+        .map(|&(index, _)| bound[index].name.clone())
+        .collect();
     let (served, services): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
     SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
+    SERVICE_GPUS.store(Box::into_raw(Box::new(names)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
 }
 
@@ -1395,8 +1408,6 @@ fn open_gpu(
         return refuse("no memory for its service");
     };
     let top = stack.top();
-    // It serves for the boot.
-    core::mem::forget(stack);
     let target = Gpu {
         stack: bound.stack,
         pci: PciBusInfo {
@@ -1431,7 +1442,13 @@ fn open_gpu(
         construct(constructed);
         opened = Some(service(&target, top));
     });
-    match opened? {
+    // A service that did not open leaves its stack, which is unmapped.
+    let opened = opened?;
+    // An open service, published or kept unreleased, uses it for the boot.
+    if opened.is_ok() {
+        core::mem::forget(stack);
+    }
+    match opened {
         Ok(service) => {
             if let Some(state @ (ResetState::Reset | ResetState::Resetting)) =
                 watch.as_ref().and_then(client::ResetWatch::state)
@@ -1504,6 +1521,14 @@ fn open_gpu(
 /// the report shows `GPU PASSES`.
 pub(in crate::engine) fn profile_passes() {
     pass_times::set_pass_profile(true);
+}
+
+/// The service of the GPU named `name`, once the services are open.
+pub(super) fn service_of(name: &str) -> Option<&'static Arc<Shared>> {
+    // SAFETY: the names are published before the services and leaked.
+    let names = unsafe { SERVICE_GPUS.load(Ordering::Acquire).as_ref() }?;
+    let index = names.iter().position(|gpu| gpu == name)?;
+    shared().get(index)
 }
 
 pub(super) fn shared() -> &'static [Arc<Shared>] {

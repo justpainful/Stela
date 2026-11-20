@@ -443,6 +443,116 @@ fn two_plane_frames(plan: &mut Plan, library: &str) {
     );
 }
 
+/// Every reader class of an `RGB10A8_2P_XR10` (550) IOSurface sees the
+/// surface's last write (`host_xr10_readers`): a 320x256 'b3a8' surface,
+/// past 64K texels, so a GPU of its own memory encodes a whole clear
+/// through device memory and a copy. Facts: the CPU's reads of five points'
+/// color words and alpha bytes under a lock, after the texture's clear,
+/// after a rectangle it draws, and at the end. Probes: the points as read
+/// by the texture's own kernel, by a second texture over the surface that
+/// only samples it, by another process's texture, then only through an
+/// argument buffer and a residency set after the CPU writes the first
+/// point, and again after a third texture draws a rectangle.
+fn xr10_readers(plan: &mut Plan, library: &str) {
+    let points: [[u32; 2]; 5] = [[0, 0], [10, 10], [319, 255], [44, 44], [200, 100]];
+    let code = |v: f64| (v * 510.0 + 384.0).round() as u32;
+    let word = |[r, g, b]: [f64; 3]| code(b) | code(g) << 10 | code(r) << 20;
+    let value = |c: u32| (f64::from(c) - 384.0) / 510.0;
+    let (clear, blue, red, green) = (
+        [0.5, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    );
+    let cpu_alpha = 128u32;
+    // Each point's color and alpha byte after the clear, the rectangle,
+    // the CPU's write of the first point and the other texture's rectangle.
+    let stages: [[([f64; 3], u32); 5]; 4] = [
+        [(clear, 255); 5],
+        [
+            (clear, 255),
+            (blue, 255),
+            (clear, 255),
+            (clear, 255),
+            (clear, 255),
+        ],
+        [
+            (red, cpu_alpha),
+            (blue, 255),
+            (clear, 255),
+            (clear, 255),
+            (clear, 255),
+        ],
+        [
+            (red, cpu_alpha),
+            (blue, 255),
+            (clear, 255),
+            (green, 255),
+            (clear, 255),
+        ],
+    ];
+    let facts: Vec<u32> = [0, 1, 3]
+        .iter()
+        .flat_map(|&stage| stages[stage].iter().flat_map(|&(c, a)| [word(c), a]))
+        .collect();
+    let probes: Vec<f64> = [1, 1, 1, 2, 3]
+        .iter()
+        .flat_map(|&stage| {
+            stages[stage].iter().flat_map(|&(c, a)| {
+                let [r, g, b] = c.map(code).map(value);
+                [r, g, b, f64::from(a) / 255.0]
+            })
+        })
+        .collect();
+    plan.add(
+        Case::host(
+            "host.iosurface.xr10_readers",
+            library,
+            json!({"kind": "xr10_readers", "width": 320, "height": 256, "points": points,
+                   "clear": [clear[0], clear[1], clear[2], 1.0],
+                   "rect": [8, 8, 16, 16], "rect_color": [0.0, 0.0, 1.0, 1.0],
+                   "cpu_word": word(red), "cpu_alpha": cpu_alpha,
+                   "other_rect": [40, 40, 16, 16], "other_color": [0.0, 1.0, 0.0, 1.0]}),
+        )
+        .buffer(Buffer::zeroed("facts", 0, facts.len() * 4).unbound())
+        .buffer(Buffer::zeroed("probes", 0, probes.len() * 4).unbound())
+        .output(Output::exact("facts", Dtype::U32, u32s(&facts)))
+        .output(Output::new("probes", Dtype::F32, Tolerance::abs(1e-3)).expect_same(f32s(&probes))),
+    );
+}
+
+/// A sampled-only 1920x1080 4:4:4 two-plane surface (542), which a GPU of
+/// its own memory keeps in device memory, read at four points after the
+/// CPU fills it with one color, bound to the kernel; then after the CPU
+/// fills it with another, only through an argument buffer and a residency
+/// set, and bound again (`host_two_plane_indirect`).
+fn two_plane_indirect(plan: &mut Plan, library: &str) {
+    let points: [[u32; 2]; 4] = [[0, 0], [1919, 1079], [960, 540], [37, 1000]];
+    // Green, then the blue and red pair.
+    let fills: [[u32; 3]; 2] = [[64, 128, 192], [200, 10, 100]];
+    let rgba = |[g, b, r]: [u32; 3]| [r, g, b].map(|v| f64::from(v) / 255.0);
+    let probes: Vec<f64> = [0, 1, 1]
+        .iter()
+        .flat_map(|&fill| {
+            let [r, g, b] = rgba(fills[fill]);
+            [[r, g, b, 1.0]; 4].concat()
+        })
+        .collect();
+    plan.add(
+        Case::host(
+            "host.iosurface.two_plane_indirect",
+            library,
+            json!({"kind": "two_plane_indirect", "format": 542, "width": 1920, "height": 1080,
+                   "points": points, "fills": fills}),
+        )
+        .buffer(Buffer::zeroed("probes", 0, probes.len() * 4).unbound())
+        .output(
+            Output::new("probes", Dtype::F32, Tolerance::abs(0.5 / 255.0))
+                .expect_same(f32s(&probes)),
+        ),
+    );
+}
+
 /// A 4:4:4 two-plane format's planes of an RGB color, in whole steps:
 /// green and blue-red, or full-range BT.601 luma and chroma whose chroma is
 /// scaled by 256 / 255 around 128, as Apple GPUs store them.
@@ -1687,6 +1797,8 @@ pub fn build(plan: &mut Plan) {
     two_plane_render(plan, &library, &mut Random::new(1304));
     two_plane_ten_bit(plan, &library, &mut Random::new(1305));
     two_plane_frames(plan, &library);
+    two_plane_indirect(plan, &library);
+    xr10_readers(plan, &library);
     share(plan, &library, &mut rng);
     archive(plan, &library, &mut rng);
     errors(plan, &library);

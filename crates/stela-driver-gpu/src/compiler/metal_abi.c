@@ -1532,10 +1532,23 @@ struct texels {
    nir_def *alpha;
    /* STELA_METAL_TEXELS_MIRROR_*, and the mirror's coordinate. */
    nir_def *mirror, *mirror_coord;
+   /* The planes' device copy's codes word and alpha byte of the texel, or
+    * zero for none. */
+   nir_def *copy, *copy_alpha;
    /* The thread's index. */
    nir_def *thread;
    nir_deref_instr *image;
 };
+
+/* The address of texel (x, y) of a plane of texels of size bytes, row bytes
+ * a row, from base, the address of its texel (0, 0); zero for a base of
+ * zero, a plane there is none of. */
+static nir_def *plane_texel(nir_builder *b, nir_def *base, nir_def *row, nir_def *x, nir_def *y,
+                            unsigned size)
+{
+   nir_def *offset = nir_iadd(b, nir_imul(b, y, row), nir_imul_imm(b, x, size));
+   return nir_bcsel(b, nir_ieq_imm(b, base, 0), base, nir_iadd(b, base, nir_u2u64(b, offset)));
+}
 
 static nir_builder texels(const nir_shader_compiler_options *options, const char *name,
                           struct texels *t)
@@ -1574,6 +1587,11 @@ static nir_builder texels(const nir_shader_compiler_options *options, const char
       &b, nir_imul(&b, y, load(&b, arguments, STELA_METAL_TEXELS_ALPHA_ROW, 32)), x);
    t->alpha = nir_bcsel(&b, nir_ieq_imm(&b, alpha, 0), alpha,
                         nir_iadd(&b, alpha, nir_u2u64(&b, alpha_offset)));
+   t->copy = plane_texel(&b, load(&b, arguments, STELA_METAL_TEXELS_COPY, 64),
+                         load(&b, arguments, STELA_METAL_TEXELS_COPY_ROW, 32), x, y, 4);
+   t->copy_alpha = plane_texel(&b, load(&b, arguments, STELA_METAL_TEXELS_COPY_ALPHA, 64),
+                               load(&b, arguments, STELA_METAL_TEXELS_COPY_ALPHA_ROW, 32), x, y,
+                               1);
    t->mirror = load(&b, arguments, STELA_METAL_TEXELS_MIRROR, 32);
    t->mirror_coord = nir_vector_insert_imm(&b, t->coord,
                                            nir_iadd_imm(&b, nir_channel(&b, t->coord, 2), 1), 2);
@@ -1618,6 +1636,28 @@ static nir_def *store_xr(nir_builder *b, nir_def *lo, nir_def *hi, bool alpha, b
    return halves(b, xr_value(b, red, srgb), xr_value(b, green, srgb), xr_value(b, blue, srgb), a);
 }
 
+/* Whether the view's next layer mirrors the planes: neither none nor the
+ * device copy in its place. */
+static nir_def *mirrors(nir_builder *b, const struct texels *t)
+{
+   return nir_iand(b, nir_ine_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_NONE),
+                   nir_ine_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_COPY));
+}
+
+/* Whether the planes' device copy holds a two-plane texel's codes word and
+ * alpha byte at copy and copy_alpha, where alpha is compared only when its
+ * plane is copied. */
+static nir_def *copy_holds(nir_builder *b, nir_def *copy, nir_def *copy_alpha, nir_def *word,
+                           nir_def *alpha)
+{
+   nir_def *held = nir_load_global(b, 1, 32, copy, .align_mul = 4);
+   nir_push_if(b, nir_ine_imm(b, copy_alpha, 0));
+   nir_def *byte = nir_u2u32(b, nir_load_global(b, 1, 8, copy_alpha, .align_mul = 1));
+   nir_pop_if(b, NULL);
+   byte = nir_if_phi(b, byte, alpha);
+   return nir_iand(b, nir_ieq(b, held, word), nir_ieq(b, byte, alpha));
+}
+
 /* Writes a two-plane texel's codes word and alpha byte to its mirror. */
 static void store_mirror(nir_builder *b, const struct texels *t, nir_def *word, nir_def *alpha)
 {
@@ -1625,6 +1665,19 @@ static void store_mirror(nir_builder *b, const struct texels *t, nir_def *word, 
                          nir_vec4(b, word, alpha, nir_imm_int(b, 0), nir_imm_int(b, 0)),
                          nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = true,
                          .format = PIPE_FORMAT_NONE, .src_type = nir_type_uint32);
+}
+
+/* Writes a two-plane texel's codes word and alpha byte to the planes'
+ * device copy at copy and copy_alpha, where each is not zero. */
+static void store_copy(nir_builder *b, nir_def *copy, nir_def *copy_alpha, nir_def *word,
+                       nir_def *alpha)
+{
+   nir_push_if(b, nir_ine_imm(b, copy, 0));
+   nir_store_global(b, word, copy, .align_mul = 4);
+   nir_pop_if(b, NULL);
+   nir_push_if(b, nir_ine_imm(b, copy_alpha, 0));
+   nir_store_global(b, nir_u2u8(b, alpha), copy_alpha, .align_mul = 1);
+   nir_pop_if(b, NULL);
 }
 
 nir_shader *stela_metal_store_texels_kernel(const nir_shader_compiler_options *options)
@@ -1679,7 +1732,7 @@ nir_shader *stela_metal_store_texels_kernel(const nir_shader_compiler_options *o
                                .image_array = true, .format = PIPE_FORMAT_NONE,
                                .src_type = nir_type_uint32);
          /* The mirror holds what the planes do. */
-         nir_push_if(&b, nir_ine_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_NONE));
+         nir_push_if(&b, mirrors(&b, &t));
          store_mirror(&b, &t, lo, byte);
          nir_pop_if(&b, NULL);
       }
@@ -1705,12 +1758,17 @@ _Static_assert(STELA_METAL_DIRTY_TILE_SHIFT == STELA_AIR_DIRTY_TILE_SHIFT &&
                STELA_METAL_DIRTY_LAYER == STELA_AIR_DIRTY_LAYER &&
                STELA_METAL_DIRTY_TILE == 1u << STELA_METAL_DIRTY_TILE_SHIFT,
                "the dirty tiles the compiler marks are the ones the load kernel reads");
+_Static_assert(STELA_METAL_KERNEL_WORKGROUP == STELA_METAL_DIRTY_TILE,
+               "a workgroup is one dirty tile's columns, which stop together when it is clean");
 
 /* Encodes the working image's texel at coord into an IOSurface's planes, at
- * address and alpha (zero for none), where its codes or alpha differ from
- * the mirror's when the mirror is compared, and writes the mirror with it. */
+ * address and alpha (zero for none), and into their device copy at copy and
+ * copy_alpha (zero for none), where its codes or alpha differ from the
+ * mirror's or the copy's when either is compared, and writes the mirror
+ * with it. */
 static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def *coord,
-                                nir_def *address, nir_def *alpha, bool srgb)
+                                nir_def *address, nir_def *alpha, nir_def *copy,
+                                nir_def *copy_alpha, bool srgb)
 {
    nir_def *stored = nir_image_deref_load(b, 4, 32, &t->image->def, coord, nir_undef(b, 1, 32),
                                           nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
@@ -1738,13 +1796,18 @@ static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def 
                               nir_ine(b, nir_channel(b, mirrored, 1), alpha_byte));
    nir_pop_if(b, NULL);
    differs = nir_if_phi(b, differs, changed);
+   nir_push_if(b, nir_ieq_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_COPY));
+   nir_def *copied = nir_inot(b, copy_holds(b, copy, copy_alpha, word, steps));
+   nir_pop_if(b, NULL);
+   differs = nir_if_phi(b, copied, differs);
    nir_push_if(b, differs);
    {
       nir_store_global(b, word, address, .align_mul = 4);
       nir_push_if(b, nir_ine_imm(b, alpha, 0));
       nir_store_global(b, nir_u2u8(b, steps), alpha, .align_mul = 1);
       nir_pop_if(b, NULL);
-      nir_push_if(b, nir_ine_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_NONE));
+      store_copy(b, copy, copy_alpha, word, steps);
+      nir_push_if(b, mirrors(b, t));
       nir_image_deref_store(b, &t->image->def, mirror_coord, nir_undef(b, 1, 32),
                             nir_vec4(b, word, alpha_byte, nir_imm_int(b, 0), nir_imm_int(b, 0)),
                             nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
@@ -1755,11 +1818,13 @@ static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def 
    nir_pop_if(b, NULL);
 }
 
-/* A load given the pass's stamp: thread n converts texel n % 64 of row
- * n / 64 % 64 of tile n / 4096 of the region, when the dirty layer holds
- * the stamp at the tile: a workgroup is a row of a tile, so a clean tile's
- * threads only read that texel, and a dirty tile's convert its texels
- * side by side rather than row after row. */
+/* A load given the pass's stamp: thread n is column n % 64 of tile n / 64
+ * of the region, so a workgroup is a tile. Where the dirty layer holds the
+ * stamp at the tile, each thread converts its column's texels row after
+ * row, the workgroup a row's side by side; a clean tile's threads read the
+ * mark once and stop. An encode then runs a workgroup a tile rather than
+ * one a tile's row, which on a GPU of few cores cost as much as the dirty
+ * tiles' conversion. */
 static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *stamp)
 {
    nir_def *arguments = t->arguments;
@@ -1768,14 +1833,16 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
    nir_def *row_bytes = load(b, arguments, STELA_METAL_TEXELS_ROW, 32);
    nir_def *alpha_row = load(b, arguments, STELA_METAL_TEXELS_ALPHA_ROW, 32);
    nir_def *alpha = load(b, arguments, STELA_METAL_TEXELS_ALPHA, 64);
+   nir_def *copy = load(b, arguments, STELA_METAL_TEXELS_COPY, 64);
+   nir_def *copy_row = load(b, arguments, STELA_METAL_TEXELS_COPY_ROW, 32);
+   nir_def *copy_alpha = load(b, arguments, STELA_METAL_TEXELS_COPY_ALPHA, 64);
+   nir_def *copy_alpha_row = load(b, arguments, STELA_METAL_TEXELS_COPY_ALPHA_ROW, 32);
    nir_def *origin[3];
    for (unsigned i = 0; i < 3; i++)
       origin[i] = load(b, arguments, STELA_METAL_TEXELS_ORIGIN + 4 * i, 32);
    nir_def *tiles_x = nir_ushr_imm(b, nir_iadd_imm(b, width, STELA_METAL_DIRTY_TILE - 1),
                                    STELA_METAL_DIRTY_TILE_SHIFT);
-   nir_def *tile = nir_ushr_imm(b, t->thread, 2 * STELA_METAL_DIRTY_TILE_SHIFT);
-   nir_def *row = nir_iand_imm(b, nir_ushr_imm(b, t->thread, STELA_METAL_DIRTY_TILE_SHIFT),
-                               STELA_METAL_DIRTY_TILE - 1);
+   nir_def *tile = nir_ushr_imm(b, t->thread, STELA_METAL_DIRTY_TILE_SHIFT);
    nir_def *lane = nir_iand_imm(b, t->thread, STELA_METAL_DIRTY_TILE - 1);
    nir_def *ty = nir_udiv(b, tile, tiles_x);
    nir_def *tx = nir_isub(b, tile, nir_imul(b, ty, tiles_x));
@@ -1790,21 +1857,36 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
                                                         .format = PIPE_FORMAT_NONE,
                                                         .dest_type = nir_type_uint32), 0);
    nir_def *x = nir_iadd(b, nir_ishl_imm(b, tx, STELA_METAL_DIRTY_TILE_SHIFT), lane);
-   nir_def *y = nir_iadd(b, nir_ishl_imm(b, ty, STELA_METAL_DIRTY_TILE_SHIFT), row);
-   nir_def *inside = nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height));
-   nir_push_if(b, nir_iand(b, nir_ieq(b, mark, stamp), inside));
-   for (unsigned e = STELA_METAL_TEXELS_XR10_PLANES; e <= STELA_METAL_TEXELS_XR10_PLANES_SRGB; e++) {
-      nir_push_if(b, nir_ieq_imm(b, t->encoding, e));
-      nir_def *coord = nir_vec4(b, nir_iadd(b, origin[0], x), nir_iadd(b, origin[1], y),
-                                origin[2], nir_imm_int(b, 0));
-      nir_def *address = nir_iadd(b, t->buffer,
-                                  nir_u2u64(b, nir_iadd(b, nir_imul(b, y, row_bytes),
-                                                        nir_ishl_imm(b, x, 2))));
-      nir_def *alpha_at = nir_bcsel(
-         b, nir_ieq_imm(b, alpha, 0), alpha,
-         nir_iadd(b, alpha, nir_u2u64(b, nir_iadd(b, nir_imul(b, y, alpha_row), x))));
-      encode_planes_texel(b, t, coord, address, alpha_at, e == STELA_METAL_TEXELS_XR10_PLANES_SRGB);
-      nir_pop_if(b, NULL);
+   nir_def *top = nir_ishl_imm(b, ty, STELA_METAL_DIRTY_TILE_SHIFT);
+   nir_push_if(b, nir_iand(b, nir_ieq(b, mark, stamp),
+                           nir_iand(b, nir_ult(b, x, width), nir_ult(b, top, height))));
+   {
+      nir_def *rows = nir_umin(b, nir_isub(b, height, top), nir_imm_int(b, STELA_METAL_DIRTY_TILE));
+      nir_variable *row_variable = nir_local_variable_create(b->impl, glsl_uint_type(), "row");
+      nir_store_var(b, row_variable, nir_imm_int(b, 0), 1);
+      nir_push_loop(b);
+      {
+         nir_def *row = nir_load_var(b, row_variable);
+         nir_break_if(b, nir_uge(b, row, rows));
+         nir_def *y = nir_iadd(b, top, row);
+         for (unsigned e = STELA_METAL_TEXELS_XR10_PLANES; e <= STELA_METAL_TEXELS_XR10_PLANES_SRGB;
+              e++) {
+            nir_push_if(b, nir_ieq_imm(b, t->encoding, e));
+            nir_def *coord = nir_vec4(b, nir_iadd(b, origin[0], x), nir_iadd(b, origin[1], y),
+                                      origin[2], nir_imm_int(b, 0));
+            nir_def *address = nir_iadd(b, t->buffer,
+                                        nir_u2u64(b, nir_iadd(b, nir_imul(b, y, row_bytes),
+                                                              nir_ishl_imm(b, x, 2))));
+            nir_def *alpha_at = plane_texel(b, alpha, alpha_row, x, y, 1);
+            encode_planes_texel(b, t, coord, address, alpha_at,
+                                plane_texel(b, copy, copy_row, x, y, 4),
+                                plane_texel(b, copy_alpha, copy_alpha_row, x, y, 1),
+                                e == STELA_METAL_TEXELS_XR10_PLANES_SRGB);
+            nir_pop_if(b, NULL);
+         }
+         nir_store_var(b, row_variable, nir_iadd_imm(b, row, 1), 1);
+      }
+      nir_pop_loop(b, NULL);
    }
    nir_pop_if(b, NULL);
 }
@@ -1872,7 +1954,7 @@ nir_shader *stela_metal_load_texels_kernel(const nir_shader_compiler_options *op
                               nir_ishl_imm(&b, codes[2], 20));
       nir_def *alpha_byte = nir_f2u32(&b, steps);
       /* A texel whose codes and alpha the planes hold already, as the
-       * mirror says, is not written again. */
+       * mirror or their device copy says, is not written again. */
       nir_def *compares = nir_ieq_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_COMPARE);
       nir_def *changed = nir_imm_false(&b);
       nir_push_if(&b, compares);
@@ -1884,11 +1966,16 @@ nir_shader *stela_metal_load_texels_kernel(const nir_shader_compiler_options *op
                                nir_ieq(&b, nir_channel(&b, mirrored, 1), alpha_byte));
       nir_pop_if(&b, NULL);
       held = nir_if_phi(&b, held, changed);
+      nir_push_if(&b, nir_ieq_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_COPY));
+      nir_def *copied = copy_holds(&b, t.copy, t.copy_alpha, word, alpha_byte);
+      nir_pop_if(&b, NULL);
+      held = nir_if_phi(&b, copied, held);
       nir_push_if(&b, nir_inot(&b, held));
       nir_push_if(&b, nir_ine_imm(&b, t.buffer, 0));
       {
          nir_store_global(&b, word, address, .align_mul = 4);
-         nir_push_if(&b, nir_ine_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_NONE));
+         store_copy(&b, t.copy, t.copy_alpha, word, alpha_byte);
+         nir_push_if(&b, mirrors(&b, &t));
          store_mirror(&b, &t, word, nir_bcsel(&b, nir_ine_imm(&b, t.alpha, 0), alpha_byte,
                                               nir_imm_int(&b, 0)));
          nir_pop_if(&b, NULL);
@@ -2037,6 +2124,151 @@ static nir_def *field(nir_builder *b, nir_def *x, unsigned offset, unsigned coun
 static nir_def *signed_field(nir_builder *b, nir_def *x, unsigned offset, unsigned count)
 {
    return nir_ishr_imm(b, nir_ishl_imm(b, x, 32 - offset - count), 32 - count);
+}
+
+/* (value * weight + 127) / 255: an 8-bit channel weighted by an 8-bit
+ * alpha, rounded as the display model rounds. */
+static nir_def *compose_scale(nir_builder *b, nir_def *value, nir_def *weight)
+{
+   return nir_udiv_imm(b, nir_iadd_imm(b, nir_imul(b, value, weight), 127), 255);
+}
+
+/* An extended-range code's 8-bit display value: (2 code - 768) 255 + 510
+ * over 1020, clamped to [0, 255]. */
+static nir_def *compose_xr10(nir_builder *b, nir_def *code)
+{
+   nir_def *scaled = nir_iadd_imm(b, nir_imul_imm(b, nir_iadd_imm(b, nir_ishl_imm(b, code, 1), -768), 255), 510);
+   return nir_umin(b, nir_udiv_imm(b, nir_imax(b, scaled, nir_imm_int(b, 0)), 1020),
+                   nir_imm_int(b, 255));
+}
+
+/* A 10-bit component rescaled to 8 bits, rounded. */
+static nir_def *compose_ten(nir_builder *b, nir_def *value)
+{
+   return nir_udiv_imm(b, nir_iadd_imm(b, nir_imul_imm(b, value, 255), 511), 1023);
+}
+
+/* The 8-bit red, green, blue and alpha of the layer's source pixel at sx,
+ * sy. */
+static nir_def *compose_source(nir_builder *b, nir_def *layer, nir_def *sx, nir_def *sy)
+{
+   nir_def *format = load(b, layer, STELA_METAL_COMPOSE_LAYER_FORMAT, 32);
+   nir_def *row = nir_imul(b, nir_u2u64(b, sy),
+                           nir_u2u64(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_STRIDE, 32)));
+   nir_def *at = nir_iadd(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_COLOR, 64),
+                          nir_iadd(b, row, nir_u2u64(b, nir_ishl_imm(b, sx, 2))));
+   nir_def *word = nir_load_global(b, 1, 32, at, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER,
+                                   .align_mul = 4);
+   nir_def *byte0 = field(b, word, 0, 8), *byte1 = field(b, word, 8, 8);
+   nir_def *byte2 = field(b, word, 16, 8), *byte3 = field(b, word, 24, 8);
+   nir_def *bgra = nir_vec4(b, byte2, byte1, byte0, byte3);
+   nir_def *rgba = nir_vec4(b, byte0, byte1, byte2, byte3);
+   nir_def *wide = nir_vec4(b, compose_ten(b, field(b, word, 20, 10)),
+                            compose_ten(b, field(b, word, 10, 10)),
+                            compose_ten(b, field(b, word, 0, 10)),
+                            nir_imul_imm(b, field(b, word, 30, 2), 85));
+   /* The alpha plane is read only for its format. */
+   nir_variable *alpha = nir_local_variable_create(b->impl, glsl_uint_type(), "alpha");
+   nir_store_var(b, alpha, nir_imm_int(b, 255), 1);
+   nir_def *extended = nir_ieq_imm(b, format, STELA_METAL_COMPOSE_XR10A8);
+   nir_push_if(b, extended);
+   {
+      nir_def *alpha_row =
+         nir_imul(b, nir_u2u64(b, sy),
+                  nir_u2u64(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_ALPHA_STRIDE, 32)));
+      nir_def *byte_at = nir_iadd(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_ALPHA, 64),
+                                  nir_iadd(b, alpha_row, nir_u2u64(b, sx)));
+      /* The byte's aligned word: rows of bytes start anywhere. */
+      nir_def *word_at = nir_iand_imm(b, byte_at, ~(int64_t)3);
+      nir_def *shift = nir_ishl_imm(b, nir_u2u32(b, nir_iand_imm(b, byte_at, 3)), 3);
+      nir_def *alpha_word = nir_load_global(b, 1, 32, word_at,
+                                            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER,
+                                            .align_mul = 4);
+      nir_store_var(b, alpha, nir_iand_imm(b, nir_ushr(b, alpha_word, shift), 0xff), 1);
+   }
+   nir_pop_if(b, NULL);
+   nir_def *xr10 = nir_vec4(b, compose_xr10(b, field(b, word, 20, 10)),
+                            compose_xr10(b, field(b, word, 10, 10)),
+                            compose_xr10(b, field(b, word, 0, 10)), nir_load_var(b, alpha));
+   nir_def *pixel = nir_bcsel(b, extended, xr10, wide);
+   pixel = nir_bcsel(b, nir_ieq_imm(b, format, STELA_METAL_COMPOSE_RGBA8), rgba, pixel);
+   return nir_bcsel(b, nir_ieq_imm(b, format, STELA_METAL_COMPOSE_BGRA8), bgra, pixel);
+}
+
+nir_shader *stela_metal_compose_kernel(const nir_shader_compiler_options *options)
+{
+   nir_def *arguments, *thread;
+   nir_builder b =
+      kernel(options, "stela_metal_compose", STELA_METAL_COMPOSE_COUNT, &arguments, &thread);
+   nir_def *width = load(&b, arguments, STELA_METAL_COMPOSE_WIDTH, 32);
+   nir_def *down = nir_udiv(&b, thread, width);
+   nir_def *x = nir_isub(&b, thread, nir_imul(&b, down, width));
+   nir_def *y = nir_iadd(&b, load(&b, arguments, STELA_METAL_COMPOSE_FIRST_ROW, 32), down);
+   nir_def *count = load(&b, arguments, STELA_METAL_COMPOSE_LAYER_COUNT, 32);
+   /* Red, green and blue over the black background. */
+   nir_variable *color = nir_local_variable_create(b.impl, glsl_uvec_type(3), "color");
+   nir_store_var(&b, color, nir_imm_ivec3(&b, 0, 0, 0), 0x7);
+   for (unsigned i = 0; i < STELA_METAL_COMPOSE_MAX_LAYERS; i++) {
+      nir_def *layer = nir_iadd_imm(&b, arguments,
+                                    STELA_METAL_COMPOSE_LAYERS + i * STELA_METAL_COMPOSE_LAYER_BYTES);
+      nir_push_if(&b, nir_ult(&b, nir_imm_int(&b, i), count));
+      {
+         const unsigned source = STELA_METAL_COMPOSE_LAYER_SOURCE;
+         const unsigned destination = STELA_METAL_COMPOSE_LAYER_DESTINATION;
+         nir_def *dx = load(&b, layer, destination, 32);
+         nir_def *dy = load(&b, layer, destination + 4, 32);
+         nir_def *dw = load(&b, layer, destination + 8, 32);
+         nir_def *dh = load(&b, layer, destination + 12, 32);
+         nir_def *inside = nir_iand(&b, nir_iand(&b, nir_uge(&b, x, dx), nir_ult(&b, x, nir_iadd(&b, dx, dw))),
+                                    nir_iand(&b, nir_uge(&b, y, dy), nir_ult(&b, y, nir_iadd(&b, dy, dh))));
+         nir_push_if(&b, inside);
+         {
+            /* The source pixel under the centre: (2 (x - dx) + 1) sw / 2 dw. */
+            nir_def *sx = nir_iadd(
+               &b, load(&b, layer, source, 32),
+               nir_udiv(&b,
+                        nir_imul(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, nir_isub(&b, x, dx), 1), 1),
+                                 load(&b, layer, source + 8, 32)),
+                        nir_ishl_imm(&b, dw, 1)));
+            nir_def *sy = nir_iadd(
+               &b, load(&b, layer, source + 4, 32),
+               nir_udiv(&b,
+                        nir_imul(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, nir_isub(&b, y, dy), 1), 1),
+                                 load(&b, layer, source + 12, 32)),
+                        nir_ishl_imm(&b, dh, 1)));
+            nir_def *pixel = compose_source(&b, layer, sx, sy);
+            nir_def *alpha = nir_channel(&b, pixel, 3);
+            nir_def *premultiplied = nir_ine_imm(
+               &b, nir_iand_imm(&b, load(&b, layer, STELA_METAL_COMPOSE_LAYER_FLAGS, 32),
+                                STELA_METAL_COMPOSE_PREMULTIPLIED),
+               0);
+            nir_def *below = nir_load_var(&b, color);
+            nir_def *rest = nir_isub(&b, nir_imm_int(&b, 255), alpha);
+            nir_def *channels[3];
+            for (unsigned c = 0; c < 3; c++) {
+               nir_def *value = nir_channel(&b, pixel, c);
+               value = nir_bcsel(&b, premultiplied, value, compose_scale(&b, value, alpha));
+               nir_def *sum = nir_iadd(&b, value, compose_scale(&b, nir_channel(&b, below, c), rest));
+               channels[c] = nir_umin(&b, sum, nir_imm_int(&b, 255));
+            }
+            nir_store_var(&b, color, nir_vec(&b, channels, 3), 0x7);
+         }
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_def *rgb = nir_load_var(&b, color);
+   nir_def *value = nir_ior(&b, nir_ior_imm(&b, nir_channel(&b, rgb, 2), 0xff000000u),
+                            nir_ior(&b, nir_ishl_imm(&b, nir_channel(&b, rgb, 1), 8),
+                                    nir_ishl_imm(&b, nir_channel(&b, rgb, 0), 16)));
+   nir_def *offset =
+      nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, y),
+                            nir_u2u64(&b, load(&b, arguments, STELA_METAL_COMPOSE_PITCH, 32))),
+               nir_u2u64(&b, nir_ishl_imm(&b, x, 2)));
+   nir_store_global(&b, value,
+                    nir_iadd(&b, load(&b, arguments, STELA_METAL_COMPOSE_DESTINATION, 64), offset),
+                    .align_mul = 4);
+   return finish(&b);
 }
 
 /* A word's bytes in the other order: ETC and EAC blocks are big-endian. */
@@ -3414,132 +3646,4 @@ nir_shader *stela_metal_decode_astc_kernel(const nir_shader_compiler_options *op
    nir_def *hdr = nir_ieq_imm(&b, k.codec, STELA_METAL_BLOCKS_ASTC_HDR);
    return store_decoded(&b, &k, stela_metal_decode_astc(&b, k.words, k.x, k.y, k.block_width,
                                                         k.block_height, srgb, hdr));
-}
-
-/* (value * weight + 127) / 255, the CPU compose's rounding. */
-static nir_def *compose_scale(nir_builder *b, nir_def *value, nir_def *weight)
-{
-   return nir_udiv_imm(b, nir_iadd_imm(b, nir_imul(b, value, weight), 127), 255);
-}
-
-/* The source column or row a destination one `at` pixels into `to` takes
- * from `from`: the one under its centre. The sizes stay below 2^15, which
- * ComposeArguments checks, so the product fits 32 bits. */
-static nir_def *compose_nearest(nir_builder *b, nir_def *at, nir_def *from, nir_def *to)
-{
-   return nir_udiv(b, nir_imul(b, nir_iadd_imm(b, nir_ishl_imm(b, at, 1), 1), from),
-                   nir_ishl_imm(b, to, 1));
-}
-
-/* An extended-range code's 8-bit display value, (code - 383) / 2 clamped
- * to [0, 255]: the DCP's XR10_DISPLAY. */
-static nir_def *compose_xr10(nir_builder *b, nir_def *word, unsigned shift)
-{
-   nir_def *code = nir_iand_imm(b, nir_ushr_imm(b, word, shift), 0x3ff);
-   nir_def *value = nir_umin(b, nir_ushr_imm(b, nir_iadd_imm(b, code, -383), 1), nir_imm_int(b, 255));
-   return nir_bcsel(b, nir_uge_imm(b, code, 385), value, nir_imm_int(b, 0));
-}
-
-/* The byte at `address`, read as the aligned word holding it: an alpha
- * plane's rows need not be word aligned, and the word stays within the
- * page the byte is in. */
-static nir_def *compose_byte(nir_builder *b, nir_def *address)
-{
-   nir_def *word = nir_load_global(b, 1, 32, nir_iand_imm(b, address, ~(uint64_t)3),
-                                   .access = ACCESS_NON_WRITEABLE, .align_mul = 4);
-   nir_def *shift = nir_ishl_imm(b, nir_u2u32(b, nir_iand_imm(b, address, 3)), 3);
-   return nir_iand_imm(b, nir_ushr(b, word, shift), 0xff);
-}
-
-nir_shader *stela_metal_compose_kernel(const nir_shader_compiler_options *options)
-{
-   nir_def *arguments, *thread;
-   nir_builder b = kernel(options, "stela_metal_compose", STELA_METAL_COMPOSE_COUNT, &arguments,
-                          &thread);
-   nir_def *width = load(&b, arguments, STELA_METAL_COMPOSE_WIDTH, 32);
-   nir_def *x = nir_umod(&b, thread, width);
-   nir_def *y = nir_iadd(&b, load(&b, arguments, STELA_METAL_COMPOSE_FIRST_ROW, 32),
-                         nir_udiv(&b, thread, width));
-   nir_def *layers = load(&b, arguments, STELA_METAL_COMPOSE_LAYER_COUNT, 32);
-   /* Blue, green and red composed so far, over black. */
-   nir_variable *out[3];
-   nir_variable *in[4];
-   for (unsigned c = 0; c < 4; c++) {
-      if (c < 3) {
-         out[c] = nir_local_variable_create(b.impl, glsl_uint_type(), "out");
-         nir_store_var(&b, out[c], nir_imm_int(&b, 0), 1);
-      }
-      in[c] = nir_local_variable_create(b.impl, glsl_uint_type(), "in");
-   }
-   for (unsigned i = 0; i < STELA_METAL_COMPOSE_LAYERS_MAX; i++) {
-      nir_def *layer = nir_iadd_imm(&b, arguments,
-                                    STELA_METAL_COMPOSE_LAYERS + i * STELA_METAL_COMPOSE_LAYER_BYTES);
-      nir_def *dx = load(&b, layer, STELA_METAL_COMPOSE_X, 32);
-      nir_def *dy = load(&b, layer, STELA_METAL_COMPOSE_Y, 32);
-      nir_def *inside = nir_iand(&b, nir_ult(&b, nir_imm_int(&b, (int)i), layers),
-                                 nir_iand(&b, nir_uge(&b, x, dx), nir_uge(&b, y, dy)));
-      inside = nir_iand(&b, inside,
-                        nir_iand(&b, nir_ult(&b, x, load(&b, layer, STELA_METAL_COMPOSE_COLUMNS_END, 32)),
-                                 nir_ult(&b, y, load(&b, layer, STELA_METAL_COMPOSE_ROWS_END, 32))));
-      nir_push_if(&b, inside);
-      {
-         nir_def *column = compose_nearest(&b, nir_isub(&b, x, dx),
-                                           load(&b, layer, STELA_METAL_COMPOSE_SOURCE_WIDTH, 32),
-                                           load(&b, layer, STELA_METAL_COMPOSE_WIDTH_SHOWN, 32));
-         nir_def *row = compose_nearest(&b, nir_isub(&b, y, dy),
-                                        load(&b, layer, STELA_METAL_COMPOSE_SOURCE_HEIGHT, 32),
-                                        load(&b, layer, STELA_METAL_COMPOSE_HEIGHT_SHOWN, 32));
-         nir_def *stride = load(&b, layer, STELA_METAL_COMPOSE_STRIDE, 32);
-         nir_def *address = nir_iadd(&b, load(&b, layer, STELA_METAL_COMPOSE_SOURCE, 64),
-                                     nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, row), nir_u2u64(&b, stride)),
-                                              nir_u2u64(&b, nir_ishl_imm(&b, column, 2))));
-         nir_def *word = nir_load_global(&b, 1, 32, address, .access = ACCESS_NON_WRITEABLE,
-                                         .align_mul = 4);
-         nir_def *flags = load(&b, layer, STELA_METAL_COMPOSE_FLAGS, 32);
-         nir_push_if(&b, nir_test_mask(&b, flags, STELA_METAL_COMPOSE_XR10));
-         {
-            nir_def *alpha = nir_iadd(&b, load(&b, layer, STELA_METAL_COMPOSE_ALPHA, 64),
-                                      nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, row),
-                                                            nir_u2u64(&b, load(&b, layer,
-                                                                               STELA_METAL_COMPOSE_ALPHA_STRIDE, 32))),
-                                               nir_u2u64(&b, column)));
-            nir_store_var(&b, in[0], compose_xr10(&b, word, 0), 1);
-            nir_store_var(&b, in[1], compose_xr10(&b, word, 10), 1);
-            nir_store_var(&b, in[2], compose_xr10(&b, word, 20), 1);
-            nir_store_var(&b, in[3], compose_byte(&b, alpha), 1);
-         }
-         nir_push_else(&b, NULL);
-         {
-            nir_def *low = nir_iand_imm(&b, word, 0xff);
-            nir_def *high = nir_iand_imm(&b, nir_ushr_imm(&b, word, 16), 0xff);
-            nir_def *rgba = nir_test_mask(&b, flags, STELA_METAL_COMPOSE_RGBA);
-            nir_store_var(&b, in[0], nir_bcsel(&b, rgba, high, low), 1);
-            nir_store_var(&b, in[1], nir_iand_imm(&b, nir_ushr_imm(&b, word, 8), 0xff), 1);
-            nir_store_var(&b, in[2], nir_bcsel(&b, rgba, low, high), 1);
-            nir_store_var(&b, in[3], nir_ushr_imm(&b, word, 24), 1);
-         }
-         nir_pop_if(&b, NULL);
-         nir_def *alpha = nir_load_var(&b, in[3]);
-         nir_def *premultiplied = nir_test_mask(&b, flags, STELA_METAL_COMPOSE_PREMULTIPLIED);
-         nir_def *below = nir_isub(&b, nir_imm_int(&b, 255), alpha);
-         for (unsigned c = 0; c < 3; c++) {
-            nir_def *value = nir_load_var(&b, in[c]);
-            value = nir_bcsel(&b, premultiplied, value, compose_scale(&b, value, alpha));
-            value = nir_iadd(&b, value, compose_scale(&b, nir_load_var(&b, out[c]), below));
-            nir_store_var(&b, out[c], nir_umin(&b, value, nir_imm_int(&b, 255)), 1);
-         }
-      }
-      nir_pop_if(&b, NULL);
-   }
-   nir_def *pixel = nir_ior(&b, nir_load_var(&b, out[0]),
-                            nir_ior(&b, nir_ishl_imm(&b, nir_load_var(&b, out[1]), 8),
-                                    nir_ishl_imm(&b, nir_load_var(&b, out[2]), 16)));
-   pixel = nir_ior_imm(&b, pixel, 0xff000000u);
-   nir_def *destination = nir_iadd(
-      &b, load(&b, arguments, STELA_METAL_COMPOSE_DESTINATION, 64),
-      nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, y),
-                            nir_u2u64(&b, load(&b, arguments, STELA_METAL_COMPOSE_PITCH, 32))),
-               nir_u2u64(&b, nir_ishl_imm(&b, x, 2))));
-   nir_store_global(&b, pixel, destination, .align_mul = 4);
-   return finish(&b);
 }

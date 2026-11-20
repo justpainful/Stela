@@ -688,6 +688,45 @@ fn a_fetch_takes_every_page_of_its_leaf_granule() {
     assert_eq!(sources(&machine, ItlbSource::LeafFills), 0);
 }
 
+/// A leaf's other pages are not logged as fills; after a TLBI of
+/// everything, the refill of the page whose fetch took them takes them
+/// again, so the next fetches of the leaf miss no more than before.
+#[test]
+fn a_whole_tlbi_refills_a_leaf_through_the_page_its_fetch_took() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0u32; (4 * 0x1000 / 4) as usize];
+    for page in 0..4 {
+        words[page * 0x400] = RET;
+    }
+    let pc = |page: u64| BASE + page * 0x1000;
+    let mut machine = machine(&words);
+    normal_memory(&mut machine, false);
+    assert!(matches!(
+        machine.fetch_block(pc(1), false),
+        Ok(Fetched::Block(_))
+    ));
+    let logged = |machine: &Machine<FakeHost, NoDevices>| {
+        machine
+            .fill_log
+            .iter()
+            .filter(|&&(page, _)| page >> 14 == pc(0) >> 14)
+            .count()
+    };
+    assert_eq!(logged(&machine), 1);
+    machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    // The fetch of another page of the leaf finds it refilled: no miss.
+    let misses = machine.statistics.itlb[0];
+    assert!(matches!(
+        machine.fetch_block(pc(2), false),
+        Ok(Fetched::Block(_))
+    ));
+    for page in 0..4 {
+        assert!(machine.current_key(pc(page)).is_some(), "page {page}");
+    }
+    assert_eq!(machine.statistics.itlb[0], misses);
+}
+
 /// A machine running `words` at BASE through 4 KiB pages of address
 /// space 0, page `n` at frame `BASE + n * 4 KiB`.
 fn machine_with_pages(words: &[u32]) -> Machine<FakeHost, NoDevices> {

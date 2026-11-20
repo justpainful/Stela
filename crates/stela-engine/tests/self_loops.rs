@@ -345,6 +345,8 @@ fn run(
     } = *case;
     let mut machine = machine(code, data, words, TargetCpu::detect())?;
     machine.set_self_loops(loops);
+    // Blocks, not regions, where the loop is not one.
+    machine.set_regions(false);
     // FEAT_CSV3 disclosed: every access masks its address, and the loop
     // carries its masked bases across the back edge.
     let pfr0 = machine.cpu.registers.get(Register::ID_AA64PFR0_EL1, 0);
@@ -510,6 +512,8 @@ fn a_store_loop_past_its_data_stops_at_the_end() -> Result<()> {
     for loops in [false, true] {
         let mut machine = machine(&code, &data, &copy, TargetCpu::detect())?;
         machine.set_self_loops(loops);
+        // Blocks, not regions, where the loop is not one.
+        machine.set_regions(false);
         machine.cpu.state.x[1] = data.0;
         machine.cpu.state.x[3] = end - 64;
         machine.cpu.state.x[2] = 1024;
@@ -546,6 +550,8 @@ fn an_endless_self_loop_takes_its_link_within_a_blocks_instructions() -> Result<
     for loops in [false, true] {
         let mut machine = machine(&code, &data, &words, TargetCpu::detect())?;
         machine.set_self_loops(loops);
+        // Blocks, not regions, where the loop is not one.
+        machine.set_regions(false);
         machine.cpu.pc = code.0;
         let (retired, blocks) = (machine.cpu.retired, machine.statistics.blocks);
         machine.run(blocks + 1000);
@@ -599,6 +605,8 @@ fn a_rewritten_self_loop_runs_its_new_body() -> Result<()> {
         for loops in [false, true] {
             let mut machine = machine(&code, &data, &words, TargetCpu::detect())?;
             machine.set_self_loops(loops);
+            // Blocks, not regions, where the loop is not one.
+            machine.set_regions(false);
             // SCTLR_EL1.UCI: EL0 cleans and invalidates by VA.
             let sctlr = machine.cpu.registers.get(Register::SCTLR_EL1, 0);
             machine
@@ -651,6 +659,8 @@ fn an_endless_loop_with_a_join_counts_each_path_within_its_bound() -> Result<()>
     for loops in [false, true] {
         let mut machine = machine(&code, &data, &words, TargetCpu::detect())?;
         machine.set_self_loops(loops);
+        // Blocks, not regions, where the loop is not one.
+        machine.set_regions(false);
         machine.cpu.pc = code.0;
         let (retired, blocks) = (machine.cpu.retired, machine.statistics.blocks);
         machine.run(blocks + 1000);

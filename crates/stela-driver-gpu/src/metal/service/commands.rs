@@ -285,8 +285,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     surface,
                     seed,
                     buffer,
-                    reserved: _,
+                    flags,
                 } = payload.record()?;
+                if flags & !SurfaceUse::SEED_ONLY != 0 {
+                    return Err(Fault::malformed("surface use flags").value(u64::from(flags)));
+                }
                 let texture = match buffer {
                     0 => Some(self.object::<TextureId>(connection, object)?),
                     1 => {
@@ -297,11 +300,18 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                         return Err(Fault::malformed("surface use kind").value(u64::from(kind)));
                     }
                 };
-                commands.surfaces.push(SurfaceNote {
+                let note = SurfaceNote {
                     texture,
                     surface,
                     seed,
-                });
+                };
+                match (flags & SurfaceUse::SEED_ONLY != 0, texture) {
+                    (true, Some(_)) => commands.seeds.push(note),
+                    (true, None) => {
+                        return Err(Fault::malformed("a seed report of a buffer"));
+                    }
+                    (false, _) => commands.surfaces.push(note),
+                }
             }
             CommandBufferCode::SampleCounters => {
                 let SampleCounters {

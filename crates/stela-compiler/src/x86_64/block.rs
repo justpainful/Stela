@@ -3,6 +3,7 @@ use crate::x86_64::asm::{Alu, Asm, Code, Cond, Gpr, Mem, Size};
 use alloc::vec;
 use alloc::vec::Vec;
 pub(crate) mod checked_memory;
+mod edges;
 mod recovery;
 pub(crate) use super::region::ResidentLoopPlan;
 
@@ -20,22 +21,21 @@ pub(super) fn exit_kind(code: &mut Code, kind: ExitKind) {
     exit_kind_with(&mut code.asm(), kind);
 }
 
-/// `mov edx,word`, the patch point's `jmp` to the return after it, and the
-/// return to the engine: the exit to the target in RAX, unpadded
-/// (`chain::dynamic_exit`).
+/// The patch point, which falls into the rest while unlinked, `mov
+/// edx,word` and the return to the engine: the exit to the target in RAX,
+/// unpadded (`chain::dynamic_exit`).
 pub(super) fn exit_kind_with(asm: &mut Asm, word: impl Into<ExitWord>) {
-    use super::chain::{DYNAMIC_EXIT_BYTES, EXIT_RETURN_BYTES, PATCH_BYTES, RET_ROOM};
+    exit_point(asm);
+    // MOV EDX zero-extends to the ABI's u64.
+    asm.fixed(&super::chain::word_return(word.into().encoded()));
+}
+
+/// The start of every exit: its patch point with the NOP after it that the
+/// pad before it takes where the code lands (`chain::exit_point`).
+fn exit_point(asm: &mut Asm) {
     // An exit hands the engine the state block, which must be current.
     asm.refuse_dirty_homes("a block exit");
-    // MOV EDX zero-extends to the ABI's u64.
-    asm.mov_imm32(Gpr::Rdx, word.into().encoded());
-    asm.fixed(&RET_ROOM);
-    super::chain::exit_return(asm);
-    // The pad that makes the patch point patchable where the code lands
-    // (`chain::dynamic_patch`).
-    for _ in 5 + PATCH_BYTES + EXIT_RETURN_BYTES..DYNAMIC_EXIT_BYTES {
-        asm.int3();
-    }
+    asm.fixed(&super::chain::exit_point(0));
 }
 
 /// Pad the exits of `code`, a block's whose direct exits are `exits`, for
@@ -68,14 +68,16 @@ pub(crate) fn direct_exit(code: &mut Code, target: GuestAddress, kind: ExitKind)
     direct_exit_with(&mut code.asm(), target, kind);
 }
 
-/// `movabs rax,target` and the exit of `word`, after its empty link slot in
-/// code whose exits keep one.
+/// The exit of `word` to `target`, after its empty link slot in code whose
+/// exits keep one: the patch point, then what only the unlinked path runs,
+/// `movabs rax,target`, `mov edx,word` and the return.
 pub(super) fn direct_exit_with(asm: &mut Asm, target: GuestAddress, word: impl Into<ExitWord>) {
     let word = word.into();
     let slot = super::chain::link_slot(asm.linked_block(), target, word.kind);
     super::chain::empty_link(asm, slot);
+    exit_point(asm);
     asm.guest_imm64(Gpr::Rax, target);
-    exit_kind_with(asm, word);
+    asm.fixed(&super::chain::word_return(word.encoded()));
 }
 
 fn conditional_exit(
@@ -127,6 +129,7 @@ pub(crate) fn emit_ordinary_for_target(
             pinned: false,
             frame_loop: None,
             self_loop: None,
+            region: false,
         },
         super::MemoryChecks::DEFAULT,
         super::NativeSystem::NONE,
@@ -152,6 +155,7 @@ pub(crate) fn emit_frame_loop(
             pinned: false,
             frame_loop: Some(entry),
             self_loop: None,
+            region: false,
         },
         super::MemoryChecks::DEFAULT,
         super::NativeSystem::NONE,
@@ -194,6 +198,7 @@ pub(crate) fn emit_for_target(
             pinned: false,
             frame_loop: None,
             self_loop: None,
+            region: false,
         },
         checks,
         super::NativeSystem::NONE,
@@ -214,13 +219,20 @@ pub(crate) fn emit_system_mode(
     checks: super::MemoryChecks,
     native: super::NativeSystem,
 ) -> (NativeBlock, Vec<crate::block::FaultRecovery>) {
-    let (block, recovery, _) =
-        emit_system_mode_looped(instructions, terminal, fallthrough, target, checks, native);
+    let (block, recovery, _) = emit_system_mode_looped(
+        instructions,
+        terminal,
+        fallthrough,
+        target,
+        checks,
+        native,
+        false,
+    );
     (block, recovery)
 }
 
 /// What a block's emission leaves beside its code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Shape {
     /// The block runs its iterations inside itself ([`SelfLoop`]).
     pub self_loop: bool,
@@ -228,9 +240,14 @@ pub(crate) struct Shape {
     /// and the paths placed behind the jumps over them, start to end; `(0,
     /// 0)` with none (`CompiledBlock::cold`).
     pub cold: (u32, u32),
+    /// A region's direct exits ([`crate::block::region`]), which it
+    /// lays out itself; `None` for a block, whose exits
+    /// [`successor_exits`] finds.
+    pub exits: Option<Vec<super::chain::DirectExit>>,
 }
 
-/// [`emit_system_mode`], and the block's [`Shape`].
+/// [`emit_system_mode`], and the block's [`Shape`]; with `region`, the
+/// instructions are a region's ([`crate::block::region`]).
 pub(crate) fn emit_system_mode_looped(
     instructions: &[Instruction],
     terminal: Option<&(GuestAddress, Terminator)>,
@@ -238,6 +255,7 @@ pub(crate) fn emit_system_mode_looped(
     target: crate::TargetCpu,
     checks: super::MemoryChecks,
     native: super::NativeSystem,
+    region: bool,
 ) -> (NativeBlock, Vec<crate::block::FaultRecovery>, Shape) {
     // Guest registers stay in host registers (`x86_64::pinned`), which the
     // engine's fault settlement reads. Pure spans can temporarily keep other
@@ -255,7 +273,11 @@ pub(crate) fn emit_system_mode_looped(
             fault_table: true,
             pinned: true,
             frame_loop: None,
-            self_loop: SelfLoop::admit(instructions, terminal, native),
+            self_loop: match region {
+                true => None,
+                false => SelfLoop::admit(instructions, terminal, native),
+            },
+            region,
         },
         super::MemoryChecks {
             guest_range: true,
@@ -282,7 +304,7 @@ pub(crate) fn emit_system_mode_looped(
 ///
 /// `GuestState::loop_retired` counts the instructions of the iterations
 /// before the running one. Every exit adds it to the chain's retired count
-/// (`chain::ChainControl::retired`) and clears it; a fault's settlement does
+/// (`chain::Account::retired`) and clears it; a fault's settlement does
 /// so in the engine. Exits and faults then count the running iteration's
 /// instructions as a block's do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +324,7 @@ impl SelfLoop {
     /// The longest body admitted: an entry runs at least two iterations.
     const MAX_INSTRUCTIONS: usize = 64;
 
-    fn admit(
+    pub(crate) fn admit(
         instructions: &[Instruction],
         terminal: Option<&(GuestAddress, Terminator)>,
         native: super::NativeSystem,
@@ -375,23 +397,17 @@ struct LoopExits {
 /// `GuestState::loop_retired`.
 const LOOP_RETIRED: u32 = core::mem::offset_of!(crate::GuestState, loop_retired) as u32;
 
-/// Move `GuestState::loop_retired`, less `less`, to the chain's retired
-/// count and clear it, before an exit of a [`SelfLoop`].
+/// Move `GuestState::loop_retired`, less `less`, to the instructions the
+/// chain's account counts and clear it, before an exit of a [`SelfLoop`].
 fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
     asm.mov_load(Size::Qword, Gpr::Rax, super::frame(LOOP_RETIRED));
     if less != 0 {
         asm.alu_imm8(Alu::Sub, Size::Qword, Gpr::Rax, less as i8);
     }
-    asm.place(Gpr::Rcx, super::chain::CONTROL_PLACE);
-    asm.alu(
-        Alu::Add,
-        Size::Qword,
-        Mem::base(Gpr::Rcx, super::chain::RETIRED_OFFSET),
-        Gpr::Rax,
-    );
     // The engine's counts, while it profiles: the entry and what its
     // iterations retired.
     if counts {
+        asm.place(Gpr::Rcx, super::chain::CONTROL_PLACE);
         asm.alu(
             Alu::Add,
             Size::Qword,
@@ -405,6 +421,7 @@ fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
             1,
         );
     }
+    super::chain::account_add(asm);
     asm.alu_imm8(Alu::And, Size::Qword, super::frame(LOOP_RETIRED), 0);
 }
 
@@ -464,6 +481,9 @@ struct RegionPolicy {
     frame_loop: Option<GuestAddress>,
     /// Run the block's iterations inside it ([`SelfLoop`]).
     self_loop: Option<SelfLoop>,
+    /// The instructions are a region's: its branches into itself jump
+    /// there ([`edges`]).
+    region: bool,
 }
 
 /// The final address of a flagless ADD that overwrites its adjacent ADR(P).
@@ -508,14 +528,14 @@ fn emit_selected(
         pinned,
         frame_loop,
         self_loop,
+        region,
     } = regions;
+    let region = region.then(|| edges::Region::plan(instructions, terminal));
     let mut fault_recovery = vec![];
     let source_rows = instructions.len() + usize::from(terminal.is_some());
-    // The buffer starts with room for most blocks' code
-    // ([`Code::new`]): grown from empty, it reallocated most blocks'.
     let mut block = super::Emitted {
-        x86_64_code: Code::new(),
         source_map: Vec::with_capacity(source_rows),
+        ..super::Emitted::default()
     };
     let code = &mut block.x86_64_code;
     code.set_pinned(pinned);
@@ -583,7 +603,18 @@ fn emit_selected(
     // to the emitter. Region admission can still borrow a suffix of them.
     // A self-loop's forward branches inside its body ([`loop_joins`]),
     // where one run covers the body or none runs, and where they land.
+    // A region's internal branches take the joins' part: before each the
+    // word holds NZCV, and where each lands nothing is held.
+    let region_joins = region.as_ref().map(|region| {
+        region
+            .internal
+            .iter()
+            .enumerate()
+            .filter_map(|(at, to)| Some((at, (*to)?)))
+            .collect::<Vec<_>>()
+    });
     let joins = match self_loop {
+        _ if region_joins.is_some() => region_joins.unwrap_or_default(),
         Some(self_loop)
             if self_loop.joins
                 && (!(pinned && !code.constant_time() && !checks.translated)
@@ -596,6 +627,9 @@ fn emit_selected(
     let mut landing = [false; MAX_BLOCK_INSTRUCTIONS + 1];
     for &(_, at) in &joins {
         landing[at] = true;
+    }
+    if let Some(region) = &region {
+        landing[..region.rows].copy_from_slice(&region.landing);
     }
     let landing = &landing[..=instructions.len()];
     let mut range_rows = [true; MAX_BLOCK_INSTRUCTIONS];
@@ -672,7 +706,9 @@ fn emit_selected(
     // The side exits whose branch the host flags alone decide (`pending`):
     // the index of each in `side_exits` and its borrow. Out of line, before
     // the terminal, each stores the word and jumps on to its exit.
-    let mut flag_exits: Vec<(usize, bool)> = vec![];
+    // With a region, also those that settle L first ([`edges::settle`]).
+    // And a run's locals over the whole region, which they store.
+    let mut flag_exits: Vec<(usize, Option<bool>, bool, super::pinned::Dirty)> = vec![];
     // Accesses that address memory from an earlier access's masked address
     // (`masked_base`), which the instructions emitted alone keep track of.
     let reuse_bases = pinned
@@ -697,8 +733,10 @@ fn emit_selected(
         None => vec![],
     };
     let mut carried = vec![];
-    // Whether one run covers a self-loop's body ([`pinned::Span::plan_loop`]).
+    // Whether one run covers a self-loop's body ([`pinned::Span::plan_loop`]),
+    // a region or, `inner_loop`, one of the region's loops.
     let mut loop_run = false;
+    let mut inner_loop = false;
     // Guest vectors stay in host registers between the instructions that
     // only compute ([`super::vector_cache`]): in system-mode blocks, whose
     // faults the fault table settles from the state block the cache keeps
@@ -714,6 +752,33 @@ fn emit_selected(
     // The vector use of the instruction after the one being emitted, which
     // is the next one emitted unless a group takes it.
     let mut next_class: Option<(usize, VectorUse)> = None;
+    // Where a region's rows that edges land at start, and what its edges
+    // leave to bind ([`edges::Pending`]).
+    let mut region_landings: Vec<Option<usize>> =
+        vec![None; region.as_ref().map_or(0, |region| region.rows)];
+    let mut region_pending = edges::Pending::default();
+    // Whether NZCV is dead at a row: along every path of a region.
+    let dead_from = |row: usize| match &region {
+        Some(region) => region.nzcv_dead(instructions, row),
+        None => super::flag_word::dead_from(instructions, row),
+    };
+    if region.is_some()
+        && runs
+        && let Some(plan) = super::pinned::Span::plan_loop(instructions)
+    {
+        // One run covers the region: its locals stay in their hosts across
+        // every edge, and the exits store them. Each counts as written from
+        // the start, so a fault on any path recovers it from its host,
+        // which holds its value from the entry on.
+        if plan.takes_slots() {
+            bases.reset();
+        }
+        let mut active = plan.enter_all(code);
+        active.emitted(code, instructions);
+        run = Some((active, usize::MAX));
+        next_pinned_span = usize::MAX;
+        loop_run = true;
+    }
     for copy in 0..if self_loop.is_some() { 2_usize } else { 1 } {
         if copy == 0
             && self_loop.is_some()
@@ -745,17 +810,16 @@ fn emit_selected(
             bases = super::masked_base::Tracker::carried(&carried);
             emitted_alone = true;
         }
-        if self_loop.is_some() {
-            loop_exits.landings[copy] = vec![None; instructions.len() + 1];
-        }
+        // A region keeps its own landings (`region_landings`).
+        loop_exits.landings[copy] = vec![None; instructions.len() + 1];
         while cursor < instructions.len() {
             if let Some(borrow) = pending
                 && (landing[cursor]
-                    || joins.iter().any(|&(at, _)| at == cursor)
+                    || (region.is_none() && joins.iter().any(|&(at, _)| at == cursor))
                     || !reads_host_flags(&instructions[cursor].operation))
             {
                 pending = None;
-                if !super::flag_word::dead_from(instructions, cursor) {
+                if !dead_from(cursor) {
                     super::flag_word::capture(code, borrow);
                     after.rax = super::Rax::Nzcv;
                 }
@@ -820,10 +884,56 @@ fn emit_selected(
                     && let Some((active, _)) = run.take()
                 {
                     active.leave(code);
+                    if core::mem::take(&mut inner_loop) {
+                        // The loop fell out of its last branch.
+                        loop_run = false;
+                        next_pinned_span = cursor;
+                    }
                 }
             }
+            // A loop of the region that one run can cover: its locals are
+            // loaded before its landing and stay in their hosts across its
+            // back edges ([`edges::Region::inner_loop`]).
+            if let Some(region) = &region
+                && runs
+                && run.is_none()
+                && region.landing[cursor]
+                && let Some(last) = region.inner_loop(cursor)
+                && let body = &instructions[cursor..(last + 1).min(instructions.len())]
+                && let Some(plan) = super::pinned::Span::plan_loop(body)
+            {
+                if plan.takes_slots() {
+                    bases.reset();
+                }
+                let mut active = plan.enter_all(code);
+                // Each counts as written from the start, as over a region.
+                active.emitted(code, body);
+                let end = if last < instructions.len() {
+                    last + 1
+                } else {
+                    usize::MAX
+                };
+                run = Some((active, end));
+                run_emitted = cursor;
+                next_pinned_span = usize::MAX;
+                loop_run = true;
+                inner_loop = true;
+            }
+            // An edge lands here: after any run ended, before one starts.
+            if let Some(region) = &region
+                && region.landing[cursor]
+            {
+                debug_assert!(run.is_none() || loop_run);
+                region_landings[cursor] = Some(code.len());
+                bind_landing(code, &mut region_pending, cursor);
+            }
+            // A group and a run end where an edge lands or leaves.
+            let group_end = region.as_ref().map_or(instructions.len(), |region| {
+                region.run_end(instructions, cursor)
+            });
+            let window = &instructions[cursor..group_end];
             if runs && run.is_none() && cursor >= next_pinned_span {
-                let (count, plan) = super::pinned::Span::plan(&instructions[cursor..]);
+                let (count, plan) = super::pinned::Span::plan(window);
                 next_pinned_span = cursor + count.max(1);
                 if let Some(plan) = plan {
                     // Its locals overwrite the slots' kept addresses.
@@ -838,10 +948,7 @@ fn emit_selected(
                     run_emitted = cursor;
                 }
             }
-            if fuse_simd
-                && let Some(group) =
-                    super::simd::sha256::HashGroup::recognize(&instructions[cursor..])
-            {
+            if fuse_simd && let Some(group) = super::simd::sha256::HashGroup::recognize(window) {
                 let (offsets, count, result) = group.emit(code, target);
                 block.source_map.extend(
                     instructions[cursor..cursor + count]
@@ -861,12 +968,8 @@ fn emit_selected(
                 )
             {
                 if fuse_vaes_rounds
-                    && super::simd::aes::packed_rounds::emit(
-                        code,
-                        &mut block.source_map,
-                        &instructions[cursor..],
-                    )
-                    .is_some()
+                    && super::simd::aes::packed_rounds::emit(code, &mut block.source_map, window)
+                        .is_some()
                 {
                     cursor += 4;
                     continue;
@@ -875,7 +978,7 @@ fn emit_selected(
                     && let Some(result) = super::simd::aes::emit_round_pair(
                         code,
                         &mut block.source_map,
-                        &instructions[cursor..],
+                        window,
                         target,
                     )
                 {
@@ -891,7 +994,7 @@ fn emit_selected(
                     Rearrange::Permute { .. } => super::simd::rearrange::emit_reverse_dword_run(
                         code,
                         &mut block.source_map,
-                        &instructions[cursor..],
+                        window,
                         target,
                     ),
                     Rearrange::Table {
@@ -901,7 +1004,7 @@ fn emit_selected(
                     } if fuse_single_table => super::simd::rearrange::emit_single_table_run(
                         code,
                         &mut block.source_map,
-                        &instructions[cursor..],
+                        window,
                         target,
                     ),
                     _ => None,
@@ -916,7 +1019,7 @@ fn emit_selected(
                 && let Some(result) = super::simd::precision::emit_half_widen_pair(
                     code,
                     &mut block.source_map,
-                    &instructions[cursor..],
+                    window,
                 )
             {
                 after.xmm0 = Some(result);
@@ -932,7 +1035,7 @@ fn emit_selected(
                 && let Some(count) = super::pinned::emit_carry_run(
                     code,
                     &mut block.source_map,
-                    &instructions[cursor..],
+                    window,
                     held.rax == super::Rax::Nzcv,
                 )
             {
@@ -954,7 +1057,7 @@ fn emit_selected(
                 && super::register_offset::emit_load_store(
                     code,
                     &mut block.source_map,
-                    &instructions[cursor..],
+                    window,
                     checks_at(cursor),
                     held.rax,
                 )
@@ -968,19 +1071,12 @@ fn emit_selected(
                         transfer: super::MemoryTransfer::Load { .. },
                         mode: super::AddressMode::Offset | super::AddressMode::PostIndex,
                         ..
-                    } => super::memory_recipe::CompareLoads::new(
-                        &instructions[cursor..],
-                        held.rax,
-                        checks,
-                    ),
+                    } => super::memory_recipe::CompareLoads::new(window, held.rax, checks),
                     Operation::MemoryPair {
                         transfer: super::MemoryTransfer::Load { .. },
                         mode: super::AddressMode::Offset,
                         ..
-                    } => super::memory_recipe::CompareLoads::from_pair(
-                        &instructions[cursor..],
-                        checks,
-                    ),
+                    } => super::memory_recipe::CompareLoads::from_pair(window, checks),
                     _ => None,
                 };
                 if let Some(group) = group {
@@ -988,7 +1084,7 @@ fn emit_selected(
                     after.rax = group.emit(
                         code,
                         &mut block.source_map,
-                        &instructions[cursor..],
+                        window,
                         checks,
                         native_branch_after(compare),
                     );
@@ -1000,11 +1096,7 @@ fn emit_selected(
                 && !code.constant_time()
                 && matches!(instructions[cursor].operation, Operation::IntegerMath(operand)
                 if matches!(operand.kind, integer_math::Kind::Divide { .. }))
-                && super::integer_math::emit_divide_remainder(
-                    code,
-                    &mut block.source_map,
-                    &instructions[cursor..],
-                )
+                && super::integer_math::emit_divide_remainder(code, &mut block.source_map, window)
             {
                 cursor += 2;
                 continue;
@@ -1012,8 +1104,7 @@ fn emit_selected(
             // Build the new candidate privately. Rejection leaves both cursor and
             // output untouched, so the legacy clean-load chunk partition is exact.
             if optimize_regions
-                && let Ok(Some(region)) =
-                    super::region::emit_allocated_prefix(&instructions[cursor..])
+                && let Ok(Some(region)) = super::region::emit_allocated_prefix(window)
             {
                 let count = region.consumed_instructions;
                 let mut baseline = Code::new();
@@ -1045,7 +1136,7 @@ fn emit_selected(
             }
             if optimize_regions
                 && let Ok(region) = super::region::emit_clean_load_prefix_with(
-                    &instructions[cursor..],
+                    window,
                     checks,
                     fault_table,
                     ranges.map(|ranges| &ranges[cursor..]),
@@ -1142,6 +1233,7 @@ fn emit_selected(
             if pinned
                 && !code.constant_time()
                 && let Some(second) = instructions.get(cursor + 1)
+                && !landing[cursor + 1]
                 && instruction.pc.0.checked_add(4) == Some(second.pc.0)
                 && let Some(address) = fold_address_pair(&instruction.operation, &second.operation)
             {
@@ -1193,6 +1285,70 @@ fn emit_selected(
             }
             block.source_map.push((instruction.pc, code.len()));
             code.set_instruction(block.source_map.len() - 1);
+            // A region's branch into itself, or one that does not fall
+            // through: a run open here covers the region.
+            if let Some(region) = &region
+                && region.handles(instructions, cursor)
+            {
+                debug_assert!(run.is_none() || loop_run);
+                let dirty = run
+                    .as_ref()
+                    .map_or_else(Default::default, |(active, _)| active.dirty());
+                let (target, conditional) =
+                    crate::block::region::branch_target(&instruction.operation)
+                        .expect("a region's branch");
+                let internal = region.internal[cursor];
+                // A B.cond after a setter that left NZCV in the host flags
+                // takes them there; the fallthrough keeps them.
+                let mut borrow = pending;
+                let taken = match (&instruction.operation, borrow.as_mut()) {
+                    _ if !conditional => None,
+                    (Operation::BranchCondition { condition, .. }, Some(borrow)) => {
+                        Some(super::flag_word::host_condition(code, *condition, borrow))
+                    }
+                    _ => branch_condition(code, &instruction.operation, held.rax),
+                };
+                if pending.is_some() {
+                    pending = borrow;
+                }
+                let over = taken.map(|taken| code.asm().jcc(taken.negate()));
+                // The taken path stores the word unless where it lands
+                // redefines NZCV before anything sees it; a back edge's exit
+                // at its bound needs it.
+                if let Some(borrow) = borrow
+                    && internal.is_none_or(|to| to <= cursor || !dead_from(to))
+                {
+                    super::flag_word::capture(code, borrow);
+                }
+                match internal {
+                    Some(to) => edges::edge(
+                        code,
+                        region,
+                        cursor,
+                        to,
+                        target,
+                        &region_landings,
+                        &mut region_pending,
+                        dirty,
+                    ),
+                    None => {
+                        // A branch to elsewhere that is always taken.
+                        super::pinned::write_back_locals(code, dirty);
+                        let mut asm = code.asm();
+                        if region.dirty(cursor) {
+                            edges::settle(&mut asm, 0);
+                        }
+                        side_exits.push((asm.jmp(), target, block.source_map.len()));
+                    }
+                }
+                if let Some(over) = over {
+                    code.asm().bind(over);
+                }
+                bases.after(instruction, None);
+                emitted_alone = true;
+                cursor += 1;
+                continue;
+            }
             if let Some(target) = instruction.operation.conditional_target() {
                 let taken = match (&instruction.operation, pending.as_mut()) {
                     (Operation::BranchCondition { condition, .. }, Some(borrow)) => {
@@ -1229,8 +1385,10 @@ fn emit_selected(
                             .push((Some(jump), target, rows, dirty, pending));
                     }
                 } else {
-                    if let Some(borrow) = pending {
-                        flag_exits.push((side_exits.len(), borrow));
+                    // A region's exit after a landing settles L first.
+                    let settles = region.as_ref().is_some_and(|region| region.dirty(cursor));
+                    if pending.is_some() || settles || dirty.iter().any(Option::is_some) {
+                        flag_exits.push((side_exits.len(), pending, settles, dirty));
                     }
                     side_exits.push((jump, target, block.source_map.len()));
                 }
@@ -1292,7 +1450,7 @@ fn emit_selected(
                 let ahead = if self_loop.is_some() {
                     &lookahead[cursor..]
                 } else {
-                    &instructions[cursor..]
+                    window
                 };
                 code.set_base_request(bases.plan(ahead));
             }
@@ -1322,7 +1480,7 @@ fn emit_selected(
                 super::pinned::reload(code);
                 code.set_pinned(true);
             } else if after.rax == super::Rax::Nzcv
-                && super::flag_word::dead_after(instructions, cursor)
+                && dead_from(cursor + 1)
                 && let Some(start) = block.source_map.last().map(|&(_, start)| start)
                 && let Some(tail) = super::flag_word::captured_tail(code, start)
             {
@@ -1449,7 +1607,10 @@ fn emit_selected(
             after = Held::NOTHING;
         }
     }
-    if let Some((active, _)) = run.take() {
+    // A region's run stays mapped to its terminal, whose exits store it.
+    if region.is_none()
+        && let Some((active, _)) = run.take()
+    {
         active.forget(code);
     }
     code.set_vector_cache(false);
@@ -1513,9 +1674,15 @@ fn emit_selected(
         || !flag_exits.is_empty()
     {
         let over = code.asm().jmp();
-        for (index, borrow) in flag_exits.drain(..) {
+        for (index, borrow, settles, dirty) in flag_exits.drain(..) {
             code.asm().bind(side_exits[index].0);
-            super::flag_word::capture(code, borrow);
+            if let Some(borrow) = borrow {
+                super::flag_word::capture(code, borrow);
+            }
+            super::pinned::write_back_locals(code, dirty);
+            if settles {
+                edges::settle(&mut code.asm(), 0);
+            }
             side_exits[index].0 = code.asm().jmp();
         }
         if let Some(cells) = native.pointer {
@@ -1545,6 +1712,8 @@ fn emit_selected(
     // A self-loop's second copy's source rows, which its faults' rows name
     // as the first copy's.
     let mut second_rows = vec![];
+    // A region's direct exits, as it lays them out.
+    let mut region_exits = None;
     if let (Some(_), Some((_, Terminator::Branch(operation)))) = (self_loop, terminal) {
         second_rows = block.source_map.split_off(loop_exits.first_rows);
         let (entry, conditional) = match *operation {
@@ -1625,6 +1794,107 @@ fn emit_selected(
         code.set_instruction(block.source_map.len() - 1);
         let taken = branch_condition(code, operation, after.rax);
         frame_loop.finish(code, taken, fallthrough);
+    } else if let Some(region) = &region {
+        let row = instructions.len();
+        let (mut rax, mut flags_live) = (after.rax, flags_live);
+        if region.landing.get(row) == Some(&true) {
+            code.forget_vectors();
+            region_landings[row] = Some(code.len());
+            bind_landing(code, &mut region_pending, row);
+            (rax, flags_live) = (super::Rax::Unknown, false);
+        }
+        let start = code.len();
+        let linked = code.asm().linked_block();
+        let mut exits = vec![];
+        // The locals a run over the region keeps in their hosts.
+        let dirty = match loop_run {
+            true => loop_exits.dirty,
+            false => Default::default(),
+        };
+        match (region.terminal, terminal) {
+            (Some(to), Some((pc, Terminator::Branch(operation)))) => {
+                // A branch back into the region.
+                block.source_map.push((*pc, code.len()));
+                code.set_instruction(block.source_map.len() - 1);
+                let (target, conditional) =
+                    crate::block::region::branch_target(operation).expect("a region's branch");
+                let taken = match conditional {
+                    true => branch_condition_with(code, operation, rax, flags_live),
+                    false => None,
+                };
+                let over = taken.map(|taken| code.asm().jcc(taken.negate()));
+                edges::edge(
+                    code,
+                    region,
+                    row,
+                    to,
+                    target,
+                    &region_landings,
+                    &mut region_pending,
+                    dirty,
+                );
+                if let Some(over) = over {
+                    code.asm().bind(over);
+                    super::pinned::write_back_locals(code, dirty);
+                    let mut asm = code.asm();
+                    if region.dirty(row) {
+                        edges::settle(&mut asm, 0);
+                    }
+                    exits.push(region_exit(
+                        &mut asm,
+                        fallthrough,
+                        ExitKind::Fallthrough.into(),
+                    ));
+                }
+                if let Some((active, _)) = run.take() {
+                    active.forget(code);
+                }
+            }
+            _ => {
+                // Its exits may be linked, or completed natively.
+                super::pinned::write_back_locals(code, dirty);
+                if let Some((active, _)) = run.take() {
+                    active.forget(code);
+                }
+                if region.dirty(row) {
+                    edges::settle(&mut code.asm(), 0);
+                    (rax, flags_live) = (super::Rax::Unknown, false);
+                }
+                let at = code.len();
+                emit_terminal(
+                    code,
+                    &mut block.source_map,
+                    terminal,
+                    TerminalContext {
+                        fallthrough,
+                        native,
+                        checks,
+                        rax,
+                        flags_live,
+                        target,
+                        zero_branch,
+                    },
+                );
+                exits = terminal_exits(
+                    &code[..],
+                    terminal,
+                    fallthrough,
+                    linked,
+                    block.source_map.len(),
+                );
+                debug_assert!(exits.iter().all(|exit| exit.offset >= at));
+            }
+        }
+        debug_assert!(code.len() > start);
+        // The back edges' exits at their bound, each to its target, every
+        // row counted (`edges::edge`).
+        for (jump, target) in core::mem::take(&mut region_pending.bounded) {
+            let mut asm = code.asm();
+            asm.bind(jump);
+            exits.push(region_exit(&mut asm, target, ExitKind::Direct.into()));
+        }
+        debug_assert!(region_pending.forward.is_empty(), "every landing bound");
+        region_exits = Some(exits);
     } else {
         emit_terminal(
             code,
@@ -1647,7 +1917,11 @@ fn emit_selected(
     for (jump, target, run) in side_exits {
         let mut asm = code.asm();
         asm.bind(jump);
-        direct_exit_with(&mut asm, target, side_exit(instructions_run - run));
+        let word = side_exit(instructions_run - run);
+        match region_exits.as_mut() {
+            Some(exits) => exits.push(region_exit(&mut asm, target, word)),
+            None => direct_exit_with(&mut asm, target, word),
+        }
     }
     code.place_failures();
     if fault_table && !second_rows.is_empty() {
@@ -1698,6 +1972,7 @@ fn emit_selected(
     let shape = Shape {
         self_loop: self_loop.is_some(),
         cold,
+        exits: region_exits,
     };
     (block.into_native(), fault_recovery, shape)
 }
@@ -2282,6 +2557,30 @@ fn nzcv_store(pinned: bool) -> Code {
     }
     code
 }
+/// Bind the jumps of `pending` to the row `row`, whose code starts here.
+fn bind_landing(code: &mut Code, pending: &mut edges::Pending, row: usize) {
+    let mut asm = code.asm();
+    pending.forward.retain(|&(jump, to)| {
+        if to == row {
+            asm.bind(jump);
+        }
+        to != row
+    });
+}
+
+/// [`direct_exit_with`] in a region, and the exit it emitted.
+fn region_exit(asm: &mut Asm, target: GuestAddress, word: ExitWord) -> super::chain::DirectExit {
+    let slot = super::chain::link_slot(asm.linked_block(), target, word.kind);
+    let offset = asm.len() + slot;
+    direct_exit_with(asm, target, word);
+    super::chain::DirectExit {
+        offset,
+        target,
+        kind: word.kind,
+        skipped: word.skipped,
+    }
+}
+
 /// The exit word of a side exit that skips `skipped` instructions.
 fn side_exit(skipped: usize) -> ExitWord {
     ExitWord {
@@ -2346,14 +2645,19 @@ fn terminal_exits(
 ) -> Vec<super::chain::DirectExit> {
     use super::chain::{DIRECT_EXIT_BYTES, DirectExit, is_direct_exit, link_slot};
     let paired = linked.is_some()
-        && matches!(
-            terminal.map(|(_, terminal)| terminal),
+        && match terminal.map(|(_, terminal)| terminal) {
             Some(Terminator::DirectCall(_))
-                | Some(Terminator::Register {
-                    kind: ExitKind::Call,
-                    ..
-                })
-        );
+            | Some(Terminator::Register {
+                kind: ExitKind::Call,
+                ..
+            }) => true,
+            // BLRA* in line; else its PAC exit ends the code, which the
+            // continuation check below finds is not one.
+            Some(Terminator::PointerAuthentication(request)) => {
+                super::pointer::inline::transfer(request.operation) == Some(ExitKind::Call)
+            }
+            _ => false,
+        };
     if !paired {
         return terminal_exits_before(code, terminal, fallthrough, linked);
     }
@@ -2493,13 +2797,29 @@ fn emit_terminal(
                 direct_exit(code, request.instruction_pc, ExitKind::Amx);
             }
             Terminator::PointerAuthentication(request) => {
-                // Return to the checked runtime helper with unchanged guest
-                // state at this instruction. Never embed keys/helper pointers.
-                direct_exit(
-                    code,
-                    request.instruction_pc,
-                    ExitKind::PointerAuthentication,
-                );
+                let transfer = native
+                    .pointer
+                    .zip(super::pointer::inline::transfer(request.operation));
+                if let Some((cells, kind)) = transfer {
+                    // RETA*, BRA* and BLRA* authenticate in line, then
+                    // branch as RET, BR and BLR do.
+                    super::pointer::inline::authenticate_transfer(
+                        code,
+                        request.operation,
+                        *pc,
+                        cells,
+                    );
+                    register_transfer(code, kind, fallthrough, source_map.len());
+                } else {
+                    // Return to the checked runtime helper with unchanged
+                    // guest state at this instruction. Never embed
+                    // keys/helper pointers.
+                    direct_exit(
+                        code,
+                        request.instruction_pc,
+                        ExitKind::PointerAuthentication,
+                    );
+                }
             }
             Terminator::System(request) => {
                 let zero = native.zero_block.zip(super::zero_block::operand(request));
@@ -2534,21 +2854,7 @@ fn emit_terminal(
             }
             Terminator::Register { source, kind } => {
                 load_unless_held(code, *source, rax);
-                if *kind == ExitKind::Call {
-                    // Capture BLR X30's target before LR is overwritten.
-                    code.asm().mov(Size::Qword, Gpr::Rcx, Gpr::Rax);
-                    super::guest_immediate(code, fallthrough);
-                    super::store(code, Register::X(30));
-                    code.asm().mov(Size::Qword, Gpr::Rax, Gpr::Rcx);
-                    let ran = source_map.len();
-                    paired_exit(code, fallthrough, ran, |asm| {
-                        exit_kind_with(asm, ExitKind::Call)
-                    });
-                } else {
-                    // A return's frame check is its lookup tail's
-                    // (`chain::paired_tail`).
-                    exit_kind(code, *kind);
-                }
+                register_transfer(code, *kind, fallthrough, source_map.len());
             }
             Terminator::Branch(operation) => match *operation {
                 Operation::Branch { target } => direct_exit(code, target, ExitKind::Direct),
@@ -2564,6 +2870,26 @@ fn emit_terminal(
         }
     } else {
         direct_exit(code, fallthrough, ExitKind::Fallthrough);
+    }
+}
+
+/// The exit of BR, BLR or RET (`kind`) to the target in RAX, from a block
+/// of `ran` instructions that falls through to `fallthrough`: a call links
+/// X30 first and pairs its frame ([`paired_exit`]).
+fn register_transfer(code: &mut Code, kind: ExitKind, fallthrough: GuestAddress, ran: usize) {
+    if kind == ExitKind::Call {
+        // Capture BLR X30's target before LR is overwritten.
+        code.asm().mov(Size::Qword, Gpr::Rcx, Gpr::Rax);
+        super::guest_immediate(code, fallthrough);
+        super::store(code, Register::X(30));
+        code.asm().mov(Size::Qword, Gpr::Rax, Gpr::Rcx);
+        paired_exit(code, fallthrough, ran, |asm| {
+            exit_kind_with(asm, ExitKind::Call)
+        });
+    } else {
+        // A return's frame check is its lookup tail's
+        // (`chain::paired_tail`).
+        exit_kind(code, kind);
     }
 }
 

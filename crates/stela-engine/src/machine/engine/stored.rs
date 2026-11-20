@@ -11,7 +11,7 @@ use super::recovery::StoredOrigin;
 use super::{Devices, FETCH_PAGE, Host, Machine, Preparation, Variant};
 use crate::translations::{Digest, Entry, PAGE_BYTES, StoredRecord};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use stela_compiler::block::CompiledBlock;
 
 /// A profile build checks one stored form in this many ([`stored_entry`]).
@@ -133,39 +133,16 @@ pub struct SharedTranslation {
     page: u64,
     pc: u64,
     context: Digest,
-    /// A compile worker translated it ahead of execution
-    /// ([`super::ahead`]), from a successor of a block a PE compiled: no PE
-    /// had fetched it yet.
+    /// The guest-physical frame of its fetch page.
+    frame: u64,
+    /// Prepared ahead of any fetch (`ahead.rs`), not offered for the
+    /// pack yet: the PE that first installs it offers it.
     ahead: bool,
-    /// A PE installed it ([`Self::claim`]): the first install of a block
-    /// translated ahead is the miss its translation saved.
-    claimed: AtomicBool,
+    /// A block prepared ahead: the entry PCs of its static successors,
+    /// which its first install offers as a fetched block's. None otherwise.
+    successors: Vec<u64>,
 }
 impl SharedTranslation {
-    /// Whether a compile worker translated it ahead of execution.
-    pub fn ahead(&self) -> bool {
-        self.ahead
-    }
-    /// Whether this install of a block translated ahead is its first: the
-    /// one that would have compiled it.
-    pub(super) fn claim(&self) -> bool {
-        self.ahead && !self.claimed.swap(true, Ordering::Relaxed)
-    }
-    /// The offer it was shared from, without its successors: for a store
-    /// to keep the stored form of a block translated ahead once a PE ran it
-    /// ([`Translations::used_ahead`]).
-    pub fn offer(&self) -> Offer {
-        Offer {
-            key: self.key,
-            page: self.page,
-            pc: self.pc,
-            context: self.context,
-            emission: self.emission.clone(),
-            successors: Vec::new(),
-            quiet: false,
-            ahead: self.ahead,
-        }
-    }
     pub fn input(&self) -> &[u8] {
         &self.emission.input
     }
@@ -174,6 +151,34 @@ impl SharedTranslation {
     }
     pub fn preparation(&self) -> &Arc<Preparation> {
         &self.emission.preparation
+    }
+    /// Whether it was prepared ahead of any fetch and not offered since.
+    pub fn ahead(&self) -> bool {
+        self.ahead
+    }
+    /// The entry PCs of its static successors, kept for a block prepared
+    /// ahead.
+    pub fn successors(&self) -> &[u64] {
+        &self.successors
+    }
+    /// The offer of a block prepared ahead, made by the PE that installs it
+    /// first: the store keeps it for the pack as any block compiled anew,
+    /// and its successors (`elsewhere`: in other pages, with the frames
+    /// the installing PE's fetch cache holds) become jobs as a fetched
+    /// block's do.
+    pub(super) fn offer(&self, quiet: bool, elsewhere: Vec<(u64, u64)>) -> Offer {
+        Offer {
+            key: self.key,
+            page: self.page,
+            pc: self.pc,
+            context: self.context,
+            emission: self.emission.clone(),
+            successors: self.successors.clone(),
+            elsewhere,
+            quiet,
+            frame: self.frame,
+            depth: 0,
+        }
     }
     pub(super) fn matches(&self, key: &Digest, pc: u64, context: &Digest, source: &[u8]) -> bool {
         self.key == *key
@@ -235,6 +240,10 @@ pub trait Translations {
     }
     /// A block the engine compiled from a page the store had no entry for.
     fn offer(&mut self, offer: Offer);
+    /// The stored form this translator gives a block of the previous
+    /// translator's pack, of the page whose bytes hash to `key`
+    /// (`refill.rs`), for the store to keep as it keeps an offer's.
+    fn refilled(&mut self, _key: &Digest, _entry: Entry) {}
     /// What a machine's use of the store cost or found, for the store's
     /// counters.
     fn note(&mut self, _event: StoreEvent) {}
@@ -255,23 +264,6 @@ pub trait Translations {
     fn known_pages(&mut self) -> Option<usize> {
         None
     }
-    /// Whether the store takes blocks to translate ahead of execution
-    /// ([`Self::ahead`]): asked on every block compiled with a store page,
-    /// so a store answers from a flag.
-    fn translates_ahead(&mut self) -> bool {
-        false
-    }
-    /// Translate `jobs`, the static successors of a block just compiled
-    /// that lie in its fetch page, on processors that run no PE, and share
-    /// what they compile as [`Self::prepared`] blocks
-    /// ([`super::ahead`]). A store takes what its queue has room for and
-    /// drops the rest: the PE never waits for it.
-    fn ahead(&mut self, _jobs: &mut dyn Iterator<Item = super::ahead::AheadJob>) {}
-    /// A PE installed `shared`, a block translated ahead, for the first
-    /// time ([`SharedTranslation::claim`]): the miss its translation saved.
-    /// A store that writes a pack keeps its stored form now, as a PE that
-    /// compiled it would have, so the pack holds only blocks that ran.
-    fn used_ahead(&mut self, _shared: &Arc<SharedTranslation>) {}
 }
 
 /// A machine's use of its store, reported to it ([`Translations::note`]).
@@ -283,9 +275,6 @@ pub enum StoreEvent {
     /// A shared block was found but not installed: its admitted bytes or
     /// source extent differ from the fetch's.
     SharedRejected,
-    /// Of those, one a compile worker translated ahead
-    /// ([`SharedTranslation::ahead`]): the page changed since.
-    AheadStale,
 }
 
 /// A block compiled anew, and how it was compiled. Emission fields are private;
@@ -309,23 +298,21 @@ pub struct Offer {
     /// The entry PCs of its static successors, for translation ahead of
     /// execution.
     pub(super) successors: Vec<u64>,
+    /// Those of them in other pages, each with the frame of its page where
+    /// the offering PE's fetch cache held its walk, else 0 (`ahead.rs`).
+    pub(super) elsewhere: Vec<(u64, u64)>,
     /// Compiled for EL0, where the PE holds no lock of the guest's kernel:
     /// a store may take time there for work of its own.
     pub(super) quiet: bool,
-    /// Translated ahead of execution by a compile worker
-    /// ([`super::ahead`]), not compiled by a PE that fetched it.
-    pub(super) ahead: bool,
+    /// The guest-physical frame of its fetch page, which a PE preparing its
+    /// successors ahead reads (`ahead.rs`).
+    pub(super) frame: u64,
+    /// 0 for a block a fetch compiled; for one prepared ahead, how many
+    /// static successor steps it lies from one (`ahead.rs` DEPTH).
+    pub(super) depth: u8,
 }
 
 impl Offer {
-    /// The same offer, as a compile worker's ([`Self::ahead`]): for tests
-    /// of a store's speculative share.
-    #[cfg(test)]
-    pub fn marked_ahead(mut self) -> Self {
-        self.ahead = true;
-        self
-    }
-
     pub(crate) fn retained_bytes(&self) -> usize {
         translation_bytes(&self.emission)
     }
@@ -351,8 +338,10 @@ impl Offer {
             context,
             emission: Arc::new(Emission::new(input, block, preparation)),
             successors: Vec::new(),
+            elsewhere: Vec::new(),
             quiet: false,
-            ahead: false,
+            frame: 0,
+            depth: 0,
         })
     }
     pub fn key(&self) -> Digest {
@@ -380,10 +369,6 @@ impl Offer {
     pub fn quiet(&self) -> bool {
         self.quiet
     }
-    /// Whether a compile worker translated it ahead of execution.
-    pub fn ahead(&self) -> bool {
-        self.ahead
-    }
     pub fn block(&self) -> &CompiledBlock {
         &self.emission.block
     }
@@ -403,9 +388,18 @@ impl Offer {
             page: self.page,
             pc: self.pc,
             context: self.context,
-            ahead: self.ahead,
-            claimed: AtomicBool::new(false),
+            frame: self.frame,
+            ahead: self.depth > 0,
+            successors: match self.depth > 0 {
+                true => self.successors,
+                false => Vec::new(),
+            },
         })
+    }
+
+    /// Whether it was prepared ahead of any fetch (`ahead.rs`).
+    pub fn ahead(&self) -> bool {
+        self.depth > 0
     }
 
     /// Its block's stored form ([`stored_entry`]).
@@ -460,9 +454,6 @@ pub(super) struct StoredPage {
     pub(super) record: Option<Arc<StoredRecord>>,
     /// The latest installed block's, which the next of this page shares.
     origin: Option<Arc<StoredOrigin>>,
-    /// `bytes`, shared with the blocks of this page translated ahead
-    /// ([`super::ahead`]): made at the first, kept while the page is.
-    pub(super) snapshot: Option<Arc<[u8; PAGE_BYTES]>>,
     /// `Machine::page_uses` at its last use.
     used: u64,
 }
@@ -539,7 +530,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 bytes,
                 record: record.clone(),
                 origin: None,
-                snapshot: None,
                 used: self.page_uses,
             },
         );

@@ -83,7 +83,10 @@ void stela_stream_free(StelaStream *stream);
 void stela_texture_record(id descriptor, StelaTextureDescriptorRecord *record);
 void stela_depth_stencil_record(id descriptor, StelaDepthStencilRecord *record);
 
-@class StelaGPUCommandBuffer, StelaGPUEvent, StelaGPUFunction, StelaGPUIndirectCommandBuffer;
+@class StelaGPUCommandBuffer, StelaGPUEvent, StelaGPUFunction, StelaGPUIndirectCommandBuffer, StelaGPUTexture;
+
+/* `_reportedSeed`: a seed was reported. */
+#define STELA_SEED_KNOWN (1ull << 32)
 
 /* MTLAddDevice asserts both protocols on the device itself. */
 @interface StelaGPUDevice : _MTLDevice <MTLDevice, MTLDeviceSPI> {
@@ -119,6 +122,11 @@ void stela_depth_stencil_record(id descriptor, StelaDepthStencilRecord *record);
 - (void)noteIndirect:(StelaGPUIndirectCommandBuffer *)buffer;
 - (void)forgetIndirect:(StelaGPUIndirectCommandBuffer *)buffer;
 - (void)flushIndirect;
+/* Textures the service keeps in device memory (`TextureResponse.copied`),
+ * held weakly: every commit reports those whose surface's seed changed. */
+- (void)noteCopied:(StelaGPUTexture *)texture;
+/* The live ones, or nil when there are none. */
+- (NSArray *)copiedTextures;
 - (StelaFormatAlignmentsResponse)alignmentsOfFormat:(NSUInteger)format;
 /* Event waiters sleep between completion notifications: `wakes` counts the
  * notifications and the CPU signals of this process's events, and a waiter
@@ -241,6 +249,12 @@ void stela_depth_stencil_record(id descriptor, StelaDepthStencilRecord *record);
 	/* The pixel format's block, asked for at the first CPU transfer: a zero
 	 * width until then. */
 	StelaFormatAlignmentsResponse _block;
+	/* The service keeps it in device memory (`TextureResponse.copied`), which
+	 * it refreshes from the surface when a commit reports a new seed. */
+	BOOL _copied;
+	/* The surface's seed a commit the service accepted last reported, with
+	 * STELA_SEED_KNOWN; 0 before any. */
+	_Atomic(uint64_t) _reportedSeed;
 }
 - (instancetype)initWithDevice:(StelaGPUDevice *)device
 		      response:(const StelaTextureResponse *)response
@@ -619,6 +633,9 @@ id stela_empty_logs(void);
 	StelaGPUQueue *_queue;
 	StelaStream _stream;
 	NSMutableArray *_retained;
+	/* The textures kept in device memory its commit reports, each with the
+	 * seed reported, as texture then seed: noted once the service accepts it. */
+	NSMutableArray *_seeds;
 	StelaGPULogState *_logState;
 	uint64_t _serial;
 	_Atomic(bool) _committed;

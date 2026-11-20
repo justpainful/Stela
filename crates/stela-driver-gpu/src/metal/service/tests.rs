@@ -35,6 +35,7 @@ use stela_contracts::gate::MemoryRange;
 
 mod commands;
 mod deferral;
+mod display;
 mod gate;
 mod indirect;
 mod lifecycle;

@@ -131,9 +131,9 @@ impl StoredRecord {
         Reader(body.get(start as usize..)?).entry().ok()
     }
 
-    /// Whether it holds an entry at `offset` in `context`, without decoding
-    /// it: a block translated ahead would only repeat it.
-    pub fn holds(&self, offset: u16, context: &Digest) -> bool {
+    /// Whether it holds an entry at `offset` in `context`, without
+    /// decoding it.
+    pub fn contains(&self, offset: u16, context: &Digest) -> bool {
         self.index
             .binary_search_by(|entry| (entry.offset, &entry.context).cmp(&(offset, context)))
             .is_ok()

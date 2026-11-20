@@ -366,10 +366,56 @@ pub fn next_event(cpu: &Cpu, now: u64) -> Option<u64> {
     streams(cpu).map(|stream| stream.next(cpu, now)).min()
 }
 
+/// [`next_event`] after the sample `now`, with the period in system counts
+/// of the edges after it where they come at one: one stream on a bank that
+/// counts the system count unscaled. `None` without a stream.
+pub fn sampled_event(cpu: &Cpu, now: u64) -> Option<(u64, Option<u64>)> {
+    let mut streams = streams(cpu);
+    let first = streams.next()?;
+    if streams.next().is_none() && !scaled(cpu, first.bank) {
+        return Some((first.next(cpu, now), Some(first.period())));
+    }
+    Some((next_event(cpu, now)?, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use {crate::machine::exception::Pstate, stela_contracts::Chip};
+
+    /// `sampled_event` gives the first edge after a sample, and with one
+    /// unscaled stream the period of the edges after it, each exactly as
+    /// `event` finds them; with two streams it gives no period.
+    #[test]
+    fn sampled_events_are_the_streams_edges_and_their_period() {
+        let mut cpu = Cpu::of(Chip::AppleM2, 0, Pstate::reset(2));
+        assert!(!scaled(&cpu, Bank::Arm));
+        assert_eq!(sampled_event(&cpu, 0), None);
+        let samples = [0u64, 1, 7, 15, 16, 1000, 12345];
+        for control in [
+            EVNTEN | 3 << EVNTI_SHIFT,
+            EVNTEN | EVNTDIR | 5 << EVNTI_SHIFT,
+        ] {
+            cpu.registers.set(Register::CNTHCTL_EL2, 0, control);
+            for sample in samples {
+                let (next, period) = sampled_event(&cpu, sample).unwrap();
+                assert!(event(&cpu, sample, next), "{control:#x} {sample}");
+                assert!(!event(&cpu, sample, next - 1), "{control:#x} {sample}");
+                let period = period.unwrap();
+                assert!(event(&cpu, next, next + period), "{control:#x} {sample}");
+                assert!(
+                    !event(&cpu, next, next + period - 1),
+                    "{control:#x} {sample}"
+                );
+            }
+        }
+        cpu.registers
+            .set(Register::CNTKCTL_EL1, 0, EVNTEN | 2 << EVNTI_SHIFT);
+        for sample in samples {
+            let next = next_event(&cpu, sample);
+            assert_eq!(sampled_event(&cpu, sample), next.map(|next| (next, None)));
+        }
+    }
 
     #[test]
     fn disabled_stream_does_not_read_its_offset() {

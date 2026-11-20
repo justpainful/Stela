@@ -219,9 +219,10 @@ impl Extents {
 /// A half is kept as the root entries that held it, detached from their
 /// roots, with the leaves it was filled from. Its tables stay in the
 /// shadow's frames until the half is emptied, which drops every kept half
-/// ([`Kept::clear`]). A TLBI reaches the kept halves through what it
-/// removes from every context ([`Everywhere`]), as the current half
-/// through [`Reach`].
+/// ([`Kept::clear`]), or until it is replaced or a TLBI drops it: then the
+/// host takes it back ([`Kept::take_dropped`]) and reuses its frames. A
+/// TLBI reaches the kept halves through what it removes from every context
+/// ([`Everywhere`]), as the current half through [`Reach`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Kept {
     halves: Vec<KeptHalf>,
@@ -231,16 +232,18 @@ pub struct Kept {
     /// ([`Kept::buffer`]), at most [`SPARE_BUFFERS`]: a switch allocates
     /// none once the halves are full.
     spare: Vec<Vec<(u64, usize, u64)>>,
+    /// Halves replaced or dropped by a TLBI whose tables the host has not
+    /// taken back yet ([`Kept::take_dropped`]).
+    dropped: Vec<KeptHalf>,
 }
 
 /// The emptied entry lists [`Kept`] keeps for reuse at most.
 const SPARE_BUFFERS: usize = 2;
 
 /// The contexts whose lower halves [`Kept`] holds at most. A replaced half
-/// frees no frames (they return only when the lower half is emptied), and
-/// refilling a context that comes back allocates its tables again, so a
-/// replacement costs frames as well as fills: a desktop session rotates
-/// among dozens of processes, which eight halves missed half the time.
+/// gives its frames back ([`Kept::take_dropped`]), but refilling a context
+/// that comes back costs fills: a desktop session rotates among dozens of
+/// processes, which eight halves missed half the time.
 pub const KEPT: usize = 32;
 
 /// One context's kept lower half.
@@ -260,7 +263,22 @@ impl Kept {
             halves: Vec::new(),
             switches: 0,
             spare: Vec::new(),
+            dropped: Vec::new(),
         }
+    }
+
+    /// A half replaced or dropped since the host last took one: its tables
+    /// are in no root and no kept half, so their frames are free once the
+    /// host has flushed what it detached them from.
+    pub fn take_dropped(&mut self) -> Option<KeptHalf> {
+        self.dropped.pop()
+    }
+
+    /// Give up the least recently kept half, for its frames: what a half
+    /// out of frames takes before it empties itself.
+    pub fn evict_oldest(&mut self) -> Option<KeptHalf> {
+        let oldest = (0..self.halves.len()).min_by_key(|&i| self.halves[i].used)?;
+        Some(self.halves.swap_remove(oldest))
     }
 
     /// An empty list for the entries a switch detaches, with the storage of
@@ -310,19 +328,20 @@ impl Kept {
             return Some(outgoing);
         }
         if self.halves.len() == KEPT
-            && let Some(oldest) = (0..self.halves.len()).min_by_key(|&i| self.halves[i].used)
+            && let Some(evicted) = self.evict_oldest()
         {
-            let evicted = self.halves.swap_remove(oldest);
-            self.recycle(evicted.entries);
+            self.dropped.push(evicted);
         }
         self.halves.push(outgoing);
         found
     }
 
-    /// Drop every kept half, returning how many there were.
+    /// Drop every kept half, returning how many there were, with the ones
+    /// not taken back yet: the caller empties the frames of all of them.
     pub fn clear(&mut self) -> usize {
         let halves = self.halves.len();
         self.halves.clear();
+        self.dropped.clear();
         halves
     }
 
@@ -354,7 +373,9 @@ impl Kept {
             Everywhere::NonGlobal(_) | Everywhere::All => (Reach::All, None),
         };
         let before = self.halves.len();
-        self.halves.retain_mut(|half| {
+        let mut index = 0;
+        while index < self.halves.len() {
+            let half = &mut self.halves[index];
             let entries = &half.entries;
             let visit = |first: u64, last: u64| {
                 for &(_, entry, value) in entries {
@@ -367,12 +388,18 @@ impl Kept {
             };
             let other = asid
                 .is_some_and(|asid| half.extents.private() && !same_asid(half.key.0, tcr, asid));
-            if other {
+            let kept = if other {
                 half.extents.visit_global_ranges(reach, bounds, visit)
             } else {
                 half.extents.visit_ranges(reach, bounds, visit)
+            };
+            if kept {
+                index += 1;
+            } else {
+                let dropped = self.halves.swap_remove(index);
+                self.dropped.push(dropped);
             }
-        });
+        }
         before - self.halves.len()
     }
 
@@ -386,8 +413,16 @@ impl Kept {
     /// halves dropped.
     pub fn drop_asid(&mut self, asid: u16, tcr: u64) -> usize {
         let before = self.halves.len();
-        self.halves
-            .retain(|half| !(half.extents.private() && same_asid(half.key.0, tcr, asid)));
+        let mut index = 0;
+        while index < self.halves.len() {
+            let half = &self.halves[index];
+            if half.extents.private() && same_asid(half.key.0, tcr, asid) {
+                let dropped = self.halves.swap_remove(index);
+                self.dropped.push(dropped);
+            } else {
+                index += 1;
+            }
+        }
         before - self.halves.len()
     }
 }
@@ -776,6 +811,56 @@ mod tests {
         assert!(kept.is_empty());
     }
 
+    /// A half the switches replaced, or a TLBI dropped, goes back to the
+    /// host with its entries, once; the oldest goes first when the host
+    /// needs frames; emptying the half forgets the ones not taken back.
+    #[test]
+    fn replaced_and_dropped_halves_go_back_to_the_host_once() {
+        let mut kept = Kept::new();
+        let key = |n: u64| (n << 48 | n << 14, 0);
+        for n in 0..=KEPT as u64 {
+            kept.switch(
+                key(n),
+                alloc::vec![(0x1000, 0, n + 1)],
+                Extents::new(),
+                key(99),
+            );
+        }
+        let replaced = kept.take_dropped().unwrap();
+        assert_eq!(
+            (replaced.key, replaced.entries),
+            (key(0), alloc::vec![(0x1000, 0, 1)])
+        );
+        assert!(kept.take_dropped().is_none());
+        // The least recently kept goes first, and then the next.
+        assert_eq!(kept.evict_oldest().unwrap().key, key(1));
+        assert_eq!(kept.evict_oldest().unwrap().key, key(2));
+        assert!(kept.take_dropped().is_none());
+        // A TLBI of everything drops every kept half; each comes back once.
+        let left = kept.halves.len();
+        assert_eq!(
+            kept.invalidate(Everywhere::All, 0, LOWER, 39, |_, _, _| {}),
+            left
+        );
+        let mut values: Vec<u64> = core::iter::from_fn(|| kept.take_dropped())
+            .map(|half| half.entries[0].2)
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, (4..=KEPT as u64 + 1).collect::<Vec<_>>());
+        // An ASID TLBI's drops come back too.
+        let mut private = Extents::new();
+        private.record(0x4000, 1 << 14, false);
+        kept.switch(key(5), alloc::vec![(0x1000, 0, 5)], private, key(99));
+        assert_eq!(kept.drop_asid(5, 0), 1);
+        assert_eq!(kept.take_dropped().unwrap().key, key(5));
+        // Emptying the half drops what was not taken back.
+        for n in 0..=KEPT as u64 {
+            kept.switch(key(n), alloc::vec![(0x1000, 0, n)], Extents::new(), key(99));
+        }
+        kept.clear();
+        assert!(kept.take_dropped().is_none() && kept.evict_oldest().is_none());
+    }
+
     #[test]
     fn a_fill_maps_the_other_leaves_of_its_window_nearest_first() {
         let leaves = |address, size| around(address, size, 1 << 16).collect::<Vec<_>>();
@@ -914,8 +999,8 @@ mod tests {
     }
 
     /// Entry lists given back, empty ones a switch did not keep and the
-    /// evicted ones, are handed out again with their storage, emptied, so a
-    /// steady stream of switches stops allocating.
+    /// evicted ones the host took back, are handed out again with their
+    /// storage, emptied, so a steady stream of switches stops allocating.
     #[test]
     fn switches_reuse_the_storage_of_entry_lists_given_back() {
         let mut kept = Kept::new();
@@ -940,6 +1025,8 @@ mod tests {
         let mut entries = kept.buffer();
         entries.push((0x1000, 0, 100));
         kept.switch(key(KEPT as u64), entries, Extents::new(), key(99));
+        let evicted = kept.take_dropped().unwrap();
+        kept.recycle(evicted.entries);
         let evicted = kept.buffer();
         assert!(evicted.is_empty() && evicted.capacity() != 0);
         // At most `SPARE_BUFFERS` are kept.

@@ -99,21 +99,17 @@ impl Span {
     }
 }
 
-/// Bytes a buffer starts with room for: the code of 99 blocks in 100 of a
-/// kernel's, so emission rarely grows it (growth was a fifth of compile
-/// time).
-const INITIAL_BYTES: usize = 1024;
-/// Likewise the fault sites and guest-address fields of most blocks.
-const INITIAL_SITES: usize = 8;
-const INITIAL_RELOCATIONS: usize = 8;
+/// Bytes a buffer starts with room for: most blocks' code, so emission
+/// rarely grows it (growth was a fifth of compile time).
+const INITIAL_BYTES: usize = 512;
 
 impl Code {
     pub(crate) fn new() -> Self {
         Self {
             bytes: Vec::with_capacity(INITIAL_BYTES),
             instructions: 0,
-            sites: Vec::with_capacity(INITIAL_SITES),
-            relocations: Vec::with_capacity(INITIAL_RELOCATIONS),
+            sites: Vec::new(),
+            relocations: Vec::new(),
             pinned: false,
             locals: None,
             dirty: Default::default(),
@@ -246,8 +242,12 @@ impl Code {
     }
     /// An encoder that appends here and adds to this count.
     pub(crate) fn asm(&mut self) -> Asm<'_> {
-        let guarded = self.vectors.occupied();
-        let homes = self.vectors.dirty_homes();
+        // A buffer made empty (`Default`, as a block's own is) takes room
+        // for most blocks at its first instruction, where it grew through
+        // seven sizes to that.
+        if self.bytes.capacity() == 0 {
+            self.bytes.reserve(INITIAL_BYTES);
+        }
         Asm {
             code: &mut self.bytes,
             instructions: 0,
@@ -258,15 +258,15 @@ impl Code {
             locals: self.locals,
             dirty: self.dirty,
             linked_block: self.linked_block,
-            guarded,
-            homes,
+            vectors: Some(&self.vectors),
+            unguarded: false,
         }
     }
     /// [`Self::asm`] for the vector cache's own moves, which may write the
     /// pool registers that hold guest vectors.
     pub(in crate::x86_64) fn asm_unguarded(&mut self) -> Asm<'_> {
         let mut asm = self.asm();
-        asm.guarded = 0;
+        asm.unguarded = true;
         asm
     }
     /// A typed recipe that emits exactly one guest memory instruction.

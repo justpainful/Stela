@@ -11,6 +11,7 @@
 //! transfers. An unlinked direct exit returns what the thunk's own exit
 //! returns.
 use super::super::*;
+use super::Controlled;
 use crate::block::{
     PointerAuthenticationKey as Key, PointerAuthenticationModifier as Modifier,
     PointerAuthenticationOperation as Operation,
@@ -291,6 +292,7 @@ impl Run {
             None => cell_tail(
                 at,
                 cell,
+                predicted_of(table, site),
                 word,
                 RAN,
                 self.region.at(PROBES + CELL_PROBE_ENTRY),
@@ -303,8 +305,10 @@ impl Run {
         put(&self.region, offset, &jump(site, at).unwrap());
     }
 
-    fn run(&mut self, state: &mut GuestState, control: &mut ChainControl) -> (u64, u64) {
-        state.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+    /// Run the entry with `control` and its account.
+    fn run(&mut self, state: &mut GuestState, control: &mut Controlled) -> (u64, u64) {
+        state.anchors[Anchor::Control] = &mut control.control as *mut ChainControl as u64;
+        state.account = control.account.0;
         // Each run starts with an empty jump cache, so the ways compare as
         // the table probe serves them; the cache's own differences are the
         // probes' and the jump cache's tests.
@@ -319,6 +323,7 @@ impl Run {
         // call, and call `service`.
         let result =
             unsafe { crate::x86_64::native::enter(self.region.0 as *const u8, state, 0, 0) };
+        control.account = Account(state.account);
         (result as u64, (result >> 64) as u64)
     }
 }
@@ -572,21 +577,24 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
             } else {
                 0x5555
             };
-            let base = ChainControl {
-                budget: [0, 1, 2, 5, 9][rng.below(5) as usize],
-                retired: 100,
-                block: 7,
-                contexts,
-                table: table.address(),
-                hits: 3,
-                interrupt_epoch: u64::from(rng.below(12) == 0),
-                itlb: itlb.address(),
-                masks: [table.mask(), itlb.mask()],
-                salts: contexts.map(|context| itlb.salt(context)),
-                stamps,
-                cells,
-                ..ChainControl::default()
+            let mut base = Controlled {
+                control: ChainControl {
+                    block: 7,
+                    contexts,
+                    table: table.address(),
+                    hits: 3,
+                    itlb: itlb.address(),
+                    masks: [table.mask(), itlb.mask()],
+                    salts: contexts.map(|context| itlb.salt(context)),
+                    stamps,
+                    cells,
+                    ..ChainControl::default()
+                },
+                account: Account::new([0, 1, 2, 5, 9][rng.below(5) as usize]).with_retired(100),
             };
+            if rng.below(12) == 0 {
+                base.interrupt();
+            }
             // SAFETY: the table made the stamps, which live with it.
             let hits_of = || unsafe { stamp_counts(stamps) }[StampCount::Hits as usize];
             let stamped_hits = hits_of();
@@ -657,23 +665,30 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 predicted,
                 u64::from(word.encoded() | RAN << ExitWord::RAN_SHIFT),
             );
-            let entered = ChainControl {
-                budget: base.budget.wrapping_sub(1),
-                retired: base.retired + u64::from(RAN),
-                block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
-                ..base
+            let account = base.account;
+            let entered = Controlled {
+                control: ChainControl {
+                    block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
+                    ..base.control
+                },
+                account: account
+                    .with_budget(account.budget().saturating_sub(1))
+                    .with_retired(account.retired() + u64::from(RAN)),
             };
             let put_out = resident_key == Some(cell.key)
                 && cell.pc == predicted
                 && !(held.pc == predicted && held.key == cell.key)
                 && lookup == exit
                 && controls[0] == base
-                && if base.budget == 0 {
-                    linked_way == exit && controls[1].budget == u64::MAX
+                && if account.budget() == 0 {
+                    linked_way == exit && controls[1] == base
                 } else {
                     linked_way == (0x7700 + u64::from(cell.block), 99)
-                        && ChainControl {
-                            hits: entered.hits,
+                        && Controlled {
+                            control: ChainControl {
+                                hits: entered.hits,
+                                ..controls[1].control
+                            },
                             ..controls[1]
                         } == entered
                 };
@@ -779,11 +794,10 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             let at = region.at(code.len());
             let word = ExitWord::from(ExitKind::Indirect);
             code.extend(
-                cell_tail(at, cell, word, 2, region.at(PROBES + CELL_PROBE_ENTRY)).unwrap(),
+                cell_tail(at, cell, pc, word, 2, region.at(PROBES + CELL_PROBE_ENTRY)).unwrap(),
             );
             put(&region, 0, &code);
             let mut control = ChainControl {
-                budget: 5,
                 contexts: [CONTEXTS[0], CONTEXTS[1]],
                 table: table.address(),
                 itlb: itlb.address(),
@@ -793,19 +807,22 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             };
             let mut frame = Box::new(GuestState::default());
             frame.anchors[Anchor::Control] = &raw mut control as u64;
+            frame.account = Account::new(5).0;
             // SAFETY: the region holds the stub, its tail and the probes;
             // they touch the frame, the control, the tables and the blocks.
-            let result =
-                unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, 0, 0) };
+            let result = unsafe {
+                crate::x86_64::native::enter_counted(region.0 as *const u8, &mut *frame, 0, 0)
+            };
             let result = (result as u64, (result >> 64) as u64);
+            let account = Account(frame.account);
             if targets & 1 << btype != 0 {
                 assert_eq!(result, (0x7703, 99), "btype {btype} targets {targets:#b}");
                 assert_eq!(control.block, 3 | u64::from(btype) << BLOCK_BTYPE_SHIFT);
-                assert_eq!((control.budget, control.retired), (4, 2));
+                assert_eq!((account.budget(), account.retired()), (4, 2));
             } else {
                 let exit = u64::from(word.encoded() | 2 << ExitWord::RAN_SHIFT);
                 assert_eq!(result, (pc, exit), "btype {btype} targets {targets:#b}");
-                assert_eq!((control.block, control.budget), (0, 5));
+                assert_eq!((control.block, account.budget()), (0, 5));
             }
         }
     }
@@ -824,12 +841,18 @@ fn predicted_tails_hold_a_direct_exit_and_a_lookup_tail() {
         assert!(is_direct_exit(exit, target, word));
         assert!(exit_ready(&tail, PREDICTED_EXIT, at, 0));
         assert!(patchable(direct_patch(at + PREDICTED_EXIT as u64)));
-        let lookup = at + (PREDICTED_EXIT + DIRECT_EXIT_BYTES) as u64;
-        assert_eq!(tail[PREDICTED_EXIT + DIRECT_EXIT_BYTES..], {
+        let lookup = at + PREDICTED_MISS as u64;
+        let plain = {
             let mut plain = Code::new();
             super::super::tail(&mut plain, lookup, word, 3, probe).unwrap();
             plain.into_bytes()
-        });
+        };
+        assert_eq!(tail[PREDICTED_MISS..][..plain.len()], plain);
+        assert!(
+            tail[PREDICTED_MISS + plain.len()..]
+                .iter()
+                .all(|&byte| byte == 0xcc)
+        );
         // movabs r8, target; cmp rax, r8; jne over the direct exit.
         assert_eq!(tail[..2], [0x49, 0xb8]);
         assert_eq!(tail[2..10], target.0.to_le_bytes());
@@ -839,4 +862,22 @@ fn predicted_tails_hold_a_direct_exit_and_a_lookup_tail() {
         );
     }
     assert!(predicted_tail(0, GuestAddress(0), ExitKind::Return, 1 << 12, 0).is_none());
+}
+
+/// An open predicted tail misses through a dynamic exit of its word, its
+/// patch point patchable where it lands, which the engine later sends to
+/// the site's second predicted tail; its compare and direct exit are a
+/// predicted tail's.
+#[test]
+fn open_predicted_tails_miss_through_a_dynamic_exit() {
+    for at in (0x1000..0x1010).map(|at| 0x7f00_0000_0000 + at) {
+        let target = GuestAddress(0xffff_fe00_1234_0010);
+        let word = ExitWord::from(ExitKind::Call);
+        let open = open_predicted_tail(at, target, word).unwrap();
+        let closed = predicted_tail(at, target, word, 3, 0x7f00_0010_0000).unwrap();
+        assert_eq!(open[..PREDICTED_MISS], closed[..PREDICTED_MISS]);
+        assert!(is_dynamic_exit(&open[PREDICTED_MISS..], ExitKind::Call));
+        assert!(dynamic_ready(&open, PREDICTED_MISS, at));
+        assert!(patchable(dynamic_patch(at + PREDICTED_MISS as u64)));
+    }
 }

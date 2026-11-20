@@ -1076,8 +1076,6 @@ fn system_profile_has_one_source_bound_exit_and_rejects_memory_prefixes() {
     const UDF: u32 = 0x0000_0042;
     const IRG: u32 = 0x9ac0_1000;
     const LDG: u32 = 0xd960_0000;
-    const MOV_RAX_IMMEDIATE: [u8; 2] = [0x48, 0xb8];
-    const MOV_EDX_IMMEDIATE: u8 = 0xba;
     for word in [SVC, UDF, IRG, LDG] {
         let source: Vec<_> = [ADD, word, ADD]
             .into_iter()
@@ -1099,15 +1097,12 @@ fn system_profile_has_one_source_bound_exit_and_rejects_memory_prefixes() {
         )
         .unwrap();
         let at = compiled.native.source_map.last().unwrap().1;
-        let mut expected = MOV_RAX_IMMEDIATE.to_vec();
-        expected.extend(instruction.instruction_pc.0.to_le_bytes());
-        expected.push(MOV_EDX_IMMEDIATE);
-        expected.extend((ExitKind::System as u32).to_le_bytes());
-        // The patch point's jump to the return after it, the return, the pad.
-        expected.extend(crate::x86_64::chain::RET_ROOM);
-        expected.extend(crate::x86_64::chain::EXIT_RETURN);
-        expected.extend([0xcc; 4]);
-        assert_eq!(&compiled.native.x86_64_code[at..], expected);
+        // The patch point, then the PC, the word and the return.
+        let expected = crate::x86_64::chain::direct_exit_word(
+            instruction.instruction_pc,
+            ExitKind::System as u32,
+        );
+        assert_eq!(compiled.native.x86_64_code[at..], expected);
     }
     // Ordinary RAM, exclusives and legacy FP/SIMD cannot bypass shared owners.
     for word in [0xf940_0000_u32, 0xf900_0000, 0xc85f_fc00, 0x1e20_2800] {
@@ -1150,10 +1145,7 @@ fn half_division_continues_its_block_on_every_target() {
         .unwrap()
     };
     let exit = |pc: GuestAddress, kind: ExitKind| {
-        let mut exit = vec![0x48, 0xb8]; // MOVABS RAX,PC
-        exit.extend(pc.0.to_le_bytes());
-        exit.extend(crate::x86_64::chain::exit_word(kind as u32));
-        exit
+        crate::x86_64::chain::direct_exit_word(pc, kind as u32).to_vec()
     };
     // VDIVPH XMM0,XMM0,XMM1 with EVEX.
     let native = |code: &[u8]| {

@@ -146,6 +146,14 @@ fn register_word(key: u32) -> u32 {
     if key >> 24 == 0xd5 { key | 0x1f } else { key }
 }
 
+/// Whether [`system_key`] `key` is a WFE, WFI, WFET or WFIT: of class
+/// [`SystemClass::Wait`], found by one decode, without the name
+/// [`SystemClass::of`] builds for it.
+pub fn wait_key(key: u32) -> bool {
+    use stela_compiler::aarch64::system::synchronization::{Operation, decode};
+    matches!(decode(register_word(key)), Some(Operation::Wait { .. }))
+}
+
 /// A short name of [`system_key`] `key` for reports: the accessor's for
 /// MRS, MSR, SYS and SYSL (`MRS_TPIDR_EL1`, `TLBI_VAE1IS`), else the
 /// operation's kind and the key (`Exception.ExceptionReturn:0xd69f03e0`).
@@ -316,6 +324,197 @@ pub struct SystemExits {
     pub regimes: RegimeSyncs,
     /// WKDMC, then WKDMD ([`Compression`]).
     pub compression: [Compression; 2],
+    /// Where sampled System exits' round trips went ([`ExitPaths`]).
+    pub paths: ExitPaths,
+}
+
+/// The points a traced System exit's round trip passes ([`ExitTrace`]), in
+/// order: native code's return in the host, the engine's adoption of what
+/// it did, the start and end of the profile's look at the exit's word, the
+/// end of the service, of its links and charge, the start and end of the
+/// next schedule, the end of the devices' and the fetch's phases, and the
+/// host's next entry into native code.
+pub const PATH_RETURNED: usize = 0;
+pub const PATH_ADOPTED: usize = 1;
+pub const PATH_WORD: usize = 2;
+pub const PATH_SERVICE: usize = 3;
+pub const PATH_SERVED: usize = 4;
+pub const PATH_CLOSED: usize = 5;
+pub const PATH_SCHEDULE: usize = 6;
+pub const PATH_SCHEDULED: usize = 7;
+pub const PATH_DEVICES: usize = 8;
+pub const PATH_FETCHED: usize = 9;
+pub const PATH_ENTERED: usize = 10;
+const PATH_POINTS: usize = PATH_ENTERED + 1;
+
+/// The segments between the [`ExitTrace`] points, as `PES EXIT PATH` names
+/// them.
+pub const PATH_SEGMENTS: usize = PATH_POINTS - 1;
+pub const PATH_NAMES: [&str; PATH_SEGMENTS] = [
+    "back", "prelude", "word", "service", "close", "loop", "schedule", "devices", "fetch", "enter",
+];
+
+/// One System exit in this many is traced: a few hundred cycles of stamps
+/// on one in 64 keep the trace's cost far below the step timing's own.
+pub const PATH_EVERY: u32 = 64;
+
+/// Sampled System exits' round trips under step timing, from native code's
+/// return to its next entry, by segment ([`PATH_NAMES`]): the exits traced
+/// and those whose trace another path ended first (an interrupt taken, an
+/// exception, the run loop left); within the traced services, the host's
+/// regime syncs and prediction isolations; and every change of derived
+/// state that closed every mirror cell, with the open cells it closed, each
+/// of which costs an exit to open again where code reaches it; and the TCR
+/// writes that kept them (`Machine::layout_written`), with the open cells
+/// they kept; and the System exits after which the run loop fetched at once
+/// (`Machine::continues_directly`), traced or not.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExitPaths {
+    pub traced: u64,
+    pub abandoned: u64,
+    pub ticks: [u64; PATH_SEGMENTS],
+    pub syncs: u64,
+    pub sync_ticks: u64,
+    pub isolations: u64,
+    pub isolation_ticks: u64,
+    pub closes: u64,
+    pub cells_closed: u64,
+    pub layouts: u64,
+    pub cells_kept: u64,
+    pub direct: u64,
+}
+
+impl ExitPaths {
+    /// Add everything `other` counts.
+    pub fn merge(&mut self, other: &Self) {
+        self.traced += other.traced;
+        self.abandoned += other.abandoned;
+        for (ticks, more) in self.ticks.iter_mut().zip(other.ticks) {
+            *ticks += more;
+        }
+        self.syncs += other.syncs;
+        self.sync_ticks += other.sync_ticks;
+        self.isolations += other.isolations;
+        self.isolation_ticks += other.isolation_ticks;
+        self.closes += other.closes;
+        self.cells_closed += other.cells_closed;
+        self.layouts += other.layouts;
+        self.cells_kept += other.cells_kept;
+        self.direct += other.direct;
+    }
+}
+
+/// The System exit being traced on a PE, if any: the profile ticks at each
+/// point it passed ([`PATH_RETURNED`] and on), the next point it expects,
+/// and the syncs its service made. A point out of order abandons it, as
+/// does leaving the run loop; the next native entry folds it into
+/// [`ExitPaths`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExitTrace {
+    countdown: u32,
+    next: usize,
+    stamps: [u64; PATH_POINTS],
+    syncs: [u64; 4],
+}
+
+impl ExitTrace {
+    /// Whether the next System exit is one to trace.
+    #[inline]
+    pub fn due(&mut self) -> bool {
+        if self.countdown != 0 {
+            self.countdown -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Trace the System exit native code returned for at `returned` (the
+    /// host's ticks, 0 where it keeps none), which the engine adopted by
+    /// `adopted`, its word looked at from `now`.
+    pub fn begin(&mut self, returned: u64, adopted: u64, now: u64) {
+        self.countdown = PATH_EVERY - 1;
+        let returned = if returned == 0 || returned > adopted {
+            adopted
+        } else {
+            returned
+        };
+        self.stamps[PATH_RETURNED] = returned;
+        self.stamps[PATH_ADOPTED] = adopted;
+        self.stamps[PATH_WORD] = now;
+        self.syncs = [0; 4];
+        self.next = PATH_SERVICE;
+    }
+
+    /// Drop the exit begun, which is not one to trace (a wait, a device
+    /// site): the next System exit is traced instead.
+    pub fn cancel(&mut self) {
+        self.next = 0;
+        self.countdown = 0;
+    }
+
+    #[inline]
+    pub fn open(&self) -> bool {
+        self.next != 0
+    }
+
+    /// Whether the traced exit's service runs.
+    #[inline]
+    pub fn in_service(&self) -> bool {
+        self.next == PATH_SERVED
+    }
+
+    /// The trace reached `point` at `now`; out of order, it is abandoned.
+    pub fn stamp(&mut self, point: usize, now: u64, paths: &mut ExitPaths) {
+        if self.next == 0 {
+            return;
+        }
+        if self.next != point {
+            return self.abandon(paths);
+        }
+        self.stamps[point] = now;
+        self.next = point + 1;
+    }
+
+    /// End the trace without a sample.
+    pub fn abandon(&mut self, paths: &mut ExitPaths) {
+        if self.next != 0 {
+            self.next = 0;
+            paths.abandoned += 1;
+        }
+    }
+
+    /// The service synchronized the host's regime in `ticks`, and isolated
+    /// its predictions in `isolated`'s.
+    pub fn sync(&mut self, ticks: u64, isolated: Option<u64>) {
+        self.syncs[0] += 1;
+        self.syncs[1] += ticks;
+        if let Some(isolated) = isolated {
+            self.syncs[2] += 1;
+            self.syncs[3] += isolated;
+        }
+    }
+
+    /// Native code was entered again at `entered` (the host's ticks, 0
+    /// where it keeps none): the trace ends and its segments count.
+    pub fn finish(&mut self, entered: u64, paths: &mut ExitPaths) {
+        if self.next == 0 {
+            return;
+        }
+        if self.next != PATH_ENTERED {
+            return self.abandon(paths);
+        }
+        let fetched = self.stamps[PATH_FETCHED];
+        self.stamps[PATH_ENTERED] = if entered < fetched { fetched } else { entered };
+        for (segment, ticks) in paths.ticks.iter_mut().enumerate() {
+            *ticks += self.stamps[segment + 1].saturating_sub(self.stamps[segment]);
+        }
+        paths.traced += 1;
+        paths.syncs += self.syncs[0];
+        paths.sync_ticks += self.syncs[1];
+        paths.isolations += self.syncs[2];
+        paths.isolation_ticks += self.syncs[3];
+        self.next = 0;
+    }
 }
 
 /// The host's regime changes ([`super::Host::set_regime`]) and prediction
@@ -993,6 +1192,7 @@ impl Default for SystemExits {
             barriers: BarrierWaits::default(),
             regimes: RegimeSyncs::default(),
             compression: [Compression::default(); 2],
+            paths: ExitPaths::default(),
         }
     }
 }
@@ -1031,6 +1231,7 @@ impl SystemExits {
         for (compression, other) in self.compression.iter_mut().zip(&exits.compression) {
             compression.merge(other);
         }
+        self.paths.merge(&exits.paths);
     }
 
     /// The keys with exits.
@@ -1046,6 +1247,7 @@ impl SystemExits {
             && self.floating_words.is_empty()
             && self.barriers.waits == 0
             && self.regimes == RegimeSyncs::default()
+            && self.paths == ExitPaths::default()
             && self
                 .compression
                 .iter()
@@ -1755,6 +1957,12 @@ pub struct Levels {
     pub wfe_spin_missed: u64,
     pub wfe_held: u64,
     pub wfe_spin_counts: u64,
+    /// WFEs native code completed on an event stream edge since the last
+    /// sample (`x86_64::register_read::EventStream`).
+    pub wfe_streamed: u64,
+    /// MSR CNTV_TVAL_EL0s that reached the engine, by why native code left
+    /// them to it ([`TimerExit`]).
+    pub timer_value_exits: [u64; TimerExit::COUNT],
     /// At each WFI, the kernel ticks charged since the PE last ran EL0 code
     /// or reached a WFI: wake-ups that found nothing for user code, idle
     /// paths and kernel threads.
@@ -1817,6 +2025,7 @@ impl Levels {
         self.wfe_spin_missed += spin.missed;
         self.wfe_held += spin.held;
         self.wfe_spin_counts += spin.counts;
+        self.wfe_streamed += spin.streamed;
     }
 
     /// The counts since `earlier`; the state is this one's.
@@ -1837,12 +2046,46 @@ impl Levels {
             wfe_spin_missed: self.wfe_spin_missed.wrapping_sub(earlier.wfe_spin_missed),
             wfe_held: self.wfe_held.wrapping_sub(earlier.wfe_held),
             wfe_spin_counts: self.wfe_spin_counts.wrapping_sub(earlier.wfe_spin_counts),
+            wfe_streamed: self.wfe_streamed.wrapping_sub(earlier.wfe_streamed),
+            timer_value_exits: core::array::from_fn(|reason| {
+                self.timer_value_exits[reason].wrapping_sub(earlier.timer_value_exits[reason])
+            }),
             kernel_before_wfi: self
                 .kernel_before_wfi
                 .wrapping_sub(earlier.kernel_before_wfi),
             ..*self
         }
     }
+}
+
+/// Why a timer write reached the engine, where the native timer write
+/// (`x86_64::register_read::timer_thunk`) would have completed it otherwise,
+/// in the order that thunk tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerExit {
+    /// Not at EL2 with HCR_EL2.E2H, at a guarded level, or a chip with two
+    /// timer banks: no native write serves the state.
+    State,
+    /// The timer cells are closed.
+    Closed,
+    /// The engine had not said when it looks at the lines again
+    /// (`Mirrors::lines_until`), as it kept no device lines for the PE...
+    LinesDevices,
+    /// ...as a performance monitor overflow was due or near...
+    LinesMonitor,
+    /// ...or as the PE's own fast IPI word was set.
+    LinesIpi,
+    /// The channel's output was high, and what lowering it leaves waiting
+    /// was not known.
+    High,
+    /// The write arms a compare the count has reached: the line rises.
+    Now,
+    /// Native code could have completed it (no thunk at the site).
+    Native,
+}
+
+impl TimerExit {
+    pub const COUNT: usize = 8;
 }
 
 /// Whether `word` is ERET, ERETAA or ERETAB.
@@ -1912,7 +2155,22 @@ mod tests {
         for (key, class) in cases {
             let name = system_key_name(key);
             assert_eq!(SystemClass::of(key), class, "{key:#010x} {name}");
+            assert_eq!(wait_key(key), class == SystemClass::Wait, "{key:#010x}");
         }
+    }
+
+    /// `wait_key` finds the Wait class exactly, over the whole hint and
+    /// barrier space (CRn 1 to 3 of op0 0) and the timed waits.
+    #[test]
+    fn wait_keys_are_the_wait_class() {
+        let mut waits = 0;
+        for key in (0xd503_1000u32..0xd503_4000).step_by(0x20) {
+            let wait = SystemClass::of(key) == SystemClass::Wait;
+            assert_eq!(wait_key(key), wait, "{key:#010x} {}", system_key_name(key));
+            waits += usize::from(wait);
+        }
+        // WFE, WFI, WFET and WFIT.
+        assert_eq!(waits, 4);
     }
 
     #[test]
@@ -1951,7 +2209,10 @@ mod tests {
     /// without step timing.
     #[test]
     fn a_sampled_run_whose_budget_ran_out_names_its_last_block() {
-        use super::super::{NativeExit, chain::ChainControl};
+        use super::super::{
+            NativeExit,
+            chain::{Account, ChainControl},
+        };
         use stela_compiler::block::ExitKind;
         const ADD: u32 = 0x9100_0400; // add x0, x0, #1
         let mut machine = super::super::tests::machine(&[ADD, 0x1400_0002, 0, ADD, 0x17ff_fffc]);
@@ -1975,10 +2236,10 @@ mod tests {
                 machine.host.chained = Some((
                     machine.chain.address() as *mut ChainControl,
                     ChainControl {
-                        budget: u64::MAX,
                         block: 1,
                         ..current
                     },
+                    Account::spent(0),
                 ));
                 machine.host.exits = alloc::vec![direct(next)];
                 machine.step().unwrap();

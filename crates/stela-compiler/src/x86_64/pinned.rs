@@ -8,6 +8,11 @@
 //! a fault's settlement ([`settle`]) takes them from the host's capture. No
 //! block spills or fills them, which leaves nothing to reconcile at a chain.
 //!
+//! The chain's account ([`super::chain::ACCOUNT`], R13) lives in a host
+//! register the same way, its home `GuestState::account`: every entry, return
+//! and [`frame_bound`] emission moves it with the pinned registers, and a
+//! fault's [`settled_account`] reads it from the capture.
+//!
 //! These host registers are the ones emitters do not take for scratch; RAX,
 //! RCX, RDX and R8 to R11 stay free. An emitter that needs one regardless goes
 //! through the frame, [`frame_bound`], with the registers around it written
@@ -26,16 +31,22 @@ use alloc::vec::Vec;
 /// Each pinned guest register and the host register that holds it. SP takes
 /// RBX, the host register an emitter may borrow around an access
 /// (`atomic::compare_exchange_pair`): SP is never a CASP operand, and the
-/// recovery row of that access names where RBX went.
-pub(crate) const PINNED: [(Register, Gpr); 7] = [
+/// recovery row of that access names where RBX went. X17, the least used of
+/// the seven once pinned, gave R13 to the chain's account: unpinned, it adds
+/// 0.04 host instructions per guest instruction to a kernel's hot blocks
+/// (5.63 to 5.67), X1 0.18 (`executed_paths`).
+pub(crate) const PINNED: [(Register, Gpr); 6] = [
     (Register::Sp, Gpr::Rbx),
     (Register::X(8), Gpr::Rsi),
     (Register::X(19), Gpr::R14),
     (Register::X(0), Gpr::R15),
     (Register::X(1), Gpr::Rbp),
     (Register::X(16), Gpr::R12),
-    (Register::X(17), Gpr::R13),
 ];
+
+/// `GuestState::account`, the home of [`super::chain::ACCOUNT`] outside
+/// native code.
+pub const ACCOUNT_HOME: i32 = core::mem::offset_of!(GuestState, account) as i32;
 
 /// The host register holding `register`.
 pub(crate) fn host(register: Register) -> Option<Gpr> {
@@ -66,12 +77,14 @@ pub(super) fn host_or_local(register: Register, locals: Option<LocalRegisters>) 
 pub(crate) fn slot(offset: i32) -> bool {
     const NZCV: i32 = core::mem::offset_of!(GuestState, nzcv) as i32;
     offset & !3 == NZCV
+        || offset & !7 == ACCOUNT_HOME
         || PINNED.iter().any(|(register, _)| {
             super::offset(*register).is_some_and(|slot| offset & !7 == slot as i32)
         })
 }
 
-/// The pinned registers' values in a fault's `capture`, into `state`.
+/// The pinned registers' values in a fault's `capture`, into `state`; the
+/// chain's account is [`settled_account`]'s.
 pub fn settle(capture: &HostGprSnapshot, state: &mut GuestState) {
     for (register, host) in PINNED {
         let value = capture.get(host.number()).unwrap_or_default();
@@ -82,6 +95,13 @@ pub fn settle(capture: &HostGprSnapshot, state: &mut GuestState) {
         }
     }
     state.nzcv = flag_word::arm(state.nzcv);
+}
+
+/// The chain's account a fault's `capture` holds ([`super::chain::ACCOUNT`]).
+pub fn settled_account(capture: &HostGprSnapshot) -> u64 {
+    capture
+        .get(super::chain::ACCOUNT.number())
+        .unwrap_or_default()
 }
 
 /// Whether `operation`'s emitter reaches guest registers and flags in the
@@ -529,6 +549,7 @@ pub fn capture(state: &mut GuestState) -> HostGprSnapshot {
             Register::Zero => 0,
         };
     }
+    registers[usize::from(super::chain::ACCOUNT.number())] = state.account;
     HostGprSnapshot::legacy(registers)
 }
 
@@ -577,7 +598,8 @@ pub fn entry() -> alloc::vec::Vec<u8> {
     code
 }
 
-/// The frame made exact for a [`frame_bound`] emission.
+/// The frame made exact for a [`frame_bound`] emission, the account in its
+/// home.
 pub(crate) fn write_back(code: &mut Code) {
     flag_word::open(code);
     let mut asm = code.asm();
@@ -585,9 +607,15 @@ pub(crate) fn write_back(code: &mut Code) {
         let slot = super::offset(register).expect("pinned registers have frame slots");
         asm.mov_store(Size::Qword, super::frame(slot), host);
     }
+    asm.mov_store(
+        Size::Qword,
+        Mem::base(Gpr::Rdi, ACCOUNT_HOME),
+        super::chain::ACCOUNT,
+    );
 }
 
-/// The pinned registers taken from the frame after a [`frame_bound`] emission.
+/// The pinned registers and the account taken from the frame after a
+/// [`frame_bound`] emission.
 pub(crate) fn reload(code: &mut Code) {
     flag_word::close(code);
     let mut asm = code.asm();
@@ -595,6 +623,11 @@ pub(crate) fn reload(code: &mut Code) {
         let slot = super::offset(register).expect("pinned registers have frame slots");
         asm.mov_load(Size::Qword, host, super::frame(slot));
     }
+    asm.mov_load(
+        Size::Qword,
+        super::chain::ACCOUNT,
+        Mem::base(Gpr::Rdi, ACCOUNT_HOME),
+    );
 }
 
 #[cfg(test)]
@@ -608,14 +641,19 @@ mod tests {
             registers[usize::from(host.number())] = index as u64 + 1;
         }
         let mut state = GuestState::default();
-        settle(&HostGprSnapshot::legacy(registers), &mut state);
+        registers[usize::from(super::super::chain::ACCOUNT.number())] = 7;
+        let capture = HostGprSnapshot::legacy(registers);
+        settle(&capture, &mut state);
         assert_eq!(state.sp, 1);
         assert_eq!(state.x[8], 2);
         assert_eq!(state.x[19], 3);
         assert_eq!(state.x[0], 4);
         assert_eq!(state.x[1], 5);
         assert_eq!(state.x[16], 6);
-        assert_eq!(state.x[17], 7);
+        assert_eq!((state.x[17], state.account), (0, 0));
+        state.account = settled_account(&capture);
+        assert_eq!(state.account, 7);
+        assert_eq!(super::capture(&mut state), capture);
     }
 
     #[test]

@@ -7,8 +7,8 @@ use super::{chain, flag_word};
 use crate::{GuestAddress, GuestState, block::ExitKind};
 
 // The bare-metal entry with its per-processor words (GS) in a static: the
-// callee-saved pushes, the recovery checks, MXCSR, the pinned registers and
-// the flag word in and out, the call and the restore.
+// callee-saved pushes, the recovery checks, MXCSR, the pinned registers, the
+// chain's account and the flag word in and out, the call and the restore.
 core::arch::global_asm!(
     r#"
 .global stela_test_enter_block
@@ -39,7 +39,7 @@ stela_test_enter_block:
     mov r15, [rdi + 0]
     mov rbp, [rdi + 8]
     mov r12, [rdi + 128]
-    mov r13, [rdi + 136]
+    mov r13, [rdi + {account}]
     lea r11, [rsp - 8]
     mov [rdi + {exit_rsp}], r11
     call rax
@@ -49,7 +49,7 @@ stela_test_enter_block:
     mov [rdi + 0], r15
     mov [rdi + 8], rbp
     mov [rdi + 128], r12
-    mov [rdi + 136], r13
+    mov [rdi + {account}], r13
     mov ecx, [rdi + {nzcv}]
     and ecx, {word_mask}
     imul ecx, ecx, {unpack}
@@ -69,6 +69,7 @@ stela_test_enter_block:
     ud2
 "#,
     sp = const core::mem::offset_of!(GuestState, sp),
+    account = const core::mem::offset_of!(GuestState, account),
     exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
     nzcv = const core::mem::offset_of!(GuestState, nzcv),
     arm_shift = const flag_word::ARM_SHIFT,

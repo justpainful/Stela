@@ -766,6 +766,16 @@ fn translation_store(
             storage = storage::discover().ok();
         }
     }
+    // The previous version's translations, for this first boot of a new
+    // one to compile again ahead of use.
+    if let Some(previous) = store.previous
+        && files.len() < MAX_FILES
+    {
+        files.push((
+            String::from(crate::engine::translations::PREVIOUS_FILE),
+            previous,
+        ));
+    }
     (files, storage)
 }
 
@@ -873,6 +883,7 @@ fn load(
     } = image;
     let memory::EngineMemory {
         heap,
+        kept_code,
         native_resources,
         native_task_allocations,
         stack,
@@ -1114,6 +1125,7 @@ fn load(
             files,
             file_count,
             heap,
+            kept_code,
             stack,
             code,
             pool,
