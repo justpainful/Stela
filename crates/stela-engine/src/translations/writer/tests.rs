@@ -1121,6 +1121,63 @@ fn a_compacted_arena_keeps_the_records_of_the_layouts_given() {
     );
 }
 
+/// A compaction a few records a step reads every layout whole between its
+/// steps, those that share records too, and leaves the arena as compact as
+/// one at once.
+#[test]
+fn a_compaction_in_steps_keeps_every_layout_whole_between_them() {
+    use crate::translations::pack::{Compaction, Settled};
+    let mut bytes = vec![0u8; 4 << 20];
+    let mut arena = Arena::new(&mut bytes);
+    let mut layouts: Vec<_> = (0..4)
+        .map(|index| {
+            let mut layout = layout_of(index * 1000, 200, index as u16, 700 + 300 * index as usize);
+            while layout.settle(&mut arena, usize::MAX) == Settled::More {}
+            layout
+        })
+        .collect();
+    // A merge's layout of a segment written and still held shares its
+    // records; one let go leaves its records behind.
+    layouts.push(layouts[2].clone());
+    drop(layouts.remove(1));
+    let before: Vec<_> = layouts.iter().map(Layout::to_vec).collect();
+    let used = arena.used();
+    let mut compaction = Compaction::new();
+    let mut steps = 0;
+    let given = loop {
+        let mut held: Vec<&mut Layout<'_>> = layouts.iter_mut().collect();
+        // Each step's time is up at its first look.
+        // SAFETY: these layouts hold every slice of the arena in use, and
+        // nothing else changes them between the steps.
+        let given = unsafe { compaction.step(&mut arena, &mut held, &mut || true) };
+        steps += 1;
+        assert_eq!(
+            layouts.iter().map(Layout::to_vec).collect::<Vec<_>>(),
+            before,
+            "step {steps}"
+        );
+        if let Some(given) = given {
+            break given;
+        }
+    };
+    assert!(steps > 20, "{steps}");
+    assert!(given > 200 * 1000 && given < used, "{given} of {used}");
+    assert_eq!(arena.used(), used - given);
+    // Compacted again at once, it has nothing left to give back.
+    let mut held: Vec<&mut Layout<'_>> = layouts.iter_mut().collect();
+    // SAFETY: as above.
+    assert_eq!(unsafe { arena.compact(&mut held) }, 0);
+    // The room given back holds new records, the kept ones unchanged.
+    let mut next = layout_of(5000, 200, 9, 1500);
+    let expected = next.to_vec();
+    while next.settle(&mut arena, usize::MAX) == Settled::More {}
+    assert_eq!(next.to_vec(), expected);
+    assert_eq!(
+        layouts.iter().map(Layout::to_vec).collect::<Vec<_>>(),
+        before
+    );
+}
+
 /// Batch after batch that presses while a write waits joins the batch held,
 /// within its share of the heap: the store refuses none. Without a known
 /// heap, one batch is held and the rest wait in the store's bound.
