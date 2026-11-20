@@ -1531,17 +1531,43 @@ fn staged_workers() -> impl Iterator<Item = &'static DiskWorker> {
 /// a model's own polls step its disk, as nothing else would.
 pub(super) struct Stepping(());
 
+/// Whether a [`Stepping`] is held, and the calls of [`while_stepped`] under
+/// way, which its drop waits for.
+static STEPPING: AtomicBool = AtomicBool::new(false);
+static STEPPED_CALLS: AtomicU32 = AtomicU32::new(0);
+
 impl Stepping {
     pub(super) fn start() -> Self {
         staged_workers().for_each(|worker| worker.set_staged(true));
+        STEPPING.store(true, Ordering::SeqCst);
         Self(())
     }
 }
 
 impl Drop for Stepping {
     fn drop(&mut self) {
+        // A call that saw the disks stepped finishes queuing on them before
+        // its commands could run on the host disk in its place.
+        STEPPING.store(false, Ordering::SeqCst);
+        while STEPPED_CALLS.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
         staged_workers().for_each(|worker| worker.set_staged(false));
     }
+}
+
+/// Run `f` while the processors step the staged disks, so that what it
+/// queues on one never runs on the host disk in its caller: `None` before
+/// they start and once they stop. A background write that queues on a
+/// staged disk after the run's stop would run its commands at once, under
+/// the host drivers' lock, which the stop's GPU unload holds for as long as
+/// it takes (run 20261120's pack writer waited 618 ms in one step on an
+/// idle PE as macOS restarted).
+pub(super) fn while_stepped<R>(f: impl FnOnce() -> R) -> Option<R> {
+    STEPPED_CALLS.fetch_add(1, Ordering::SeqCst);
+    let result = STEPPING.load(Ordering::SeqCst).then(f);
+    STEPPED_CALLS.fetch_sub(1, Ordering::SeqCst);
+    result
 }
 
 /// The macOS disk's model, the first of [`HostDisks`], written once as the

@@ -1229,16 +1229,19 @@ pub fn with_store_file<R>(
 /// Lend the store's partition to `f` while the guest runs, for background
 /// writes: staged, so `f` only queues commands (`BlockDevice::start`) and
 /// takes results (`finish`), never waiting for the disk. The pack file and
-/// the pipeline store share it. `None` when it is absent, lent, or not
-/// staged.
+/// the pipeline store share it. `None` when it is absent, lent, not
+/// staged, or the processors no longer step it (`storage::while_stepped`).
 pub fn lend_staged_partition<R>(f: impl FnOnce(&mut dyn BlockDevice) -> R) -> Option<R> {
     if !PARTITION_STAGED.load(Ordering::Acquire) {
         return None;
     }
-    BOOT.with(|boot| {
-        let partition = boot.as_mut()?.partition.as_deref_mut()?;
-        Some(f(partition))
+    super::storage::while_stepped(|| {
+        BOOT.with(|boot| {
+            let partition = boot.as_mut()?.partition.as_deref_mut()?;
+            Some(f(partition))
+        })
     })
+    .flatten()
 }
 
 /// Milliseconds of `ticks` TSC ticks.
