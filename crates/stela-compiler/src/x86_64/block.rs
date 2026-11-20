@@ -459,7 +459,7 @@ fn loop_joins(instructions: &[Instruction]) -> Vec<(usize, usize)> {
 /// each stretch of `instructions` between the landings in `starts`, each
 /// as if a block started there.
 fn segmented(
-    analysis: fn(&[Instruction], &mut [bool]),
+    analysis: impl Fn(&[Instruction], &mut [bool]),
     instructions: &[Instruction],
     starts: &[bool],
     rows: &mut [bool],
@@ -632,11 +632,14 @@ fn emit_selected(
         landing[..region.rows].copy_from_slice(&region.landing);
     }
     let landing = &landing[..=instructions.len()];
+    let range_analysis = |run: &[Instruction], rows: &mut [bool]| {
+        super::guest_range::checks(checks.range, run, rows);
+    };
     let mut range_rows = [true; MAX_BLOCK_INSTRUCTIONS];
     let ranges = if checks.guest_range {
         let rows = &mut range_rows[..instructions.len()];
         if !checks.checks_every_access() {
-            segmented(super::guest_range::checks, instructions, landing, rows);
+            segmented(range_analysis, instructions, landing, rows);
         }
         Some(&rows[..])
     } else {
@@ -661,7 +664,7 @@ fn emit_selected(
                     .collect();
                 let mut rows = vec![true; tripled.len()];
                 let starts: Vec<bool> = (0..tripled.len()).map(|at| landing[at % count]).collect();
-                segmented(super::guest_range::checks, &tripled, &starts, &mut rows);
+                segmented(range_analysis, &tripled, &starts, &mut rows);
                 for (index, row) in loop_rows[..count].iter_mut().enumerate() {
                     *row = rows[count + index] || rows[2 * count + index];
                 }

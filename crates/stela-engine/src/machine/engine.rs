@@ -865,8 +865,9 @@ pub struct Machine<H: Host, D: Devices> {
     #[cfg(feature = "native-profile")]
     stored_pages_peak: usize,
     page_uses: u64,
-    /// Entry contexts by variant and address class.
-    stored_contexts: BTreeMap<(Variant, u64), crate::translations::Digest>,
+    /// Entry contexts by variant, address class and whether the range check
+    /// passes around the page ([`Preparation::context`]).
+    stored_contexts: BTreeMap<(Variant, u64, bool), crate::translations::Digest>,
     /// How each variant's blocks are compiled ([`prepare`]).
     preparations: BTreeMap<Variant, Arc<Preparation>>,
     fetch: Vec<Option<FetchEntry>>,

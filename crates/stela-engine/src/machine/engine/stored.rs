@@ -43,8 +43,9 @@ pub fn entry_checks() -> EntryChecks {
 /// the page at `page` from `input` ([`Entry::stored`]). The compiler makes
 /// it as it emits; a check compiles the block again at both probe addresses
 /// of its page and requires the fields that move to be the relocations it
-/// recorded ([`crate::translations::prove`]). Test and debug builds check
-/// every one and panic on a difference; a profile build checks one in
+/// recorded ([`crate::translations::prove`]), where both probes share the
+/// page's context ([`Preparation::passes_around`]). Test and debug builds
+/// check every one and panic on a difference; a profile build checks one in
 /// [`CHECK_INTERVAL`], counts any that differ ([`entry_checks`]) and keeps
 /// those out of the store. Other builds trust the compiler.
 pub(super) fn stored_entry(
@@ -56,7 +57,17 @@ pub(super) fn stored_entry(
     preparation: &Preparation,
 ) -> Option<Entry> {
     let entry = Entry::stored(block, input, page, pc, context)?;
-    let due = if cfg!(any(test, debug_assertions)) {
+    let displacements = crate::translations::probe_displacements(page);
+    // A probe page of another context, where the range check passes around
+    // it otherwise ([`Preparation::context`]), may compile otherwise: the
+    // entry never moves there, and the check compares no such page.
+    let probed = displacements.iter().all(|&displacement| {
+        preparation.passes_around(page.wrapping_add(displacement))
+            == preparation.passes_around(page)
+    });
+    let due = if !probed {
+        false
+    } else if cfg!(any(test, debug_assertions)) {
         true
     } else if cfg!(feature = "native-profile") {
         ENTRIES
@@ -69,7 +80,7 @@ pub(super) fn stored_entry(
         return Some(entry);
     }
     CHECKED.fetch_add(1, Ordering::Relaxed);
-    let probes = crate::translations::probe_displacements(page).map(|displacement| {
+    let probes = displacements.map(|displacement| {
         preparation
             .compile_input(input, pc.wrapping_add(displacement))
             .ok()
@@ -705,13 +716,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         page: u64,
     ) -> Digest {
         let class = crate::translations::address_class(page);
+        let around = preparation.passes_around(page);
         let variant = Variant {
             guarded_page: false,
             ..variant
         };
         *self
             .stored_contexts
-            .entry((variant, class))
+            .entry((variant, class, around))
             .or_insert_with(|| preparation.context(page))
     }
 }
