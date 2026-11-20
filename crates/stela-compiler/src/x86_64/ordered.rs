@@ -1,17 +1,26 @@
 //! Acquire/release accesses and DMB on write-back memory.
 //!
-//! Release stores use XCHG so a later acquire load cannot pass them, and a
-//! full DMB is a locked OR of zero into the host stack's top word. Checked
-//! loads crossing eight bytes read one aligned 16-byte snapshot. For
-//! PSTATE.DIT ([`super::plain_ordering`]), which the engine admits only
-//! while one PE runs, every access is a plain load or store and a DMB emits
-//! nothing: no other agent observes guest memory, and one PE observes its
-//! own accesses in program order.
+//! x86 keeps every store after the PE's earlier loads and stores, and every
+//! load after its earlier loads (TSO), so a load-acquire is a plain load and
+//! a store-release a plain store: only the order of a store-release before
+//! a later load-acquire (RCsc) needs more, as a store may wait in the store
+//! buffer while later loads run. A store-release marks the frame
+//! ([`GuestState::pending_release`]) and a load-acquire, finding the mark,
+//! drains the buffer with a locked instruction first ([`drain_release`]),
+//! across blocks and exits alike. A full DMB is that locked instruction, a
+//! locked OR of zero into the host stack's top word. On a host where a
+//! store inside a cache line may not be single-copy atomic (not
+//! [`TargetCpu::LineAtomic`]), a store-release inside its granule is XCHG,
+//! itself locked. Checked loads crossing eight bytes read one aligned
+//! 16-byte snapshot. For PSTATE.DIT ([`super::plain_ordering`]), which the
+//! engine admits only while one PE runs, every access is a plain load or
+//! store and a DMB emits nothing: no other agent observes guest memory, and
+//! one PE observes its own accesses in program order.
 use super::atomic::{address_offset, commit_rax, input_rcx, read_rax, store_rcx};
 use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size};
 use crate::x86_64::isa::SimdOpcode;
 use crate::{
-    TargetCpu,
+    GuestState, TargetCpu,
     aarch64::{
         Register, Width,
         ordered::{Barrier, Kind, LoadExtension, Operand},
@@ -132,7 +141,12 @@ pub(super) fn emit(
             // no non-temporal or write-combining stores, the only ones MFENCE
             // orders that it might not, and the host flags are dead here.
             match requirement {
-                Barrier::All if !plain => code.asm().locked_barrier(),
+                Barrier::All if !plain => {
+                    // Every store-release before it drains with it.
+                    let mut asm = code.asm();
+                    asm.locked_barrier();
+                    asm.mov_byte_imm(pending_release(), 0);
+                }
                 Barrier::All | Barrier::Reads | Barrier::Writes => code.asm().nop(),
             }
         }
@@ -155,7 +169,7 @@ pub(super) fn emit(
                 super::Access::of(kind == Kind::Release, bytes.into()),
             );
             // An access that crosses its granule needs no single-copy
-            // atomicity: it takes a plain load, or a store and a full fence.
+            // atomicity: it takes a plain load or store.
             let crossing = crossing(base, bytes, displacement, checks);
             if plain {
                 // With no other agent, a plain access is single-copy atomic
@@ -172,19 +186,26 @@ pub(super) fn emit(
                 }
             } else if kind == Kind::Release {
                 input_rcx(code, bytes, data);
+                // A byte, and on an Intel host any store inside a cache
+                // line, is single-copy atomic.
+                let atomic = target.supports(TargetCpu::LineAtomic) || bytes == BYTE_BYTES;
                 match crossing {
-                    Crossing::Never => release(code, bytes),
-                    Crossing::Always => crossing_release(code, bytes),
+                    _ if atomic => marked_release(code, bytes),
+                    Crossing::Never => locked_release(code, bytes),
+                    Crossing::Always => marked_release(code, bytes),
                     Crossing::Maybe => {
                         let within = branch_within_granule(code, bytes);
-                        crossing_release(code, bytes);
+                        marked_release(code, bytes);
                         let done = jump_over(code);
                         patch(code, within);
-                        release(code, bytes);
+                        locked_release(code, bytes);
                         patch(code, done);
                     }
                 }
             } else {
+                if kind == Kind::Acquire {
+                    drain_release(code);
+                }
                 let mut done = None;
                 if crossing == Crossing::Maybe {
                     let within = branch_within_granule(code, bytes);
@@ -223,17 +244,37 @@ pub(super) fn emit(
     }
 }
 
-/// A store-release that crosses its granule: a plain store, which x86 keeps
-/// in order after earlier accesses, and a locked instruction, which keeps
-/// later load-acquires after it (RCsc).
-fn crossing_release(code: &mut Code, bytes: u8) {
-    store_rcx(code, bytes);
-    code.asm().locked_barrier();
+/// The low byte of [`GuestState::pending_release`].
+fn pending_release() -> Mem {
+    super::frame(core::mem::offset_of!(GuestState, pending_release) as u32)
 }
 
-fn release(code: &mut Code, bytes: u8) {
+/// A store-release as a plain store, which x86 keeps in order after earlier
+/// accesses, marking the frame so the next load-acquire drains it first
+/// ([`drain_release`]).
+fn marked_release(code: &mut Code, bytes: u8) {
+    store_rcx(code, bytes);
+    code.asm().mov_byte_imm(pending_release(), 1);
+}
+
+/// A store-release as XCHG, whose implicit lock drains the store buffer:
+/// no later load passes it, and it is single-copy atomic however it lies
+/// in its granule.
+fn locked_release(code: &mut Code, bytes: u8) {
     code.asm()
         .guest_access(|asm| asm.xchg(size(bytes), ADDRESS, Gpr::Rcx));
+}
+
+/// What a load-acquire (RCsc: LDAR, LDAXR) does first: while a store-release
+/// may wait in the store buffer ([`marked_release`]), drain it with a locked
+/// instruction and clear the mark. Clobbers the host flags.
+pub(super) fn drain_release(code: &mut Code) {
+    let mut asm = code.asm();
+    asm.alu_byte_imm(Alu::Cmp, pending_release(), 0);
+    let drained = asm.jcc8(Cond::E);
+    asm.locked_barrier();
+    asm.mov_byte_imm(pending_release(), 0);
+    asm.bind(drained);
 }
 
 fn read_extended(code: &mut Code, bytes: u8, extension: LoadExtension) {
@@ -322,6 +363,15 @@ mod tests {
 
     const MFENCE: &[u8] = &[0x0f, 0xae, 0xf0];
     const LOCKED_BARRIER: &[u8] = &[0xf0, 0x83, 0x0c, 0x24, 0x00];
+    /// `mov byte [rdi+920],imm8` without its immediate: the frame's
+    /// pending release mark set or cleared.
+    const MARK: &[u8] = &[0xc6, 0x87, 0x98, 0x03, 0, 0];
+    /// `cmp byte [rdi+920],0; je +12; lock or dword [rsp],0;
+    /// mov byte [rdi+920],0`: a drain.
+    const DRAIN: &[u8] = &[
+        0x80, 0xbf, 0x98, 0x03, 0, 0, 0, 0x74, 12, 0xf0, 0x83, 0x0c, 0x24, 0x00, 0xc6, 0x87, 0x98,
+        0x03, 0, 0, 0,
+    ];
     const MOVDQA_XMM0_RDX: &[u8] = &[0x66, 0x0f, 0x6f, 0x02];
     const UNCHECKED: MemoryChecks = MemoryChecks {
         stack_alignment: false,
@@ -407,8 +457,9 @@ mod tests {
         ));
     }
 
-    /// DMB ISH, SY and the reserved options are one locked instruction;
-    /// the LD and ST forms order nothing TSO leaves unordered.
+    /// DMB ISH, SY and the reserved options are one locked instruction,
+    /// which drains every store-release before it; the LD and ST forms
+    /// order nothing TSO leaves unordered.
     #[test]
     fn a_full_dmb_is_a_locked_barrier_and_the_others_nothing() {
         for option in 0..16u8 {
@@ -429,9 +480,45 @@ mod tests {
                 MemoryChecks::DEFAULT,
             );
             if requirement == Barrier::All {
-                assert_eq!(&code[..], LOCKED_BARRIER, "{option}");
+                assert_eq!(&code[..], [LOCKED_BARRIER, MARK, &[0]].concat(), "{option}");
             } else {
                 assert_eq!(code, [0x90], "{option}");
+            }
+        }
+    }
+
+    /// On an Intel host a store-release is a plain store that marks the
+    /// frame, and LDAR drains a marked one first; LDAPR (RCpc) does not.
+    /// Elsewhere a store-release inside its granule is XCHG.
+    #[test]
+    fn store_releases_mark_and_rcsc_load_acquires_drain() {
+        let has =
+            |code: &[u8], bytes: &[u8]| code.windows(bytes.len()).any(|window| window == bytes);
+        let intel = TargetCpu::X86_64_V3.with_line_atomic();
+        let amd = TargetCpu::X86_64_V3.with_atomic_load16();
+        for target in [intel, amd] {
+            for bytes in [BYTE_BYTES, HALFWORD_BYTES, DWORD_BYTES, QWORD_BYTES] {
+                for kind in [Kind::Acquire, Kind::AcquirePc, Kind::Release] {
+                    let operand = Operand::Transfer {
+                        feature: crate::aarch64::ordered::Feature::Base,
+                        kind,
+                        bytes,
+                        data: Register::X(1),
+                        base: Register::X(2),
+                        displacement: 0,
+                        extension: LoadExtension::Zero,
+                    };
+                    let mut code = Code::new();
+                    emit(&mut code, &operand, target, MemoryChecks::DEFAULT);
+                    let marked = kind == Kind::Release && (target == intel || bytes == 1);
+                    assert_eq!(code.ends_with(&[MARK, &[1]].concat()), marked);
+                    // XCHG with [rdx].
+                    let exchange = [&[0x86 | u8::from(bytes > 1), 0x0a][..]].concat();
+                    let locked = kind == Kind::Release && !marked;
+                    assert_eq!(has(&code, &exchange), locked, "{kind:?} {bytes}");
+                    assert_eq!(has(&code, DRAIN), kind == Kind::Acquire, "{kind:?}");
+                    assert_eq!(has(&code, LOCKED_BARRIER), kind == Kind::Acquire);
+                }
             }
         }
     }
@@ -468,9 +555,10 @@ mod tests {
             };
             let mut code = Code::new();
             emit(&mut code, &operand, timed, single);
-            // No XCHG, fence, 16-byte snapshot or granule branch.
+            // No XCHG, fence, mark, 16-byte snapshot or granule branch.
             assert!(!has(&code, &[0x48, 0x87, 0x0a]) && !has(&code, MFENCE));
-            assert!(!has(&code, LOCKED_BARRIER));
+            assert!(!has(&code, LOCKED_BARRIER) && !has(&code, MARK));
+            assert!(!has(&code, &DRAIN[..4]));
             assert!(!has(&code, MOVDQA_XMM0_RDX) && !has(&code, &[0x89, 0xd0, 0x83, 0xe0]));
             if kind == Kind::Release {
                 assert!(code.ends_with(&[0x48, 0x89, 0x0a]));
@@ -488,7 +576,9 @@ mod tests {
             ordered_granule: false,
             ..MemoryChecks::DEFAULT
         };
-        let emitted = |kind, base, displacement, checks| {
+        let intel = TargetCpu::X86_64_V3.with_line_atomic();
+        let amd = TargetCpu::X86_64_V3.with_atomic_load16();
+        let emitted = |kind, base, displacement, checks, target| {
             let mut code = Code::new();
             let operand = Operand::Transfer {
                 feature: crate::aarch64::ordered::Feature::Base,
@@ -499,35 +589,39 @@ mod tests {
                 displacement,
                 extension: LoadExtension::Zero,
             };
-            emit(&mut code, &operand, TargetCpu::detect(), checks);
+            emit(&mut code, &operand, target, checks);
             code
         };
         let has =
             |code: &[u8], bytes: &[u8]| code.windows(bytes.len()).any(|window| window == bytes);
         // mov eax,edx; and eax,15; cmp al,12; jbe: the run-time granule test.
         let within = [0x89, 0xd0, 0x83, 0xe0, 0x0f, 0x3c, 12, 0x76];
-        for kind in [Kind::Acquire, Kind::AcquirePc, Kind::Release] {
-            let checked = emitted(kind, Register::X(2), 0, MemoryChecks::DEFAULT);
-            assert!(has(&checked, &UD2) && !has(&checked, &within));
-            let code = emitted(kind, Register::X(2), 0, relaxed);
-            assert!(!has(&code, &UD2) && has(&code, &within));
-            // A crossing store-release is a plain store and a locked barrier.
-            assert_eq!(
-                kind == Kind::Release,
-                has(&code, &[0x89, 0x0a, 0xf0, 0x83, 0x0c, 0x24, 0x00])
-            );
+        // mov [rdx],ecx, then the mark: a plain store-release.
+        let marked = [&[0x89, 0x0a], MARK, &[1]].concat();
+        for target in [intel, amd] {
+            for kind in [Kind::Acquire, Kind::AcquirePc, Kind::Release] {
+                let checked = emitted(kind, Register::X(2), 0, MemoryChecks::DEFAULT, target);
+                assert!(has(&checked, &UD2) && !has(&checked, &within));
+                let code = emitted(kind, Register::X(2), 0, relaxed, target);
+                assert!(!has(&code, &UD2));
+                // A store-release on an Intel host is one marked store
+                // wherever it lies; elsewhere only a crossing one is.
+                let tested = kind != Kind::Release || target == amd;
+                assert_eq!(has(&code, &within), tested, "{kind:?}");
+                assert_eq!(has(&code, &marked), kind == Kind::Release, "{kind:?}");
+            }
         }
         // A checked SP settles the residue: SP+14 always crosses, and with
         // the granule check it always faults.
-        let crossing = emitted(Kind::Release, Register::Sp, 14, relaxed);
-        let fenced = [0x89, 0x0a, 0xf0, 0x83, 0x0c, 0x24, 0x00];
-        assert!(!has(&crossing, &within) && has(&crossing, &fenced));
+        let crossing = emitted(Kind::Release, Register::Sp, 14, relaxed, amd);
+        assert!(!has(&crossing, &within) && has(&crossing, &marked));
         assert!(has(
-            &emitted(Kind::Release, Register::Sp, 14, MemoryChecks::DEFAULT),
+            &emitted(Kind::Release, Register::Sp, 14, MemoryChecks::DEFAULT, amd),
             &UD2
         ));
-        let inside = emitted(Kind::Release, Register::Sp, 4, relaxed);
-        assert!(!has(&inside, &within) && !has(&inside, LOCKED_BARRIER));
+        let inside = emitted(Kind::Release, Register::Sp, 4, relaxed, amd);
+        assert!(!has(&inside, &within) && !has(&inside, &marked));
+        assert!(has(&inside, &[0x87, 0x0a]));
     }
 
     #[test]
@@ -561,10 +655,11 @@ mod tests {
                     TargetCpu::DataIndependentTiming,
                     checks,
                 );
-                // No XCHG with [rdx] and no MFENCE, even for a crossing.
+                // No XCHG with [rdx], fence or mark, even for a crossing.
                 assert!(code.ends_with(store), "{bytes}");
                 assert!(!has(&code, &[0x86, 0x0a]) && !has(&code, &[0x87, 0x0a]));
-                assert!(!has(&code, MFENCE));
+                assert!(!has(&code, MFENCE) && !has(&code, LOCKED_BARRIER));
+                assert!(!has(&code, MARK));
             }
         }
     }

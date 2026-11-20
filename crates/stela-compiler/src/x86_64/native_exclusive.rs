@@ -3,7 +3,9 @@
 //! value (the engine's `parallel`): the load records its address, width and
 //! value in the guest frame, and a store to that address and width compares
 //! the value and stores in one LOCK CMPXCHG. A write of the same value by
-//! another PE between them goes unseen, as with LSE CAS.
+//! another PE between them goes unseen, as with LSE CAS. LDAXR first drains
+//! a store-release still in the store buffer, as LDAR does
+//! (`x86_64::ordered`); STLXR's LOCK CMPXCHG orders it as XCHG would.
 //!
 //! A store to any other address or width, like every fault, a pair and CLREX,
 //! exits to the engine at the instruction, with the frame's monitor intact
@@ -73,7 +75,11 @@ pub(crate) fn emit(
     } = transfer;
     atomic::address(code, base, bytes, checks);
     match kind {
-        Kind::Load { .. } => {
+        Kind::Load { acquire } => {
+            if acquire {
+                // LDAXR is RCsc, as LDAR is.
+                super::ordered::drain_release(code);
+            }
             read_rax(code, bytes);
             let mut asm = code.asm();
             asm.mov_store(Size::Qword, value_field(), Gpr::Rax);
