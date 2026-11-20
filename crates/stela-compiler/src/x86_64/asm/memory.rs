@@ -33,11 +33,6 @@ impl Asm<'_> {
     pub(crate) fn rdtsc(&mut self) {
         self.fixed(&[0x0f, 0x31]);
     }
-    /// `mfence` (0F AE F0): order every earlier load and store before every
-    /// later one.
-    pub(crate) fn mfence(&mut self) {
-        self.fixed(&[0x0f, 0xae, 0xf0]);
-    }
     /// `lock or dword [rsp],0` (F0 83 0C 24 00): a locked instruction, which
     /// no earlier or later load or store passes (SDM Vol. 3A 9.2.2), so a
     /// full barrier for write-back memory at about half MFENCE's cost on
@@ -127,7 +122,6 @@ mod tests {
                 &[0x0f, 0x18, 0x90, 0, 1, 0, 0],
                 one(|a| a.prefetch(Prefetch::T1, Mem::base(Rax, 0x100))),
             ),
-            (&[0x0f, 0xae, 0xf0], one(|a| a.mfence())),
             (&[0xf0, 0x83, 0x0c, 0x24, 0x00], one(|a| a.locked_barrier())),
             (
                 &[0xc6, 0x87, 0x98, 0x03, 0, 0, 1],
