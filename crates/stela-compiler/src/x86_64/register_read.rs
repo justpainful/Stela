@@ -527,10 +527,11 @@ pub fn pan_thunk(pc: GuestAddress, pan: bool, cell: Place) -> Thunk {
 
 /// The thunk completing a DSB at `pc` while the cell at `cell` is open, that
 /// is while the engine has no maintenance for it to complete, else exiting
-/// at `pc`.
+/// at `pc`: a locked instruction completes this PE's accesses to write-back
+/// memory before its later ones, as MFENCE does at twice the cost.
 pub fn barrier_thunk(pc: GuestAddress, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
-    Asm::new(&mut code).mfence();
+    Asm::new(&mut code).locked_barrier();
     finish(code, miss, pc)
 }
 

@@ -1,11 +1,12 @@
 //! Acquire/release accesses and DMB on write-back memory.
 //!
 //! Release stores use XCHG so a later acquire load cannot pass them, and a
-//! full DMB is MFENCE. Checked loads crossing eight bytes read one aligned
-//! 16-byte snapshot. For PSTATE.DIT ([`super::plain_ordering`]), which the
-//! engine admits only while one PE runs, every access is a plain load or
-//! store and a DMB emits nothing: no other agent observes guest memory, and
-//! one PE observes its own accesses in program order.
+//! full DMB is a locked OR of zero into the host stack's top word. Checked
+//! loads crossing eight bytes read one aligned 16-byte snapshot. For
+//! PSTATE.DIT ([`super::plain_ordering`]), which the engine admits only
+//! while one PE runs, every access is a plain load or store and a DMB emits
+//! nothing: no other agent observes guest memory, and one PE observes its
+//! own accesses in program order.
 use super::atomic::{address_offset, commit_rax, input_rcx, read_rax, store_rcx};
 use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size};
 use crate::x86_64::isa::SimdOpcode;
@@ -126,9 +127,12 @@ pub(super) fn emit(
         Operand::Barrier { requirement, .. } => {
             // Cached ordinary WB accesses already preserve reads→reads/writes
             // and writes→writes. Full barriers additionally close store→load,
-            // which only another agent could observe.
+            // which only another agent could observe: a locked instruction
+            // does, as MFENCE does, at half its cost. Translated code makes
+            // no non-temporal or write-combining stores, the only ones MFENCE
+            // orders that it might not, and the host flags are dead here.
             match requirement {
-                Barrier::All if !plain => code.asm().mfence(),
+                Barrier::All if !plain => code.asm().locked_barrier(),
                 Barrier::All | Barrier::Reads | Barrier::Writes => code.asm().nop(),
             }
         }
@@ -220,11 +224,11 @@ pub(super) fn emit(
 }
 
 /// A store-release that crosses its granule: a plain store, which x86 keeps
-/// in order after earlier accesses, and MFENCE, which keeps later
-/// load-acquires after it (RCsc).
+/// in order after earlier accesses, and a locked instruction, which keeps
+/// later load-acquires after it (RCsc).
 fn crossing_release(code: &mut Code, bytes: u8) {
     store_rcx(code, bytes);
-    code.asm().mfence();
+    code.asm().locked_barrier();
 }
 
 fn release(code: &mut Code, bytes: u8) {
@@ -317,6 +321,7 @@ mod tests {
     use crate::x86_64::MemoryChecks;
 
     const MFENCE: &[u8] = &[0x0f, 0xae, 0xf0];
+    const LOCKED_BARRIER: &[u8] = &[0xf0, 0x83, 0x0c, 0x24, 0x00];
     const MOVDQA_XMM0_RDX: &[u8] = &[0x66, 0x0f, 0x6f, 0x02];
     const UNCHECKED: MemoryChecks = MemoryChecks {
         stack_alignment: false,
@@ -402,6 +407,35 @@ mod tests {
         ));
     }
 
+    /// DMB ISH, SY and the reserved options are one locked instruction;
+    /// the LD and ST forms order nothing TSO leaves unordered.
+    #[test]
+    fn a_full_dmb_is_a_locked_barrier_and_the_others_nothing() {
+        for option in 0..16u8 {
+            let requirement = match option & 3 {
+                1 => Barrier::Reads,
+                2 => Barrier::Writes,
+                _ => Barrier::All,
+            };
+            let mut code = Code::new();
+            let operand = Operand::Barrier {
+                option,
+                requirement,
+            };
+            emit(
+                &mut code,
+                &operand,
+                TargetCpu::detect(),
+                MemoryChecks::DEFAULT,
+            );
+            if requirement == Barrier::All {
+                assert_eq!(&code[..], LOCKED_BARRIER, "{option}");
+            } else {
+                assert_eq!(code, [0x90], "{option}");
+            }
+        }
+    }
+
     #[test]
     fn data_independent_timing_takes_plain_ordered_accesses_and_drops_dmb() {
         let single = MemoryChecks {
@@ -434,8 +468,9 @@ mod tests {
             };
             let mut code = Code::new();
             emit(&mut code, &operand, timed, single);
-            // No XCHG, MFENCE, 16-byte snapshot or granule branch.
+            // No XCHG, fence, 16-byte snapshot or granule branch.
             assert!(!has(&code, &[0x48, 0x87, 0x0a]) && !has(&code, MFENCE));
+            assert!(!has(&code, LOCKED_BARRIER));
             assert!(!has(&code, MOVDQA_XMM0_RDX) && !has(&code, &[0x89, 0xd0, 0x83, 0xe0]));
             if kind == Kind::Release {
                 assert!(code.ends_with(&[0x48, 0x89, 0x0a]));
@@ -476,22 +511,23 @@ mod tests {
             assert!(has(&checked, &UD2) && !has(&checked, &within));
             let code = emitted(kind, Register::X(2), 0, relaxed);
             assert!(!has(&code, &UD2) && has(&code, &within));
-            // A crossing store-release is a plain store and a full fence.
+            // A crossing store-release is a plain store and a locked barrier.
             assert_eq!(
                 kind == Kind::Release,
-                has(&code, &[0x89, 0x0a, 0x0f, 0xae, 0xf0])
+                has(&code, &[0x89, 0x0a, 0xf0, 0x83, 0x0c, 0x24, 0x00])
             );
         }
         // A checked SP settles the residue: SP+14 always crosses, and with
         // the granule check it always faults.
         let crossing = emitted(Kind::Release, Register::Sp, 14, relaxed);
-        assert!(!has(&crossing, &within) && has(&crossing, &[0x89, 0x0a, 0x0f, 0xae, 0xf0]));
+        let fenced = [0x89, 0x0a, 0xf0, 0x83, 0x0c, 0x24, 0x00];
+        assert!(!has(&crossing, &within) && has(&crossing, &fenced));
         assert!(has(
             &emitted(Kind::Release, Register::Sp, 14, MemoryChecks::DEFAULT),
             &UD2
         ));
         let inside = emitted(Kind::Release, Register::Sp, 4, relaxed);
-        assert!(!has(&inside, &within) && !has(&inside, &[0x0f, 0xae, 0xf0]));
+        assert!(!has(&inside, &within) && !has(&inside, LOCKED_BARRIER));
     }
 
     #[test]
@@ -533,3 +569,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod litmus_tests;
