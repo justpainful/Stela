@@ -36,10 +36,14 @@ pub(crate) struct CompileThroughput {
     #[arg(long)]
     four_level_slices: Option<u8>,
     /// Write each block of the last pass as a JSON line to this new file:
-    /// its PC, consumed source words, native code and source map, for
-    /// inspecting what real code compiles to.
+    /// its PC, consumed source words, native code, source map and cold
+    /// code, for inspecting what real code compiles to.
     #[arg(long)]
     emit: Option<PathBuf>,
+    /// Compile as a running machine's PEs do: exclusives by value (PEs on
+    /// cores of their own), self-loops and regions.
+    #[arg(long)]
+    as_machine: bool,
 }
 
 impl CompileThroughput {
@@ -73,6 +77,9 @@ impl CompileThroughput {
             // The engine's blocks complete PAC instructions inside themselves.
             system: NativeSystem {
                 pointer: Some(POINTER_CELLS),
+                exclusive: self.as_machine,
+                self_loops: self.as_machine,
+                regions: self.as_machine,
                 ..NativeSystem::NONE
             },
             withheld: 0,
@@ -138,14 +145,16 @@ impl CompileThroughput {
     }
 }
 
-/// One emitted block: its PC, consumed source and native code in hex, and
-/// the native offset of each source instruction.
+/// One emitted block: its PC, consumed source and native code in hex, the
+/// native offset of each source instruction, and its cold code's offsets
+/// (`CompiledBlock::cold`).
 #[derive(serde::Serialize)]
 struct Emitted {
     pc: u64,
     source: String,
     native: String,
     map: Vec<usize>,
+    cold: (u32, u32),
 }
 
 impl Emitted {
@@ -160,6 +169,7 @@ impl Emitted {
                 .iter()
                 .map(|&(_, offset)| offset)
                 .collect(),
+            cold: compiled.cold,
         }
     }
 }
