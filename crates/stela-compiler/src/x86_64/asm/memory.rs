@@ -47,6 +47,11 @@ impl Asm<'_> {
         self.lock();
         self.alu_imm8(Alu::Or, Size::Dword, Mem::base(Gpr::Rsp, 0), 0);
     }
+    /// `mov byte rm,imm8` (C6 /0 ib).
+    pub(crate) fn mov_byte_imm(&mut self, rm: impl Into<Rm>, value: u8) {
+        self.legacy(Size::Byte, None, &[0xc6], 0, false, rm.into());
+        self.data(&[value]);
+    }
     /// `lfence` (0F AE E8): no later instruction starts until every earlier
     /// one has completed locally, which orders `rdtsc` against the loads
     /// around it (Intel SDM Vol. 2B, RDTSC).
@@ -124,6 +129,10 @@ mod tests {
             ),
             (&[0x0f, 0xae, 0xf0], one(|a| a.mfence())),
             (&[0xf0, 0x83, 0x0c, 0x24, 0x00], one(|a| a.locked_barrier())),
+            (
+                &[0xc6, 0x87, 0x98, 0x03, 0, 0, 1],
+                one(|a| a.mov_byte_imm(Mem::base_disp32(Rdi, 920), 1)),
+            ),
             (&[0x0f, 0xae, 0xe8], one(|a| a.lfence())),
             (&[0x3c, 12], one(|a| a.alu_accumulator_imm8(Alu::Cmp, 12))),
             (

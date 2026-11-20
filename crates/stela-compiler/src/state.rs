@@ -126,6 +126,11 @@ pub struct GuestState {
     /// it: `x86_64::pinned::settled_account`) and clears it, so between
     /// native calls it is 0.
     pub account: u64,
+    /// Whether a store-release of this PE's native code may still wait in
+    /// the host core's store buffer: such a store is a plain MOV, which sets
+    /// it, and a load-acquire (RCsc) drains the buffer with a locked
+    /// instruction when it is set, then clears it (`x86_64::ordered`).
+    pub pending_release: PendingRelease,
 }
 
 /// [`GuestState::exit_rsp`]: a host stack address of the native run in
@@ -146,6 +151,28 @@ impl Eq for ExitStack {}
 impl core::fmt::Debug for ExitStack {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("ExitStack")
+    }
+}
+
+/// [`GuestState::pending_release`]: nonzero in its low byte while a
+/// store-release may wait in the host's store buffer, a fact of the host
+/// core, no part of the guest's state, so any two compare equal and none
+/// prints.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default)]
+pub struct PendingRelease(pub u64);
+
+impl PartialEq for PendingRelease {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PendingRelease {}
+
+impl core::fmt::Debug for PendingRelease {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("PendingRelease")
     }
 }
 
@@ -190,6 +217,7 @@ impl Default for GuestState {
             loop_retired: 0,
             exit_rsp: ExitStack(0),
             account: 0,
+            pending_release: PendingRelease(0),
         }
     }
 }
@@ -203,9 +231,9 @@ mod tests {
     #[test]
     fn layout_matches_native_abi() {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
-            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v15-"));
+            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v16-"));
         }
-        assert_eq!(size_of::<GuestState>(), 920);
+        assert_eq!(size_of::<GuestState>(), 928);
         assert_eq!(align_of::<GuestState>(), 8);
         assert_eq!(offset_of!(GuestState, x), 0);
         assert_eq!(offset_of!(GuestState, sp), 248);
@@ -221,6 +249,7 @@ mod tests {
         assert_eq!(offset_of!(GuestState, loop_retired), 896);
         assert_eq!(offset_of!(GuestState, exit_rsp), 904);
         assert_eq!(offset_of!(GuestState, account), 912);
+        assert_eq!(offset_of!(GuestState, pending_release), 920);
     }
 
     #[test]

@@ -21,6 +21,12 @@ const ROUNDS: u64 = 40_000;
 const STR_W2_X0: u32 = 0xb900_0002;
 const LDR_W3_X1: u32 = 0xb940_0023;
 const DMB_ISH: u32 = 0xd503_3bbf;
+const STLR_W2_X0: u32 = 0x889f_fc02;
+const LDAR_W3_X1: u32 = 0x88df_fc23;
+const LDAPR_W3_X1: u32 = 0xb8bf_c023;
+const LDAXR_W3_X1: u32 = 0x885f_fc23;
+const STLRB_W2_X0: u32 = 0x089f_fc02;
+const LDARB_W3_X1: u32 = 0x08df_fc23;
 
 unsafe extern "C" {
     fn mmap(
@@ -167,4 +173,18 @@ fn a_full_dmb_orders_a_store_before_a_later_load() {
     std::println!("SB plain STR; LDR: {plain} of {ROUNDS} rounds read 0 twice");
     assert_eq!(both_zero(&[vec![STR_W2_X0, DMB_ISH, LDR_W3_X1]]), 0);
     assert_eq!(both_zero(&[vec![STR_W2_X0], vec![DMB_ISH, LDR_W3_X1]]), 0);
+}
+
+/// A store-release and a later load-acquire (RCsc) are ordered, in one
+/// block or across blocks, through LDAR or LDAXR. LDAPR (RCpc) after a
+/// store-release, which Arm leaves unordered, shows the plain path runs.
+#[test]
+fn a_store_release_comes_before_a_later_rcsc_load_acquire() {
+    let rcpc = both_zero(&[vec![STLR_W2_X0, LDAPR_W3_X1]]);
+    std::println!("SB STLR; LDAPR: {rcpc} of {ROUNDS} rounds read 0 twice");
+    assert_eq!(both_zero(&[vec![STLR_W2_X0, LDAR_W3_X1]]), 0);
+    assert_eq!(both_zero(&[vec![STLR_W2_X0], vec![LDAR_W3_X1]]), 0);
+    assert_eq!(both_zero(&[vec![STLR_W2_X0], vec![LDAXR_W3_X1]]), 0);
+    // Bytes take the same path.
+    assert_eq!(both_zero(&[vec![STLRB_W2_X0, LDARB_W3_X1]]), 0);
 }
