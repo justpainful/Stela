@@ -239,6 +239,15 @@ enum Path {
     Lookup(usize),
     /// One of this many targets in native runs of this many transfers.
     LookupRuns(usize, u64),
+    /// A predicted tail of a BR or BLR site whose prediction never holds,
+    /// over this many targets: its miss's call of the probe at this entry
+    /// of the dispatcher, as at a site of more targets than the two it
+    /// predicts (a vtable call, an `objc_msgSend` tail): the jump probe
+    /// ([`JUMP_PROBE_ENTRY`]), or the table probe, which every such miss
+    /// took before.
+    PredictedMiss(usize, usize),
+    /// [`Path::Lookup`] through a plain tail that calls the jump probe.
+    JumpProbe(usize),
 }
 
 /// Nanoseconds and TSC ticks of one transfer through `path`, less the
@@ -247,13 +256,17 @@ fn cost(path: Path) -> (f64, f64, f64) {
     const TRANSFERS: u64 = 1 << 22;
     let pc = target_pc(0);
     let (target, targets, run) = match path {
-        Path::Lookup(targets) => (Target::Sequence, targets, TRANSFERS),
+        Path::Lookup(targets) | Path::PredictedMiss(targets, _) | Path::JumpProbe(targets) => {
+            (Target::Sequence, targets, TRANSFERS)
+        }
         Path::LookupRuns(targets, run) => (Target::Sequence, targets, run),
         _ => (Target::Fixed(pc), 1, TRANSFERS),
     };
     let sequence = sequence(targets);
     let word = ExitWord::from(match path {
-        Path::Lookup(_) | Path::LookupRuns(..) => ExitKind::Indirect,
+        Path::Lookup(_) | Path::LookupRuns(..) | Path::PredictedMiss(..) | Path::JumpProbe(_) => {
+            ExitKind::Indirect
+        }
         _ => ExitKind::Direct,
     });
     // The region's address first: tails jump relative to it.
@@ -297,6 +310,20 @@ fn cost(path: Path) -> (f64, f64, f64) {
         Path::Lookup(_) | Path::LookupRuns(..) => {
             let probe = base + (PROBES + PROBE_ENTRY) as u64;
             lookup_tail(at, word, RAN, probe, 0).unwrap().to_vec()
+        }
+        Path::JumpProbe(_) => {
+            let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
+            let mut code = Code::new();
+            super::super::tail(&mut code, at, word, RAN, probe).unwrap();
+            code.into_bytes()
+        }
+        Path::PredictedMiss(_, entry) => {
+            // A prediction no target equals: its direct exit never runs.
+            let never = GuestAddress(target_pc(MOST_TARGETS));
+            let probe = base + (PROBES + entry) as u64;
+            predicted_tail(at, never, word, RAN, probe)
+                .unwrap()
+                .to_vec()
         }
     };
     fill(&measured, target, &tail, false);
@@ -349,6 +376,15 @@ fn transfer_path_costs() {
         Path::LookupRuns(1, 32),
         Path::LookupRuns(16, 32),
         Path::LookupRuns(64, 32),
+        Path::JumpProbe(1),
+        Path::JumpProbe(64),
+        Path::JumpProbe(1024),
+        Path::PredictedMiss(4, PROBE_ENTRY),
+        Path::PredictedMiss(4, JUMP_PROBE_ENTRY),
+        Path::PredictedMiss(64, PROBE_ENTRY),
+        Path::PredictedMiss(64, JUMP_PROBE_ENTRY),
+        Path::PredictedMiss(1024, PROBE_ENTRY),
+        Path::PredictedMiss(1024, JUMP_PROBE_ENTRY),
     ] {
         let (ns, ticks, table) = cost(path);
         std::println!(
@@ -375,6 +411,10 @@ enum Ring {
     /// An indirect exit to the target in RAX, one per site, through its
     /// lookup tail and this PE's jump cache, or the table probe.
     Lookup,
+    /// [`Ring::Lookup`] through a plain tail that calls the jump probe
+    /// ([`JUMP_PROBE_ENTRY`]): the jump cache checked in the shared probe
+    /// rather than in each site's tail.
+    JumpProbe,
     /// An indirect exit through a predicted tail of its one target, whose
     /// direct exit is linked through a stamped tail.
     Predicted,
@@ -504,6 +544,13 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                     _ => either_jump(at, pc, target_pc(next[to]), tail),
                 };
                 (jump, Some(code.to_vec()))
+            }
+            Ring::JumpProbe => {
+                let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
+                let mut code = Code::new();
+                let word = ExitWord::from(ExitKind::Indirect);
+                super::super::tail(&mut code, tail, word, RAN, probe).unwrap();
+                (indirect_jump(at, pc, tail), Some(code.into_bytes()))
             }
             Ring::Predicted | Ring::PolyPredicted => {
                 let code = predicted(&mut world, base, tail, held, site, None);
@@ -646,6 +693,7 @@ fn spread_transfer_costs() {
             Ring::Stamped,
             Ring::Cell,
             Ring::Lookup,
+            Ring::JumpProbe,
             Ring::Predicted,
             Ring::PolyLookup,
             Ring::PolyPredicted,

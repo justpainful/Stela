@@ -4663,7 +4663,8 @@ fn sctlr_fields_outside_translation_keep_every_translation() {
 /// A BR's predicted tail misses to the engine until it meets another
 /// target, which becomes the site's second: the miss's patch point then
 /// jumps to a predicted tail of that target, whose own miss calls the
-/// table probe, and further targets stay in native code.
+/// jump probe (the jump cache, then the table probe), and further targets
+/// stay in native code.
 #[test]
 fn indirect_branches_learn_a_second_target_at_their_first_miss() {
     const BR_X0: u32 = 0xd61f_0000;
@@ -4699,20 +4700,32 @@ fn indirect_branches_learn_a_second_target_at_their_first_miss() {
     }
     assert_eq!(machine.code.blocks.record(index).second(), None);
     assert_eq!(machine.statistics.predicted_tails, 2);
-    let tail = machine
+    let (tail, bytes) = machine
         .host
         .patches
         .iter()
         .rev()
         .find(|(_, bytes)| bytes.len() == chain::PREDICTED_TAIL_BYTES)
-        .expect("the second predicted tail")
-        .0 as u64;
+        .expect("the second predicted tail");
+    let tail = *tail as u64;
     assert!(
         machine
             .host
             .patches
             .contains(&(miss as usize, chain::jump(miss, tail).unwrap().to_vec()))
     );
+    // Its miss calls the jump probe of the probes of BTYPE 0b01.
+    let dispatcher = chain::lookup_dispatcher(0b01).unwrap();
+    let probes = machine
+        .host
+        .installed
+        .iter()
+        .position(|code| *code == dispatcher)
+        .expect("the probes of BTYPE 0b01");
+    let probe = ((probes + 1) * NATIVE_CODE_STRIDE + chain::JUMP_PROBE_ENTRY) as u64;
+    let expected =
+        chain::predicted_tail(tail, GuestAddress(second), ExitKind::Indirect, 1, probe).unwrap();
+    assert_eq!(bytes[..], expected[..]);
     let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
     let cell = machine
         .code
