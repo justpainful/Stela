@@ -136,6 +136,16 @@ pub(super) struct FakeHost {
     /// What the next native blocks return, in order: unit tests do not
     /// run native code.
     pub(super) exits: Vec<NativeExit>,
+    /// What native blocks return in turn once [`Self::exits`] runs out,
+    /// over and over, for the run loop's timings; and the turns so far.
+    pub(super) cycle: Vec<NativeExit>,
+    turn: usize,
+    /// Nonzero: each turn of [`Self::cycle`] leaves X0 and X2 holding the
+    /// turn's value of this many, as code between the exits would.
+    pub(super) spread: u64,
+    /// The counter reads the host's time stamp counter, as a real host's
+    /// does, for the run loop's timings.
+    pub(super) stamped: bool,
     /// A translation store, for the tests that give the host one.
     pub(super) store: Option<stored::tests::MemoryStore>,
     /// Pages whose fetch the host refuses, and its answers.
@@ -316,6 +326,16 @@ impl Host for FakeHost {
         Some(entry)
     }
     unsafe fn execute(&mut self, _: NativeCode, state: &mut GuestState) -> NativeExit {
+        if self.exits.is_empty() && !self.cycle.is_empty() {
+            let exit = self.cycle[self.turn % self.cycle.len()];
+            if self.spread != 0 {
+                let value = (self.turn as u64 / self.cycle.len() as u64) % self.spread;
+                state.x[0] = 0x1_0000_0000 | value << 12;
+                state.x[2] = 0x2_0000_0000 | value << 12;
+            }
+            self.turn = self.turn.wrapping_add(1);
+            return exit;
+        }
         assert!(!self.exits.is_empty(), "unit tests do not run native code");
         if let Some((control, chained, account)) = self.chained.take() {
             state.account = account.0;
@@ -340,13 +360,18 @@ impl Host for FakeHost {
         exit
     }
     fn set_regime(&mut self, regime: &Regime) {
-        self.regimes.push(*regime);
+        // Timings keep no records, which would grow at every run.
+        if !self.stamped {
+            self.regimes.push(*regime);
+        }
     }
     fn isolate_predictions(&mut self) {
         self.isolations += 1;
     }
     fn code_invalidated(&mut self, page: Option<u64>) {
-        self.code_invalidations.push(page);
+        if !self.stamped {
+            self.code_invalidations.push(page);
+        }
     }
     fn fetch_permitted(&mut self, virtual_address: u64) -> bool {
         self.fetch_checks += 1;
@@ -364,7 +389,9 @@ impl Host for FakeHost {
         self.invalidations += 1;
     }
     fn invalidate_reach(&mut self, reach: mmu::tlbi::Reach, everywhere: mmu::tlbi::Everywhere) {
-        self.reaches.push((reach, everywhere));
+        if !self.stamped {
+            self.reaches.push((reach, everywhere));
+        }
         if reach == mmu::tlbi::Reach::All {
             self.invalidations += 1;
         }
@@ -388,6 +415,11 @@ impl Host for FakeHost {
     }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
+        if self.stamped {
+            // SAFETY: RDTSC only reads the time stamp counter. Seven bits
+            // off bring a few-GHz count near the profile's 24 MHz.
+            return unsafe { core::arch::x86_64::_rdtsc() } >> 7;
+        }
         let now = self.now;
         self.now += self.counter_step;
         now
@@ -406,7 +438,9 @@ impl Host for FakeHost {
         }
     }
     fn arm_timer(&mut self, until: Option<u64>) {
-        self.timers.push(until);
+        if !self.stamped {
+            self.timers.push(until);
+        }
     }
     fn wait_for_interrupt(&mut self) {
         self.now += 1000;
@@ -422,7 +456,9 @@ impl Host for FakeHost {
         due
     }
     fn report(&mut self, event: &Event) {
-        self.events.push(*event);
+        if !self.stamped {
+            self.events.push(*event);
+        }
     }
     fn translations(&mut self) -> Option<&mut dyn Translations> {
         self.store
@@ -590,6 +626,10 @@ pub(super) fn board_on<D: Devices>(
         live_patch_start: 0,
         chained: None,
         exits: Vec::new(),
+        cycle: Vec::new(),
+        turn: 0,
+        spread: 0,
+        stamped: false,
         store: None,
         refused: Vec::new(),
         fetch_checks: 0,
@@ -10138,6 +10178,7 @@ mod process_switching;
 mod pstate_features;
 mod recovery;
 mod retire_cost;
+mod run_overhead;
 mod shared_code;
 mod sharing;
 mod stage2_syndrome;
