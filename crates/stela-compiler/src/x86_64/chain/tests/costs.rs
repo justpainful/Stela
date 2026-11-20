@@ -246,8 +246,6 @@ enum Path {
     /// ([`JUMP_PROBE_ENTRY`]), or the table probe, which every such miss
     /// took before.
     PredictedMiss(usize, usize),
-    /// [`Path::Lookup`] through a plain tail that calls the jump probe.
-    JumpProbe(usize),
 }
 
 /// Nanoseconds and TSC ticks of one transfer through `path`, less the
@@ -256,7 +254,7 @@ fn cost(path: Path) -> (f64, f64, f64) {
     const TRANSFERS: u64 = 1 << 22;
     let pc = target_pc(0);
     let (target, targets, run) = match path {
-        Path::Lookup(targets) | Path::PredictedMiss(targets, _) | Path::JumpProbe(targets) => {
+        Path::Lookup(targets) | Path::PredictedMiss(targets, _) => {
             (Target::Sequence, targets, TRANSFERS)
         }
         Path::LookupRuns(targets, run) => (Target::Sequence, targets, run),
@@ -264,9 +262,7 @@ fn cost(path: Path) -> (f64, f64, f64) {
     };
     let sequence = sequence(targets);
     let word = ExitWord::from(match path {
-        Path::Lookup(_) | Path::LookupRuns(..) | Path::PredictedMiss(..) | Path::JumpProbe(_) => {
-            ExitKind::Indirect
-        }
+        Path::Lookup(_) | Path::LookupRuns(..) | Path::PredictedMiss(..) => ExitKind::Indirect,
         _ => ExitKind::Direct,
     });
     // The region's address first: tails jump relative to it.
@@ -308,14 +304,8 @@ fn cost(path: Path) -> (f64, f64, f64) {
             cell_tail(at, cell, pc, word, RAN, probe).unwrap().to_vec()
         }
         Path::Lookup(_) | Path::LookupRuns(..) => {
-            let probe = base + (PROBES + PROBE_ENTRY) as u64;
-            lookup_tail(at, word, RAN, probe, 0).unwrap().to_vec()
-        }
-        Path::JumpProbe(_) => {
             let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
-            let mut code = Code::new();
-            super::super::tail(&mut code, at, word, RAN, probe).unwrap();
-            code.into_bytes()
+            lookup_tail(at, word, RAN, probe, 0).unwrap().to_vec()
         }
         Path::PredictedMiss(_, entry) => {
             // A prediction no target equals: its direct exit never runs.
@@ -376,9 +366,6 @@ fn transfer_path_costs() {
         Path::LookupRuns(1, 32),
         Path::LookupRuns(16, 32),
         Path::LookupRuns(64, 32),
-        Path::JumpProbe(1),
-        Path::JumpProbe(64),
-        Path::JumpProbe(1024),
         Path::PredictedMiss(4, PROBE_ENTRY),
         Path::PredictedMiss(4, JUMP_PROBE_ENTRY),
         Path::PredictedMiss(64, PROBE_ENTRY),
@@ -409,12 +396,9 @@ enum Ring {
     /// A cell tail, through the cell probe.
     Cell,
     /// An indirect exit to the target in RAX, one per site, through its
-    /// lookup tail and this PE's jump cache, or the table probe.
+    /// lookup tail and the jump probe: this PE's jump cache, or the table
+    /// probe.
     Lookup,
-    /// [`Ring::Lookup`] through a plain tail that calls the jump probe
-    /// ([`JUMP_PROBE_ENTRY`]): the jump cache checked in the shared probe
-    /// rather than in each site's tail.
-    JumpProbe,
     /// An indirect exit through a predicted tail of its one target, whose
     /// direct exit is linked through a stamped tail.
     Predicted,
@@ -537,20 +521,13 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                 (jump(at, tail).unwrap().to_vec(), Some(code.to_vec()))
             }
             Ring::Lookup | Ring::PolyLookup => {
-                let probe = base + (PROBES + PROBE_ENTRY) as u64;
+                let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
                 let code = lookup_tail(tail, ExitKind::Indirect, RAN, probe, 0).unwrap();
                 let jump = match ring {
                     Ring::Lookup => indirect_jump(at, pc, tail),
                     _ => either_jump(at, pc, target_pc(next[to]), tail),
                 };
                 (jump, Some(code.to_vec()))
-            }
-            Ring::JumpProbe => {
-                let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
-                let mut code = Code::new();
-                let word = ExitWord::from(ExitKind::Indirect);
-                super::super::tail(&mut code, tail, word, RAN, probe).unwrap();
-                (indirect_jump(at, pc, tail), Some(code.into_bytes()))
             }
             Ring::Predicted | Ring::PolyPredicted => {
                 let code = predicted(&mut world, base, tail, held, site, None);
@@ -624,7 +601,8 @@ fn predicted(
     miss: Option<u64>,
 ) -> Vec<u8> {
     let (pc, word) = (held.pc, ExitKind::Indirect);
-    let probe = base + (PROBES + PROBE_ENTRY) as u64;
+    // Its miss calls the jump probe, as the engine links it.
+    let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
     let mut code = match miss {
         None => predicted_tail(tail, GuestAddress(pc), word, RAN, probe).unwrap(),
         Some(_) => open_predicted_tail(tail, GuestAddress(pc), word).unwrap(),
@@ -693,7 +671,6 @@ fn spread_transfer_costs() {
             Ring::Stamped,
             Ring::Cell,
             Ring::Lookup,
-            Ring::JumpProbe,
             Ring::Predicted,
             Ring::PolyLookup,
             Ring::PolyPredicted,

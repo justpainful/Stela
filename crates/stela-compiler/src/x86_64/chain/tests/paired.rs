@@ -617,7 +617,7 @@ fn call_loop(paired: bool, sites: usize, base: u64) -> Vec<u8> {
         asm.int3();
     }
     let at = base + TAIL_AT as u64;
-    let probe = base + (PROBES + PROBE_ENTRY) as u64;
+    let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
     let word = ExitWord::from(ExitKind::Return);
     match paired {
         true => asm.fixed(&paired_tail(at, word, RAN, probe).unwrap()),
@@ -896,7 +896,7 @@ fn chain_loop(depth: usize, sites: usize, calls: Calls, base: u64) -> (Vec<u8>, 
     let probes = tails + depth * PAIRED_TAIL_BYTES;
     for level in 0..depth {
         let at = tails + level * PAIRED_TAIL_BYTES;
-        let probe = base + (probes + PROBE_ENTRY) as u64;
+        let probe = base + (probes + JUMP_PROBE_ENTRY) as u64;
         let tail = match calls {
             Calls::Stacked => {
                 // The top's entry, when it holds the target: taken, and

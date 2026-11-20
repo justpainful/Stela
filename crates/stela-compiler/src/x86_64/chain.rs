@@ -1157,8 +1157,9 @@ pub const STAMP_TABLE_BYTES: usize = STAMPED_CELLS * STAMP_BYTES;
 pub const STAMP_COUNTS_BYTES: usize = 64;
 
 /// Entries of a PE's jump cache, in front of its stamp counts: targets its
-/// table probe entered, by guest PC, which a [`lookup_tail`] takes without
-/// a probe. Bits 2-9 of the PC pick the entry.
+/// table probe entered, by guest PC, which the jump probe a
+/// [`lookup_tail`] calls ([`JUMP_PROBE_ENTRY`]) takes without the ITLB or
+/// the table. Bits 2-9 of the PC pick the entry.
 ///
 /// An entry holds across native runs, while the target's half has the
 /// context and ITLB drop epoch the entry names, as a stamp holds
@@ -3381,9 +3382,9 @@ pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 /// table probe: a [`stamped_tail`]'s miss takes it.
 pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 640;
 /// Where a [`lookup_dispatcher`]'s jump probe begins, after the stamping
-/// cell probe: this PE's jump cache, then the table probe, as a
-/// [`lookup_tail`] takes them, for the tails that call a probe without a
-/// cache check of their own ([`predicted_tail`]'s miss).
+/// cell probe: this PE's jump cache, then the table probe, which every
+/// [`lookup_tail`] and [`paired_tail`] calls, and a [`predicted_tail`]'s
+/// miss.
 pub const JUMP_PROBE_ENTRY: usize = STAMPING_PROBE_ENTRY + 512;
 /// Bytes in a tail's call of a probe: `mov edx, word`, `call probe` and
 /// `jmp r9` into the block the probe found.
@@ -3514,10 +3515,11 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
 /// The jump probe at the end of `code` ([`JUMP_PROBE_ENTRY`]), which a
 /// tail calls with the target in RAX and its word in EDX: a target this
 /// PE's jump cache holds, and that accepts `btype`, returns to the tail
-/// with its block's code in R9, counted and named as a [`lookup_tail`]'s
-/// hit counts and names it, under that tail's rules; any other, or a run
-/// that must stop, takes the jump returned to the table probe, its return
-/// address and EDX kept, whose own checks stop the run.
+/// with its block's code in R9, the transfer counted in the account and
+/// `hits` and the block named with `btype`, as the table probe counts and
+/// names its own ([`lookup_tail`]); any other, or a run that must stop,
+/// takes the jump returned to the table probe, its return address and EDX
+/// kept, whose own checks stop the run.
 fn jump_probe(code: &mut Code, policy: Interruption, btype: u8) -> crate::x86_64::asm::Patch {
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
@@ -3983,22 +3985,27 @@ fn missed(asm: &mut crate::x86_64::asm::Asm) {
     exit_return(asm);
 }
 
-/// Bytes in a [`lookup_tail`]: the jump cache's hit and the plain tail
-/// ([`TAIL_BYTES`]) of a miss.
-pub const LOOKUP_TAIL_BYTES: usize = 224;
+/// Bytes in a [`lookup_tail`]: its call of the jump probe ([`TAIL_BYTES`]),
+/// padded.
+pub const LOOKUP_TAIL_BYTES: usize = 16;
 
 /// The tail at host address `at` that an exit's patch point jumps to once
 /// the exit is redirected through a lookup, for a branch that sets
-/// `btype`: a target this PE's jump cache holds (and that accepts `btype`)
-/// is entered from here, counted as a probe
-/// counts its transfers, by a jump of the site's own; any other takes EDX
-/// the exit's `word` with the `ran` instructions of the block it leaves,
-/// which only a probe reads, then a jump to the table probe at `probe`,
-/// which enters the block it finds, filling the cache, or returns to the
-/// engine. An interruption or no transfer left takes the plain tail too,
-/// whose probe stops the run.
-/// `None` when `ran` exceeds its field, `btype` is no BTYPE or `probe` is
-/// out of a 32-bit jump's reach.
+/// `btype`: EDX the exit's `word` with the `ran` instructions of the block
+/// it leaves, a call of the jump probe at `probe`, that of the dispatcher
+/// of `btype` ([`JUMP_PROBE_ENTRY`]), and the site's own jump into the
+/// block it returns. The probe enters a target this PE's jump cache holds
+/// (and that accepts `btype`), and any other through the table probe,
+/// which fills the cache or returns to the engine; an interruption or no
+/// transfer left takes the table probe too, which stops the run. `None`
+/// when `ran` exceeds its field, `btype` is no BTYPE or `probe` is out of
+/// a 32-bit call's reach.
+///
+/// The jump cache's check lies in the probe, shared, and not in each
+/// site's tail, which took 224 bytes to these 16 (`spread_transfer_costs`:
+/// lookup sites over 4096 blocks 138.6 TSC ticks a transfer with the check
+/// in the tail, 42.5 in the probe, as the tails' code no longer fits the
+/// host's caches; 4.4 and 7.7 over 64).
 ///
 /// An entry holds while the target's half has the context and this PE's
 /// ITLB the drop epoch of that half that it names, as a stamp holds
@@ -4017,19 +4024,8 @@ pub fn lookup_tail(
     probe: u64,
     btype: u8,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
-    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Quiet)
-}
-
-fn lookup_tail_with_policy(
-    at: u64,
-    word: ExitWord,
-    ran: u32,
-    probe: u64,
-    btype: u8,
-    policy: Interruption,
-) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
     let mut code = Code::new();
-    lookup_tail_code(&mut code, at, word, ran, probe, btype, policy)?;
+    lookup_tail_code(&mut code, at, word.into(), ran, probe, btype)?;
     let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
         code.asm().int3();
@@ -4038,7 +4034,7 @@ fn lookup_tail_with_policy(
 }
 
 /// Bytes in a [`paired_tail`], padded.
-pub const PAIRED_TAIL_BYTES: usize = 320;
+pub const PAIRED_TAIL_BYTES: usize = 128;
 /// Bytes of the largest tail the engine installs: a lookup, stamped or
 /// paired one.
 pub const TAIL_ROOM: usize = {
@@ -4070,15 +4066,7 @@ pub fn paired_tail(
 ) -> Option<[u8; PAIRED_TAIL_BYTES]> {
     let mut code = Code::new();
     paired_return(&mut code.asm(), ran)?;
-    lookup_tail_code(
-        &mut code,
-        at,
-        word.into(),
-        ran,
-        probe,
-        0,
-        Interruption::Quiet,
-    )?;
+    lookup_tail_code(&mut code, at, word.into(), ran, probe, 0)?;
     let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
         code.asm().int3();
@@ -4086,7 +4074,8 @@ pub fn paired_tail(
     code.try_into().ok()
 }
 
-/// [`lookup_tail`]'s code, appended to `code`, which runs from `at`.
+/// [`lookup_tail`]'s code, appended to `code`, which runs from `at`: the
+/// plain tail, whose call is relative to its own end in `code`.
 fn lookup_tail_code(
     code: &mut Code,
     at: u64,
@@ -4094,27 +4083,10 @@ fn lookup_tail_code(
     ran: u32,
     probe: u64,
     btype: u8,
-    policy: Interruption,
 ) -> Option<()> {
-    if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
+    if btype > 3 {
         return None;
     }
-    let mut asm = code.asm();
-    asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    let entry = jump_cache_check(&mut asm, btype, &mut misses);
-    // A run that must stop takes the plain tail, whose probe stops it.
-    misses.push(stop_check(&mut asm, policy, true));
-    count(&mut asm, transfer_change(ran)?);
-    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
-    asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
-    entered_btype(&mut asm, R8, btype);
-    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
-    asm.jmp_rm(entry(JUMP_CODE));
-    for miss in misses {
-        asm.bind(miss);
-    }
-    // The plain tail's jump is relative to its own end in `code`.
     tail(code, at, word, ran, probe)
 }
 
@@ -4238,13 +4210,13 @@ const _: () = assert!(TAIL_BYTES <= DYNAMIC_EXIT_BYTES);
 /// ([`PREDICTED_EXIT`]), which returns RAX and EDX exactly as the
 /// redirected exit does and which the engine links like a block's direct
 /// exit, through a cell ([`cell_tail`], [`stamped_branch_tail`]); any other
-/// target calls `probe` after it, the engine's the jump probe
-/// ([`JUMP_PROBE_ENTRY`]): the jump cache, then the table probe, as a
-/// [`lookup_tail`] takes them, where a site of more targets than it
-/// predicts (a vtable call, an `objc_msgSend` tail) took the table probe
-/// at every transfer. Both leave EDX as the redirected exit or its lookup
-/// tail would, so whichever runs, the transfer or exit is the one the
-/// lookup tail makes. `None` as for a [`lookup_tail`].
+/// target calls `probe` after it, the jump probe ([`JUMP_PROBE_ENTRY`]):
+/// the jump cache, then the table probe, as a [`lookup_tail`] does, where
+/// a site of more targets than it predicts (a vtable call, an
+/// `objc_msgSend` tail) took the table probe at every transfer. Both leave
+/// EDX as the redirected exit or its lookup tail would, so whichever runs,
+/// the transfer or exit is the one the lookup tail makes. `None` as for a
+/// [`lookup_tail`].
 pub fn predicted_tail(
     at: u64,
     target: GuestAddress,
@@ -5807,12 +5779,11 @@ mod tests {
         expected.extend((0x2000i32 - 0x100a).to_le_bytes());
         expected.extend([0x41, 0xff, 0xe1]);
         assert_eq!(plain.to_vec(), expected);
-        // The cached tail ends its misses in the same word and jump.
+        // A lookup tail is the plain tail, its probe the jump probe.
         let cached = lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, 0).unwrap();
-        let word = &expected[..5];
-        assert!(cached.windows(5).any(|bytes| bytes == word));
-        assert_eq!(cached.last(), Some(&0xcc));
-        // Every BTYPE's tail fits, the longest's both BTS included.
+        assert_eq!(cached[..expected.len()], expected[..]);
+        assert!(cached[expected.len()..].iter().all(|&byte| byte == 0xcc));
+        // Every BTYPE has a tail, which its dispatcher's probes check.
         for btype in 0..4 {
             assert!(lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, btype).is_some());
         }
@@ -5839,7 +5810,7 @@ mod tests {
         for btype in 0..4 {
             let probes = lookup_dispatcher(btype).unwrap();
             // Each probe starts with the control's address.
-            for at in [CELL_PROBE_ENTRY, PROBE_ENTRY] {
+            for at in [CELL_PROBE_ENTRY, PROBE_ENTRY, JUMP_PROBE_ENTRY] {
                 assert_eq!(&probes[at..at + 3], &[0x48, 0x8b, 0x8f]);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

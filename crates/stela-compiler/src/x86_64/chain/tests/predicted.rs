@@ -227,7 +227,8 @@ impl Run {
         put(&region, THUNK, &thunk.code);
         put(&region, PROBES, &lookup_dispatcher(btype).unwrap());
         let point = dynamic_patch(region.at(THUNK + thunk.dynamic.unwrap()));
-        let probe = region.at(PROBES + PROBE_ENTRY);
+        // Both tails call the jump probe, as the engine links them.
+        let probe = region.at(PROBES + JUMP_PROBE_ENTRY);
         let tail = region.at(TAIL);
         match way {
             Way::Bare => {}
@@ -236,18 +237,10 @@ impl Run {
                 TAIL,
                 &lookup_tail(tail, word, RAN, probe, 0).unwrap(),
             ),
-            // A miss calls the jump probe, as the engine links it.
             Way::Unlinked | Way::Linked => put(
                 &region,
                 TAIL,
-                &predicted_tail(
-                    tail,
-                    GuestAddress(predicted),
-                    word,
-                    RAN,
-                    region.at(PROBES + JUMP_PROBE_ENTRY),
-                )
-                .unwrap(),
+                &predicted_tail(tail, GuestAddress(predicted), word, RAN, probe).unwrap(),
             ),
         }
         if way != Way::Bare {

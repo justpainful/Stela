@@ -1159,14 +1159,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Send the exit of `word` whose patch point is at host address `site`
     /// ([`chain::dynamic_patch`]), from a block that ran `retired`
     /// instructions by a branch that sets `btype`, to a tail of its own that
-    /// calls the table probe of `btype` ([`chain::lookup_tail`]), written
-    /// before the point's jump to it: the jump into each found block is the
-    /// site's, so the host predicts a site's targets apart from every other
-    /// site's. The probe validates every transfer against the ITLB, whose
-    /// entries a TLBI or a context change forgets, and the block table,
-    /// whose entries a release of the block forgets, so a return that
-    /// unwinds past its caller (longjmp, an exception) or returns to a
-    /// poisoned PAC address misses and exits.
+    /// calls the jump probe of `btype` ([`chain::lookup_tail`]: the jump
+    /// cache, then the table probe), written before the point's jump to it:
+    /// the jump into each found block is the site's, so the host predicts a
+    /// site's targets apart from every other site's. The probes validate
+    /// every transfer against the ITLB, whose entries a TLBI or a context
+    /// change forgets, and the block table, whose entries a release of the
+    /// block forgets, so a return that unwinds past its caller (longjmp, an
+    /// exception) or returns to a poisoned PAC address misses and exits.
     pub(super) fn redirect_through_lookup(
         &mut self,
         cache: &mut board::Cache,
@@ -1188,7 +1188,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         };
         let at = tail.0 as u64;
-        let probe = probe + chain::PROBE_ENTRY as u64;
+        let probe = probe + chain::JUMP_PROBE_ENTRY as u64;
         let code = match returning {
             true => chain::paired_tail(at, word, retired, probe).map(|code| code.to_vec()),
             false => chain::lookup_tail(at, word, retired, probe, btype).map(|code| code.to_vec()),

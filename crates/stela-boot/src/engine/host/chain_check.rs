@@ -9,8 +9,8 @@
 //!   direct exits in their page take;
 //! - `cell`: cell tails ([`chain::cell_tail`]) through the cell probe, as
 //!   direct exits out of their page take;
-//! - `table`: lookup tails ([`chain::lookup_tail`]) through the table probe,
-//!   as RET, BR and BLR take;
+//! - `table`: lookup tails ([`chain::lookup_tail`]) through the jump probe
+//!   (the jump cache, then the table probe), as RET, BR and BLR take;
 //! - `stamped`: stamped tails ([`chain::stamped_tail`]), as hot direct exits
 //!   out of their page take: a direct jump while this PE's stamp holds, after
 //!   the first transfer's stamping cell probe.
@@ -205,7 +205,7 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
                 chain::cell_tail(tail, cell, pc(next), word, 1, probe)?.to_vec()
             }
             Ring::Table => {
-                let probe = base + (DISPATCHER + chain::PROBE_ENTRY) as u64;
+                let probe = base + (DISPATCHER + chain::JUMP_PROBE_ENTRY) as u64;
                 chain::lookup_tail(tail, word, 1, probe, 0)?.to_vec()
             }
             Ring::Stamped => {

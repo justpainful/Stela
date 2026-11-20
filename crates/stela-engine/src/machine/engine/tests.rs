@@ -3674,7 +3674,7 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
                 .to_vec()
         } else {
             // A return's tail first takes its call's paired frame.
-            chain::paired_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64)
+            chain::paired_tail(at, kind, ran, probes + chain::JUMP_PROBE_ENTRY as u64)
                 .unwrap()
                 .to_vec()
         };
@@ -7461,13 +7461,13 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     let site = machine.code.blocks[0].dynamic_site.expect("a dynamic site");
     let site = chain::dynamic_patch(site.get());
     // The probes, then the RET's own tail, which takes its call's paired
-    // frame with the authenticated target or calls the table probe.
+    // frame with the authenticated target or calls the jump probe.
     let installed = machine.host.installed.len();
     let dispatcher = chain::lookup_dispatcher(0).unwrap();
     assert_eq!(machine.host.installed[installed - 2], dispatcher);
     let probes = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let tail = (installed * NATIVE_CODE_STRIDE) as u64;
-    let probe = probes + chain::PROBE_ENTRY as u64;
+    let probe = probes + chain::JUMP_PROBE_ENTRY as u64;
     let code = chain::paired_tail(tail, ExitKind::Return, 1, probe).unwrap();
     let exit = chain::jump(site, tail).unwrap();
     let patches = machine.host.patches.len();

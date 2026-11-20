@@ -101,8 +101,14 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
     put(0, &[0x48, 0x89, 0xf0]); // mov rax,rsi
     put(3, &cell_tail);
     put(64, &[0x48, 0x89, 0xf0]);
-    let table_tail =
-        lookup_tail(at(67), ExitKind::Return, 3, probes + PROBE_ENTRY as u64, 0).unwrap();
+    let table_tail = lookup_tail(
+        at(67),
+        ExitKind::Return,
+        3,
+        probes + JUMP_PROBE_ENTRY as u64,
+        0,
+    )
+    .unwrap();
     put(67, &table_tail);
     put(256, &lookup_dispatcher(0).unwrap());
     for &(offset, block) in &BLOCKS {

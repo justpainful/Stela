@@ -1,10 +1,10 @@
-//! The jump cache of [`lookup_tail`]s and of the jump probe a predicted
-//! tail's miss calls ([`JUMP_PROBE_ENTRY`]): a target the table probe
-//! entered is entered from the tail or that probe across native runs, and
+//! The jump cache, which the jump probe ([`JUMP_PROBE_ENTRY`]) that every
+//! [`lookup_tail`] and a [`predicted_tail`]'s miss call takes: a target the
+//! table probe entered is entered from that probe across native runs, and
 //! every change the probe would see (a TLBI of the page, a rekeyed page, a
 //! block's release or replacement, a context switch, a native transition's
 //! new contexts) takes the entry with it. Random runs against the plain
-//! tail.
+//! tail, which calls the table probe.
 use super::super::*;
 use super::Controlled;
 use alloc::{boxed::Box, vec::Vec};
@@ -22,14 +22,16 @@ unsafe extern "C" {
 }
 
 const PAGE: usize = 4096;
-/// The cached tail's site, the plain tail's, the branch's cached tail's,
-/// the plain tails of BTYPE 0 and 2 that call the jump probe, the probes
-/// of BTYPE 0 and 2.
+/// The cached (lookup) tail's site, the plain tail's, the branch's cached
+/// tail's, the predicted tails of BTYPE 0 and 2 that miss, the probes of
+/// BTYPE 0 and 2.
 const CACHED: usize = 128;
 const PLAIN: usize = 384;
 const BRANCH_CACHED: usize = 448;
 const JUMPED: usize = 704;
-const BRANCH_JUMPED: usize = 768;
+const BRANCH_JUMPED: usize = 832;
+/// The predicted tails' prediction, which no run's target is.
+const NEVER: GuestAddress = GuestAddress(0x7e00_0000_0000);
 const PROBES: usize = 2048;
 const BRANCH_PROBES: usize = 4096;
 const REGION: usize = 6 * PAGE;
@@ -69,9 +71,10 @@ fn blocks() -> Pages {
 }
 
 /// `mov rax, rsi` and a jump to each tail, 16 bytes apart from the
-/// region's start: the cached tail, the plain tail, the branch's cached
-/// tail, then the plain tails of BTYPE 0 and 2 that call the jump probe
-/// ([`JUMP_PROBE_ENTRY`]), as a predicted tail's miss does; the probes.
+/// region's start: the cached (lookup) tail, the plain tail, the branch's
+/// cached tail, then predicted tails of BTYPE 0 and 2 whose prediction
+/// never holds, their misses the jump probe's, as a site of more targets
+/// than it predicts takes; the probes.
 fn region() -> Pages {
     let region = pages(REGION);
     let base = region.0 as u64;
@@ -86,17 +89,18 @@ fn region() -> Pages {
         put(&region, stub, &code);
     }
     let word = ExitWord::from(ExitKind::Return);
-    let probe = base + (PROBES + PROBE_ENTRY) as u64;
+    let jump_probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
     put(
         &region,
         CACHED,
-        &lookup_tail(base + CACHED as u64, word, RAN, probe, 0).unwrap(),
+        &lookup_tail(base + CACHED as u64, word, RAN, jump_probe, 0).unwrap(),
     );
     let mut plain = Code::new();
+    let probe = base + (PROBES + PROBE_ENTRY) as u64;
     tail(&mut plain, base + PLAIN as u64, word, RAN, probe).unwrap();
     put(&region, PLAIN, &plain);
     let branch = ExitWord::from(ExitKind::Indirect);
-    let branch_probe = base + (BRANCH_PROBES + PROBE_ENTRY) as u64;
+    let branch_probe = base + (BRANCH_PROBES + JUMP_PROBE_ENTRY) as u64;
     put(
         &region,
         BRANCH_CACHED,
@@ -106,10 +110,13 @@ fn region() -> Pages {
         (JUMPED, word, PROBES),
         (BRANCH_JUMPED, branch, BRANCH_PROBES),
     ] {
-        let mut jumped = Code::new();
         let probe = base + (probes + JUMP_PROBE_ENTRY) as u64;
-        tail(&mut jumped, base + site as u64, word, RAN, probe).unwrap();
-        put(&region, site, &jumped);
+        let at = base + site as u64;
+        put(
+            &region,
+            site,
+            &predicted_tail(at, NEVER, word, RAN, probe).unwrap(),
+        );
     }
     put(&region, PROBES, &lookup_dispatcher(0).unwrap());
     put(&region, BRANCH_PROBES, &lookup_dispatcher(2).unwrap());

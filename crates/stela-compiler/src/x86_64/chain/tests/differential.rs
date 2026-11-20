@@ -545,7 +545,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                 tail(&mut code, at, kind, RAN, dispatcher + PROBE_ENTRY as u64).unwrap();
                 code.into_bytes()
             }
-            Path::Lookup => lookup_tail(at, kind, RAN, dispatcher + PROBE_ENTRY as u64, btype)
+            Path::Lookup => lookup_tail(at, kind, RAN, dispatcher + JUMP_PROBE_ENTRY as u64, btype)
                 .unwrap()
                 .to_vec(),
             Path::Cell => {
@@ -778,7 +778,7 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
         region.0 as u64 + 3,
         ExitWord::from(ExitKind::Direct),
         1,
-        region.0 as u64 + (PROBES + PROBE_ENTRY) as u64,
+        region.0 as u64 + (PROBES + JUMP_PROBE_ENTRY) as u64,
         0,
     )
     .unwrap();
