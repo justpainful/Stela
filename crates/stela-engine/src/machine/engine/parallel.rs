@@ -291,16 +291,18 @@ impl GlobalSpan {
 }
 
 /// Whether the range a merge of the spans `held` and `new` makes takes in,
-/// besides the 16 KiB granules (the largest) they touch, an address of
-/// `globals`, the lower-half span a PE may hold global translations of
-/// ([`GlobalSpan`]): the granules between two spans of one ASID, which
-/// neither TLBI reaches, are all the merged range adds, and at a global
-/// page's address it removes that page's entry in every address space (Arm
-/// `TLBIMatch`: an entry with nG 0 matches any ASID). The shared cache's
-/// pages lie between a process's own (its image and stacks below, its heaps
-/// above), so such a merge drops each PE's whole shared region.
+/// besides the 4 KiB pages they touch, an address of `globals`, the
+/// lower-half span a PE may hold global translations of ([`GlobalSpan`]):
+/// the pages between two spans of one ASID, which neither TLBI reaches, are
+/// all the merged range adds, and at a global page's address it removes
+/// that page's entry in every address space (Arm `TLBIMatch`: an entry with
+/// nG 0 matches any ASID). The gap is measured in the smallest granule, as
+/// a 4 KiB leaf between two TLBIs in one 16 KiB granule is reached by
+/// neither. The shared cache's pages lie between a process's own (its image
+/// and stacks below, its heaps above), so such a merge drops each PE's
+/// whole shared region.
 fn bridges(globals: Option<(u64, u64)>, held: (u64, u64), new: (u64, u64)) -> bool {
-    const GRANULE: u64 = 0x4000;
+    const GRANULE: u64 = 0x1000;
     let Some((first, last)) = globals else {
         return false;
     };

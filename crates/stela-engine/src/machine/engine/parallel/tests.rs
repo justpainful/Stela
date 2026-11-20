@@ -1022,6 +1022,21 @@ fn a_mailbox_merges_no_scope_across_the_pes_global_pages() {
     assert_eq!((mail.maintenance.len(), mail.merged), (1, 3));
 }
 
+/// A global 4 KiB leaf between two TLBIs in one 16 KiB granule is reached
+/// by neither, so a merge of the two bridges it; pages that touch, or a
+/// global span outside the gap, bridge nothing.
+#[test]
+fn a_merge_bridges_a_global_page_between_two_in_one_granule() {
+    let page = |va: u64| (va, va + 0xfff);
+    let (global, far) = (Some(page(0x2000)), Some(page(0x8000)));
+    assert!(super::bridges(global, page(0x1000), page(0x3000)));
+    assert!(super::bridges(global, page(0x3000), page(0x1000)));
+    assert!(!super::bridges(global, page(0x1000), page(0x2000)));
+    assert!(!super::bridges(global, page(0x3000), page(0x4000)));
+    assert!(!super::bridges(far, page(0x1000), page(0x3000)));
+    assert!(!super::bridges(None, page(0x1000), page(0x3000)));
+}
+
 /// Another PE's TLBI by VA or range reaches this PE through its mail and
 /// drops the ITLB entries it covers alone: a global page's for any ASID,
 /// a page of an ASID for that ASID or every ASID. A page remapped behind
