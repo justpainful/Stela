@@ -147,21 +147,6 @@ pub fn unmap(frames: &dyn Frames, root: u64, first: u64, last: u64, mut removed:
     clear(frames, root, layout::top_level(), first, last, &mut removed);
 }
 
-/// [`unmap`] the part of `first..=last` that the root entry `entry` maps,
-/// which holds the range, whether or not the entry is in a root.
-pub fn unmap_under(frames: &dyn Frames, entry: u64, first: u64, last: u64) {
-    if entry & PRESENT != 0 && entry & HUGE == 0 {
-        clear(
-            frames,
-            entry & ADDRESS,
-            layout::top_level() - 1,
-            first,
-            last,
-            &mut |_| {},
-        );
-    }
-}
-
 /// Report each table page under the root entry `entry`, every level down
 /// to the page tables, deepest first. Leaves and large pages hold no table.
 pub fn tables_under(frames: &dyn Frames, entry: u64, table: &mut impl FnMut(u64)) {

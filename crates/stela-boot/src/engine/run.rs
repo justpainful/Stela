@@ -2159,6 +2159,8 @@ impl Heartbeat {
                 String::from("PES TRANSITIONS genter/engine/gexit/engine/svc/engine/eret/engine");
             // All PEs: why SVC, ERET, GENTER and GEXIT took the engine path.
             let mut transition_misses = [0u64; 36];
+            // All PEs: why TTBR0 changes took the engine path.
+            let mut switch_misses = [0u64; stela_engine::machine::SWITCH_MISS_REASONS];
             // All PEs: why runs ended at fallthrough, direct, indirect, call
             // and return exits.
             let mut branch_misses = [0u64; 40];
@@ -2387,6 +2389,12 @@ impl Heartbeat {
                         .iter()
                         .zip(before.transition_misses.as_flattened()),
                 ) {
+                    *total += now.saturating_sub(*before);
+                }
+                for (total, (now, before)) in switch_misses
+                    .iter_mut()
+                    .zip(now.switch_misses.iter().zip(&before.switch_misses))
+                {
                     *total += now.saturating_sub(*before);
                 }
                 {
@@ -2704,6 +2712,10 @@ impl Heartbeat {
             });
             output::arguments(format_args!(
                 "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other/monitor svc={svc} eret={eret} genter={genter} gexit={gexit}\n"
+            ));
+            let [closed, never, forgotten, context, set, class, other] = switch_misses;
+            output::arguments(format_args!(
+                "PES SWITCH MISSES closed/never/forgotten/context/set/class/other ttbr0={closed}/{never}/{forgotten}/{context}/{set}/{class}/{other}\n"
             ));
             let [fallthrough, direct, indirect, call, ret] = [0, 1, 2, 3, 4].map(|kind| {
                 branch_misses[kind * 8..kind * 8 + 8]

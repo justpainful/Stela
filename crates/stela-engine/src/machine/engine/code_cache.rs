@@ -113,9 +113,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         while report.blocks < STALE_CHECKS {
             checks.clear();
             {
-                let cache = self.code.cache_at(board::LockSite::Report);
+                let pages = self.code.every_page(board::LockSite::Report);
                 let step = STALE_STEP.min(STALE_CHECKS - report.blocks);
-                for (cursor, index) in cache.index.sweep(last.or(self.stale_cursor)).take(step) {
+                for (cursor, index) in pages.sweep(last.or(self.stale_cursor), step) {
                     let block = &self.code.blocks[index];
                     checks.push((
                         cursor,
@@ -182,6 +182,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// An architectural cache epoch must never wrap back to an old permission.
     pub(super) fn advance_translation_generation(&mut self) {
+        self.mirrors.table_switch.forget();
+        self.refresh_translations();
+    }
+
+    /// [`Self::advance_translation_generation`] keeping the native TTBR0
+    /// switch entries (`x86_64::table_switch`), for a TLBI that leaves
+    /// every lookup context and a permissions change. An entry names
+    /// nothing a translation holds: its lower context is the one of its
+    /// TTBR0 under the controls its upper context was made with (the two
+    /// halves' contexts are keyed by the same controls but TTBR0, and a
+    /// context's number is never given again), which the thunk checks, and
+    /// its host set, whose generation and class (the rights and the lower
+    /// half's TCR fields) the thunk checks too. What lookup contexts go
+    /// forgets them ([`Self::forget_contexts`]).
+    pub(super) fn refresh_translations(&mut self) {
         self.mirrors.close_code_page();
         self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
@@ -192,7 +207,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// What TTBR0 or its ASID selects may have changed.
-    fn advance_table_generation(&mut self) {
+    pub(super) fn advance_table_generation(&mut self) {
         self.mirrors.close_code_page();
         self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
@@ -227,6 +242,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// one process leaves of the others', which their ITLB entries stay good
     /// for.
     pub(super) fn forget_asid(&mut self, halves: core::ops::RangeInclusive<usize>, asid: u16) {
+        self.mirrors.table_switch.forget();
         for half in halves {
             self.statistics.lookup_forgets[0] += 1;
             self.spaces[half].retain(|space| !same_asid(space, asid));
@@ -240,6 +256,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// for the context the PE translates in): the contexts of other
     /// regimes go, which it may have reached, and `regime`'s stay.
     fn forget_other_regimes(&mut self, regime: mmu::Regime) {
+        self.mirrors.table_switch.forget();
         let mut forgot = false;
         for half in 0..2 {
             if self.spaces[half].len() == 0 {
@@ -267,6 +284,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// [`Self::forget_spaces`] for a caller that advances the generation.
     fn forget_contexts(&mut self, halves: core::ops::RangeInclusive<usize>, cause: usize) {
+        // Native switches name contexts by number.
+        self.mirrors.table_switch.forget();
         let upper_stays = !halves.contains(&1);
         for half in halves {
             self.refill_after(half);
@@ -371,7 +390,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     fn forget_fetches(&mut self, reach: mmu::tlbi::Reach) {
         let (first, last) = match reach {
             mmu::tlbi::Reach::Nothing => return,
-            mmu::tlbi::Reach::All => return self.advance_translation_generation(),
+            mmu::tlbi::Reach::All => return self.refresh_translations(),
             mmu::tlbi::Reach::Containing(address) => (address, address),
             mmu::tlbi::Reach::Overlapping { first, last } => (first, last),
         };
@@ -380,7 +399,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             };
             if (last - first) / FETCH_PAGE >= FETCH_CACHE as u64 {
-                return self.advance_translation_generation();
+                return self.refresh_translations();
             }
             for page in (first..=last).step_by(FETCH_PAGE as usize) {
                 let slot = (page / FETCH_PAGE) as usize % FETCH_CACHE;
@@ -476,6 +495,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// again.
     pub(super) fn controls_changed(&mut self) {
         self.derived_changed();
+        self.mirrors.table_switch.forget();
         self.permissions_changed();
     }
 
@@ -494,7 +514,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// data and at thread switches, thousands of times a second.
     pub(super) fn permissions_changed(&mut self) {
         self.mirrors.close(SPRR_PERM_MIRROR);
-        self.advance_translation_generation();
+        self.refresh_translations();
         self.statistics.translation_changes += 1;
         self.sync_host_regime(step_timing::SyncSource::Translation);
     }
@@ -534,7 +554,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             | mmu::tlbi::Everywhere::AsidAddresses(addresses, _) => {
                 // Canonical memory's kept TLBs refresh on the generation.
                 if self.canonical_memory_serves() {
-                    self.advance_translation_generation();
+                    self.refresh_translations();
                 } else {
                     self.forget_fetches(reach);
                 }
@@ -620,7 +640,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn invalidate_code_page(&mut self, physical: u64) {
         let frame = frame_number(physical);
         let code = Arc::clone(&self.code);
-        let mut cache = code.cache_at(board::LockSite::Invalidate);
+        let mut cache = code.page_at(physical, board::LockSite::Invalidate);
         // The page's blocks leave the index, so no detach finds them as
         // sources again: their links out are cut now.
         let page: Vec<usize> = cache.index.page(physical).collect();
@@ -632,7 +652,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !page.is_empty() {
             code.blocks.advance_epoch();
         }
-        cache.targets.forget_frames(frame..=frame, |_| true);
+        code.cache_at(board::LockSite::Invalidate)
+            .targets
+            .forget_frames(frame..=frame, |_| true);
         let forgot = cache.index.forget_page(physical & !(FETCH_PAGE - 1));
         drop(cache);
         // Every PE's jump cache on a shared board still names its blocks.
@@ -1029,7 +1051,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// Note that block `slot` leaves the index for `cause`
     /// ([`churn::Churn::gone`]). Under the board's lock, `cache`.
-    pub(super) fn note_gone(&self, cache: &mut board::Cache, slot: usize, cause: churn::Gone) {
+    pub(super) fn note_gone(&self, cache: &mut board::Shard, slot: usize, cause: churn::Gone) {
         let block = &self.code.blocks[slot];
         let identity = churn::identity(block.pc, block.physical, block.variant.0);
         let (generation, _) = self.ring_position();
@@ -1051,7 +1073,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// Note the install of block `slot`, before it enters the index
     /// ([`churn::Churn::installed`]). Under the board's lock, `cache`.
-    pub(super) fn note_churn(&self, cache: &mut board::Cache, slot: usize) {
+    pub(super) fn note_churn(&self, cache: &mut board::Shard, slot: usize) {
         let blocks = &self.code.blocks;
         let block = &blocks[slot];
         let shared = cache
@@ -1175,8 +1197,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) -> board::Retirement {
         let code = Arc::clone(&self.code);
         let listed = code
-            .cache_at(board::LockSite::Evict)
             .code_slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
             .take(&range);
         // Without a list, every slot's record, read without the lock: the
         // range takes no new block.
@@ -1199,8 +1222,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             })
             .collect();
         slots.sort_unstable();
-        code.cache_at(board::LockSite::Evict)
-            .code_slots
+        code.code_slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
             .give_back(evicted);
         board::Retirement {
             part,
@@ -1230,11 +1254,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn retire_step(&mut self, job: &mut board::Retirement) -> bool {
         let started = board::timestamp();
         let code = Arc::clone(&self.code);
-        let mut cache = code.cache_at(board::LockSite::Evict);
         let mut visits = 0;
-        if job.next < job.slots.len() || job.page.is_some() {
+        // The page under way, or the next: a step holds its index shard and
+        // goes on to later pages of the same shard only.
+        let frame = match &job.page {
+            Some(page) => Some(job.slots[page.start].0),
+            None => job.slots.get(job.next).map(|&(frame, _)| frame),
+        };
+        if let Some(frame) = frame {
+            let shard = super::block_index::shard_of(frame);
+            let lock = &code.shards[shard];
+            let mut cache = lock.at(board::LockSite::Evict);
             loop {
-                let budget = match code.wanted() {
+                let budget = match lock.wanted() {
                     true => YIELD_VISITS.min(code.step_visits),
                     false => code.step_visits,
                 };
@@ -1243,7 +1275,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 }
                 let left = budget - visits;
                 if job.page.is_none() {
-                    if job.next >= job.slots.len() {
+                    if job.next >= job.slots.len()
+                        || super::block_index::shard_of(job.slots[job.next].0) != shard
+                    {
                         break;
                     }
                     let first = job.slots[job.next].0;
@@ -1287,7 +1321,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     }
                     board::PagePhase::Retire(from) => {
                         let to = page.end.min(from + EVICT_STEP.min(left as usize));
-                        self.retire_blocks(&mut cache, &job.slots[from..to]);
+                        self.retire_blocks(&job.slots[from..to]);
                         visits += (to - from) as u64;
                         if to == page.end {
                             job.next = page.end;
@@ -1301,17 +1335,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else if let Some(from) = job.cells {
             // The exits in the range go, and with them their cells: no
             // block in it is live now, so none links through a cell again.
-            let most = match code.wanted() {
+            let most = match code.cache.wanted() {
                 true => CELL_STEP.min(YIELD_VISITS as usize),
                 false => CELL_STEP,
             }
             .min(code.step_visits as usize);
-            job.cells = cache
+            job.cells = code
+                .cache_at(board::LockSite::Evict)
                 .targets
                 .release_some_cells(from..=job.range.end as u64 - 1, most);
             visits = most as u64;
         }
-        drop(cache);
         job.visits += visits;
         job.step_visits = job.step_visits.max(visits);
         job.ticks += board::timestamp().wrapping_sub(started);
@@ -1322,12 +1356,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The blocks `step` of the page at `frame` leave the index, the block
     /// table and their links out, and this PE's jump cache and waiting
     /// exit; their PCs go to `pcs`. They stay live: links into them are
-    /// cut next ([`Self::cut_links_into`]). Under the board's lock,
-    /// `cache`. The work it took, in [`STEP_VISITS`] units: a block each,
-    /// a sixteenth of the page's index list, and the cells looked at.
+    /// cut next ([`Self::cut_links_into`]). Under the lock of the page's
+    /// index shard, `cache`, and the block table's for their entries. The
+    /// work it took, in [`STEP_VISITS`] units: a block each, a sixteenth of
+    /// the page's index list, and the cells looked at.
     fn unindex(
         &mut self,
-        cache: &mut board::Cache,
+        cache: &mut board::Shard,
         frame: u64,
         step: &[(u64, u32)],
         pcs: &mut Vec<u64>,
@@ -1356,12 +1391,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         unmark(&mut cache.marked, marked, &slots);
         let mut visits = (slots.len() + listed / 16) as u64;
         let mut unlinks = Vec::new();
+        let mut table = code.cache_at(board::LockSite::Evict);
+        for &slot in &slots {
+            let block = &blocks[slot as usize];
+            for key in block_keys(block) {
+                visits += table.targets.forget_block(block.pc, key, slot) as u64;
+            }
+        }
+        drop(table);
         for &slot in &slots {
             let block = &blocks[slot as usize];
             pcs.push(block.pc);
-            for key in block_keys(block) {
-                visits += cache.targets.forget_block(block.pc, key, slot) as u64;
-            }
             // No detach visits it once it left the index: its links out
             // go now, and it links nothing again.
             let record = blocks.record(slot as usize);
@@ -1394,11 +1434,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// sorted `pcs`: those of blocks that left the index. A link names the
     /// block a PC and variant have, so a link to any of the PCs goes (one
     /// to a block compiled again there links again). Blocks indexed after
-    /// they left link to none of them. Under the board's lock, `cache`.
-    /// Where the cut goes on, if blocks are left, and the blocks visited.
+    /// they left link to none of them. Under the lock of the page's index
+    /// shard, `cache`. Where the cut goes on, if blocks are left, and the
+    /// blocks visited.
     fn cut_links_into(
         &mut self,
-        cache: &mut board::Cache,
+        cache: &mut board::Shard,
         frame: u64,
         pcs: &[u64],
         from: usize,
@@ -1431,8 +1472,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// Retire the blocks of `step`, which nothing reaches but a core
     /// already in one: their slots go once the retirement ends and its
-    /// grace passed. Under the board's lock, `cache`.
-    fn retire_blocks(&mut self, cache: &mut board::Cache, step: &[(u64, u32)]) {
+    /// grace passed. Under the lock of their page's index shard.
+    fn retire_blocks(&mut self, step: &[(u64, u32)]) {
         let code = Arc::clone(&self.code);
         let shared = self.code_hub.is_some();
         let now = self.host.counter();
@@ -1452,7 +1493,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 false => recovery.remove(&slot).map(|owner| owner.code_bytes()),
             }
             .unwrap_or(0);
-            self.census_evicted(cache, slot, bytes, now);
+            self.census_evicted(slot, bytes, now);
             // Retired first: a PE adding its kept exits checks the block's
             // incarnation and liveness, so it adds them here before the
             // swap or by word after (but for one that checked just before).
@@ -1537,10 +1578,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// entry goes, so no fetch, lookup or jump cache entry reaches a block
     /// installed before; their code goes as the ring reaches its parts.
     fn forget_shared_code(&mut self) {
-        let mut cache = self.code.cache_at(board::LockSite::Discard);
-        cache.index.clear();
-        cache.targets.clear();
-        drop(cache);
+        let mut pages = self.code.every_page(board::LockSite::Discard);
+        pages.clear();
+        self.code.cache_at(board::LockSite::Discard).targets.clear();
+        drop(pages);
         self.code.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -1596,8 +1637,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// of their pages undo their links to their PCs (a link names the
     /// block a PC and variant have, so any of the page's blocks of the PC
     /// may be the one it reached), and their lookup and jump cache
-    /// entries go. Under the board's lock, `cache`.
-    pub(super) fn detach(&mut self, cache: &mut board::Cache, slots: &[u32]) {
+    /// entries go. Under the lock of their pages' index shard, `cache`, and
+    /// the block table's for their entries.
+    pub(super) fn detach(&mut self, cache: &mut board::Shard, slots: &[u32]) {
         let blocks = &self.code.blocks;
         let marked = mark(&mut cache.marked, blocks.len(), slots);
         let detached = |slot: usize| bit_set(&marked, slot as u32);
@@ -1639,13 +1681,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Lookup entries go by the frames their keys name, in runs.
         let mut frames: Vec<u64> = gone.iter().map(|&(page, _)| frame_number(page)).collect();
         frames.dedup();
+        let code = Arc::clone(&self.code);
+        let mut table = code.cache_at(board::LockSite::Install);
         for run in frames.chunk_by(|a, b| a + 1 == *b) {
-            cache
+            table
                 .targets
                 .forget_frames(run[0]..=run[run.len() - 1], |entry| {
                     detached(entry.block as usize)
                 });
         }
+        drop(table);
         // A jump cache entry sits in its PC's slot alone.
         for &(_, pc) in &gone {
             let entry = &mut self.jump[(pc / INSTRUCTION) as usize % JUMP_CACHE];
@@ -1666,14 +1711,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.exit_words = self.exit_words();
         }
         let code = Arc::clone(&self.code);
-        let counted =
-            self.census.is_some() || code.cache_at(board::LockSite::Discard).census.is_some();
+        let counted = self.census.is_some()
+            || code
+                .census
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
         if counted {
-            // In bounded steps of slots, each under the lock.
+            // In bounded steps of slots.
             let now = self.host.counter();
             let slots = code.blocks.len();
             for step in (0..slots).step_by(EVICT_STEP) {
-                let mut cache = code.cache_at(board::LockSite::Discard);
                 for slot in step..slots.min(step + EVICT_STEP) {
                     if code
                         .blocks
@@ -1685,7 +1733,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                             .recovery()
                             .get(&slot)
                             .map_or(0, |owner| owner.code_bytes());
-                        self.census_evicted(&mut cache, slot, bytes, now);
+                        self.census_evicted(slot, bytes, now);
                     }
                 }
             }

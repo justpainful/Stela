@@ -389,8 +389,13 @@ fn layout(
     blobs: &[u64],
     end: u64,
     room: usize,
+    avoid: &[(u64, u64)],
 ) -> Layout {
-    let mut taken: Vec<(u64, u64)> = current.iter().map(Entry::span).collect();
+    let mut taken: Vec<(u64, u64)> = current
+        .iter()
+        .map(Entry::span)
+        .chain(avoid.iter().copied())
+        .collect();
     taken.sort_unstable();
     let kept = current.iter().filter(|entry| !replaced(entry)).count();
     let mut first = Vec::new();
@@ -420,6 +425,7 @@ fn layout(
                 .iter()
                 .map(|&(index, offset)| (offset, offset + aligned(blobs[index]))),
         )
+        .chain(avoid.iter().copied())
         .collect();
     taken.sort_unstable();
     let mut second = Vec::new();
@@ -449,7 +455,20 @@ pub fn plan<'a>(
     file_bytes: u64,
     change: Change<'a>,
 ) -> Plan<'a> {
-    planned(current, domain, key, file_bytes, change, false)
+    planned(current, domain, key, file_bytes, change, false, &[])
+}
+
+/// [`plan`] that writes nothing into `avoid`, file ranges (`start..end`)
+/// that a reader may still read though no commit names them any more.
+pub fn plan_avoiding<'a>(
+    current: Option<&Commit>,
+    domain: [u8; 8],
+    key: [u8; 32],
+    file_bytes: u64,
+    change: Change<'a>,
+    avoid: &[(u64, u64)],
+) -> Plan<'a> {
+    planned(current, domain, key, file_bytes, change, false, avoid)
 }
 
 /// [`plan`] in one commit: each new blob is placed beside every committed
@@ -463,7 +482,7 @@ pub fn plan_beside<'a>(
     file_bytes: u64,
     change: Change<'a>,
 ) -> Plan<'a> {
-    planned(current, domain, key, file_bytes, change, true)
+    planned(current, domain, key, file_bytes, change, true, &[])
 }
 
 fn planned<'a>(
@@ -473,6 +492,7 @@ fn planned<'a>(
     file_bytes: u64,
     change: Change<'a>,
     beside: bool,
+    avoid: &[(u64, u64)],
 ) -> Plan<'a> {
     let Change {
         mut replace,
@@ -502,7 +522,7 @@ fn planned<'a>(
         let replaced =
             |entry: &Entry| replace.contains(&entry.kind) || remove.contains(&entry.offset);
         let (first, mut second, mut dropped) =
-            layout(committed, &replaced, &candidates, end, MAX_ENTRIES);
+            layout(committed, &replaced, &candidates, end, MAX_ENTRIES, avoid);
         if beside {
             dropped.extend(second.drain(..).map(|(index, _)| index));
             dropped.sort_unstable();
@@ -614,12 +634,24 @@ pub fn largest_free(
     key: [u8; 32],
     file_bytes: u64,
 ) -> u64 {
+    largest_free_avoiding(current, domain, key, file_bytes, &[])
+}
+
+/// [`largest_free`] outside `avoid` too ([`plan_avoiding`]).
+pub fn largest_free_avoiding(
+    current: Option<&Commit>,
+    domain: [u8; 8],
+    key: [u8; 32],
+    file_bytes: u64,
+    avoid: &[(u64, u64)],
+) -> u64 {
     let mut taken: Vec<(u64, u64)> = match current {
         Some(commit) if commit.domain == domain && commit.key == key => {
             commit.entries.iter().map(Entry::span).collect()
         }
         _ => Vec::new(),
     };
+    taken.extend_from_slice(avoid);
     taken.sort_unstable();
     let end = data_end(file_bytes);
     let (mut at, mut largest) = (DATA_START, 0);
@@ -718,6 +750,33 @@ impl<'a> Execution<'a> {
     /// Whether every step is done.
     pub fn finished(&self) -> bool {
         self.step == self.plan.steps.len()
+    }
+
+    /// What the next [`Self::advance`] with `budget` reads of a blob's
+    /// source first: the blob, the offset in it and the bytes. `None` when
+    /// its next step writes no new piece of a blob.
+    pub fn next_read(&self, budget: u64) -> Option<(usize, u64, u64)> {
+        if self.pending.is_some() {
+            return None;
+        }
+        let Step::Data { blob, .. } = self.plan.steps.get(self.step)? else {
+            return None;
+        };
+        let length = self.plan.blobs[*blob].source.length();
+        let take = (aligned(length) - self.done).min(aligned(budget.max(1)));
+        let filled = (self.done + take).min(length).saturating_sub(self.done);
+        Some((*blob, self.done, filled))
+    }
+
+    /// The file offset blob `blob` of the plan is written at, if it is.
+    pub fn offset_of(&self, blob: usize) -> Option<u64> {
+        self.plan.steps.iter().find_map(|step| match *step {
+            Step::Data {
+                blob: written,
+                offset,
+            } if written == blob => Some(offset),
+            _ => None,
+        })
     }
 
     /// Carries out the next pieces of at most `budget` bytes in all (at

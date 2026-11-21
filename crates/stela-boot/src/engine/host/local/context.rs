@@ -472,7 +472,7 @@ impl Owner {
         }
         let mut roots = alloc::vec::Vec::new();
         roots
-            .try_reserve_exact(2 + super::super::ROOTS * (1 + super::super::BANKS))
+            .try_reserve_exact(2 + super::super::ROOTS * super::super::SETS)
             .map_err(unavailable)?;
         roots.push(state.window_root);
         roots.push(state.host_root);
@@ -534,7 +534,7 @@ impl Owner {
         let state = state();
         let mut roots = alloc::vec::Vec::new();
         roots
-            .try_reserve_exact(2 + super::super::ROOTS * (1 + super::super::BANKS))
+            .try_reserve_exact(2 + super::super::ROOTS * super::super::SETS)
             .map_err(|_| refuse!("RAM transition root catalog allocation failed"))?;
         roots.extend([state.window_root, state.host_root]);
         roots.extend(state.all_roots());

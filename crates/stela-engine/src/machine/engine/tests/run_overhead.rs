@@ -56,7 +56,7 @@ fn guest(system: bool) -> ([u32; 2], Vec<NativeExit>) {
 /// Ready `machine` to loop at BASE.
 fn prepare(machine: &mut Machine<FakeHost, NoDevices>, cycle: Vec<NativeExit>) {
     machine.host.cycle = cycle;
-    machine.host.stamped = true;
+    machine.host.real_counter = true;
     machine.cpu.pc = BASE;
     machine.cpu.state.x[1] = BASE;
 }

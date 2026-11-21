@@ -212,7 +212,7 @@ pub struct Written {
 
 impl Written {
     /// Leave `Xt`'s value as the register stores it in RAX.
-    fn apply(self, asm: &mut Asm<'_>, rt: u8) {
+    pub(crate) fn apply(self, asm: &mut Asm<'_>, rt: u8) {
         if rt == 31 {
             asm.alu(Alu::Xor, Size::Dword, Gpr::Rax, Gpr::Rax);
         } else {

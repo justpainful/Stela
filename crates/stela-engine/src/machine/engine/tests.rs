@@ -140,9 +140,6 @@ pub(super) struct FakeHost {
     /// over and over, for the run loop's timings; and the turns so far.
     pub(super) cycle: Vec<NativeExit>,
     turn: usize,
-    /// The counter reads the host's time stamp counter, as a real host's
-    /// does, for the run loop's timings.
-    pub(super) stamped: bool,
     /// A translation store, for the tests that give the host one.
     pub(super) store: Option<stored::tests::MemoryStore>,
     /// Pages whose fetch the host refuses, and its answers.
@@ -159,6 +156,8 @@ pub(super) struct FakeHost {
     serializes: usize,
     /// Counts the counter moves on after each read.
     pub(super) counter_step: u64,
+    /// The counter is the TSC, for host timing benches.
+    pub(super) real_counter: bool,
     pub(super) execute_ticks: u64,
     pub(super) timers: Vec<Option<u64>>,
     /// What [`Host::tsc_counter`] answers.
@@ -185,6 +184,105 @@ pub(super) struct FakeHost {
     pub(super) described: Vec<Described>,
     /// The idle marks of [`Host::profile_idle`], in order.
     pub(super) idle_marks: Vec<bool>,
+    /// Root sets a native TTBR0 switch loads, for the tests that give the
+    /// host some ([`FakeSets`]).
+    pub(super) sets: Option<Box<FakeSets>>,
+}
+
+/// A host's root sets as `x86_64::table_switch` reads them, one per TTBR0
+/// value, all of one class, and the word that stands for CR3: what
+/// [`Host::set_regime`] selects and native switches and transitions load,
+/// the root of the regime's view ([`FakeSets::view_of`]) in the current
+/// set.
+pub(super) struct FakeSets {
+    pub(super) sets: table_switch::Sets,
+    pub(super) cr3: u64,
+    /// The TTBR0 of each set made so far, and the current one.
+    pub(super) keys: Vec<u64>,
+    pub(super) current: usize,
+    /// The current view, and the view word native transitions write
+    /// ([`Host::native_view`]).
+    pub(super) view: usize,
+    pub(super) view_word: u64,
+    /// Native switches the host followed.
+    pub(super) followed: usize,
+}
+
+/// Where [`FakeSets`] place set 0's first root.
+pub(super) const FAKE_SETS_BASE: u64 = 0x10_0000;
+
+impl FakeSets {
+    pub(super) fn new() -> Box<Self> {
+        let mut sets = table_switch::Sets {
+            open: 1,
+            base: FAKE_SETS_BASE,
+            tagged: 1,
+            ..table_switch::Sets::default()
+        };
+        sets.current = FAKE_SETS_BASE;
+        Box::new(Self {
+            sets,
+            cr3: FAKE_SETS_BASE | table_switch::FIRST_CONTEXT,
+            keys: Vec::new(),
+            current: 0,
+            view: 0,
+            view_word: 0,
+            followed: 0,
+        })
+    }
+
+    /// The view of `requester`: EL0, EL1, EL1 with PAN, or the guarded
+    /// level, as the bare host numbers them.
+    pub(super) fn view_of(requester: mmu::Requester) -> usize {
+        match (requester.el, requester.pan, requester.guarded) {
+            (0, _, _) => 0,
+            (_, _, true) => 3,
+            (_, false, false) => 1,
+            (_, true, false) => 2,
+        }
+    }
+
+    /// CR3 for set `set`'s root of `view`, without the no-flush bit.
+    pub(super) fn cr3_of(set: usize, view: usize) -> u64 {
+        let index = (set * table_switch::SET_ROOTS + view) as u64;
+        (FAKE_SETS_BASE + index * 4096) | (table_switch::FIRST_CONTEXT + index)
+    }
+
+    /// The root of set `set`'s first view.
+    pub(super) fn root(set: usize) -> u64 {
+        FAKE_SETS_BASE + (set * table_switch::SET_ROOTS) as u64 * 4096
+    }
+
+    /// Follow a native switch, then select the set of `ttbr0` and load its
+    /// root of `view`.
+    fn select(&mut self, ttbr0: u64, view: usize) {
+        let switched = core::mem::take(&mut self.sets.switched);
+        if switched != 0 {
+            self.current = switched as usize - 1;
+            self.followed += 1;
+        }
+        // The view a native transition loaded.
+        let word = core::mem::take(&mut self.view_word);
+        if word != 0 {
+            self.view = (word & 0xff) as usize;
+        }
+        let set = match self.keys.iter().position(|&key| key == ttbr0) {
+            Some(set) => set,
+            None => {
+                self.keys.push(ttbr0);
+                let set = self.keys.len() - 1;
+                self.sets.classes[set] = 1;
+                self.sets.generations[set] = 1;
+                set
+            }
+        };
+        if self.keys.len() == 1 || set != self.current || view != self.view {
+            self.current = set;
+            self.view = view;
+            self.sets.current = Self::root(set);
+            self.cr3 = Self::cr3_of(set, view);
+        }
+    }
 }
 
 /// A described install: its code, length and regions.
@@ -353,6 +451,40 @@ impl Host for FakeHost {
     }
     fn set_regime(&mut self, regime: &Regime) {
         self.regimes.push(*regime);
+        if let Some(sets) = &mut self.sets {
+            sets.select(regime.controls.ttbr0, FakeSets::view_of(regime.requester));
+        }
+    }
+    fn native_view(&mut self, from: &Regime, to: &Regime) -> Option<NativeView> {
+        let sets = self.sets.as_mut()?;
+        if from.controls != to.controls
+            || from.watch != to.watch
+            || from.tag_checks != to.tag_checks
+            || self.regimes.last() != Some(to)
+        {
+            return None;
+        }
+        let view = FakeSets::view_of(to.requester);
+        Some(NativeView {
+            sets: &sets.sets as *const table_switch::Sets as u64,
+            root: view as u64,
+            class: sets.sets.classes[sets.current],
+            view_at: &sets.view_word as *const u64 as u64,
+            view: 0x100 | view as u64,
+            ac: stela_compiler::x86_64::transition::AC_KEEP,
+        })
+    }
+    fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
+        let sets = self.sets.as_ref()?;
+        Some((
+            &sets.sets as *const table_switch::Sets as u64,
+            table_switch::Cr3::Word(&sets.cr3 as *const u64 as u64),
+        ))
+    }
+    fn native_set(&mut self, controls: &mmu::Controls) -> Option<(u64, u64)> {
+        let sets = self.sets.as_ref()?;
+        let set = sets.keys.iter().position(|&key| key == controls.ttbr0)?;
+        Some((set as u64, sets.sets.generations[set]))
     }
     fn isolate_predictions(&mut self) {
         self.isolations += 1;
@@ -400,10 +532,8 @@ impl Host for FakeHost {
     }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
-        if self.stamped {
-            // SAFETY: RDTSC only reads the time stamp counter. Seven bits
-            // off bring a few-GHz count near the profile's 24 MHz.
-            return unsafe { core::arch::x86_64::_rdtsc() } >> 7;
+        if self.real_counter {
+            return super::board::timestamp();
         }
         let now = self.now;
         self.now += self.counter_step;
@@ -609,7 +739,6 @@ pub(super) fn board_on<D: Devices>(
         exits: Vec::new(),
         cycle: Vec::new(),
         turn: 0,
-        stamped: false,
         store: None,
         refused: Vec::new(),
         fetch_checks: 0,
@@ -619,6 +748,7 @@ pub(super) fn board_on<D: Devices>(
         on_serialize: None,
         serializes: 0,
         counter_step: 0,
+        real_counter: false,
         execute_ticks: 0,
         timers: Vec::new(),
         tsc_counter: None,
@@ -633,6 +763,7 @@ pub(super) fn board_on<D: Devices>(
         host_work_at: None,
         described: Vec::new(),
         idle_marks: Vec::new(),
+        sets: None,
     };
     let profile = CpuProfile {
         name: "test",
@@ -2486,7 +2617,7 @@ fn check_code_arena_reclamation(indexed: bool) {
     // The parts held pages 0 and 1, then page 0 again and page 2; page
     // 3 needed the first part back, whose reclaim forgot its two blocks
     // alone, and whose slots took the next blocks.
-    let left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     assert_eq!(left, [page(0) + 4, page(1) + 8, page(2), page(3)]);
@@ -2496,7 +2627,7 @@ fn check_code_arena_reclamation(indexed: bool) {
     assert_eq!(&slots[4..], [1, 0]);
     assert_eq!(
         matches!(
-            machine.code.cache().code_slots,
+            *machine.code.code_slots.lock().unwrap(),
             code_slots::CodeSlots::Partitioned { .. }
         ),
         indexed
@@ -2537,7 +2668,7 @@ fn an_evicted_blocks_successor_box_and_index_list_serve_the_next_block() {
         machine.code.blocks[next].successors[0].target.0,
         base + 2 * FETCH_PAGE + 4
     );
-    assert!(machine.code.cache().index.page(base).next().is_none());
+    assert!(machine.code.index().page(base).next().is_none());
     assert!(machine.fetch_block(base + 3 * FETCH_PAGE, false).is_ok());
     // The first page's block is installed again within the window: thrash.
     assert!(machine.fetch_block(base, false).is_ok());
@@ -2667,16 +2798,14 @@ fn eviction_undoes_the_links_into_evicted_blocks_and_keeps_their_pages() {
     assert_eq!(
         machine
             .code
-            .cache()
-            .index
+            .index()
             .get(&machine.code.blocks, base + 12, physical, variant),
         Some(1)
     );
     assert_eq!(
         machine
             .code
-            .cache()
-            .index
+            .index()
             .get(&machine.code.blocks, base, first_physical, variant),
         None
     );
@@ -2769,8 +2898,11 @@ fn pressure_reclaims_metadata_when_the_next_arena_part_is_empty() {
     assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
     assert_eq!(machine.code.blocks.recovery().len(), 1);
     assert!(
-        !(machine.code.cache().index.sweep(None))
-            .any(|(_, slot)| machine.code.blocks[slot].pc == base)
+        !(machine.code.index().sweep(None, usize::MAX).into_iter()).any(|(_, slot)| machine
+            .code
+            .blocks[slot]
+            .pc
+            == base)
     );
     assert_ne!(machine.code_generation, old_generation);
     // A cached hit adds no compilation scratch and keeps its owner.
@@ -2783,7 +2915,7 @@ fn pressure_reclaims_metadata_when_the_next_arena_part_is_empty() {
     // Continued foreign pressure must not permit unbounded local growth.
     assert!(machine.fetch_block(base + 2 * FETCH_PAGE, false).is_ok());
     assert_eq!(machine.code.blocks.recovery().len(), 1);
-    assert_eq!(machine.code.cache().index.len(), 1);
+    assert_eq!(machine.code.index().len(), 1);
 }
 
 #[test]
@@ -2796,7 +2928,7 @@ fn a_machine_with_few_blocks_keeps_them_under_memory_pressure() {
     machine.host.memory_low = true;
     // One block frees too little to relieve the heap: it stays.
     assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
-    assert_eq!(machine.code.cache().index.len(), 2);
+    assert_eq!(machine.code.index().len(), 2);
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 0);
 }
 
@@ -2813,7 +2945,7 @@ fn pressure_releases_the_oldest_arena_part_and_keeps_newer_code() {
     }
     machine.host.memory_low = true;
     assert!(machine.fetch_block(page(3), false).is_ok());
-    let mut left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let mut left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     left.sort_unstable();
@@ -2830,7 +2962,7 @@ fn a_block_installed_while_memory_runs_low_discards_the_others_first() {
     assert!(machine.fetch_block(base, false).is_ok());
     machine.host.memory_low = true;
     assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
-    let left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     assert_eq!(left, [base + FETCH_PAGE]);
@@ -2848,7 +2980,7 @@ fn memory_pressure_reclaims_before_each_new_compilation() {
     // Still low, as another machine's data may keep it: a new compile
     // releases this machine's old owners before allocating more.
     assert!(machine.fetch_block(base + 2 * FETCH_PAGE, false).is_ok());
-    assert_eq!(machine.code.cache().index.len(), 1);
+    assert_eq!(machine.code.index().len(), 1);
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 2);
 }
 
@@ -2868,11 +3000,11 @@ fn pressure_this_machine_cannot_relieve_waits_for_it_to_regrow() {
     // One block held: it installs the next without discarding again.
     assert!(machine.fetch_block(page(3), false).is_ok());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 1);
-    assert_eq!(machine.code.cache().index.len(), 2);
+    assert_eq!(machine.code.index().len(), 2);
     // Two again, as many as at the last reclaim: the next one reclaims.
     assert!(machine.fetch_block(page(4), false).is_ok());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 2);
-    assert_eq!(machine.code.cache().index.len(), 1);
+    assert_eq!(machine.code.index().len(), 1);
     // Once memory recovers, the next stretch of pressure reclaims at once.
     machine.host.memory_low = false;
     assert!(machine.fetch_block(page(0), false).is_ok());
@@ -2924,17 +3056,17 @@ fn ic_ivau_forgets_its_pages_blocks_and_ic_iallu_every_block() {
             Ok(Fetched::Block(_))
         ));
     }
-    assert_eq!(machine.code.cache().index.len(), 2);
+    assert_eq!(machine.code.index().len(), 2);
     machine.cpu.state.x[0] = base + 0x40;
     machine.system_instruction(IC_IVAU_X0).unwrap();
-    let left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     assert_eq!(left, [base + FETCH_PAGE]);
     assert_eq!(machine.statistics.code_invalidations, 1);
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 0);
     machine.system_instruction(IC_IALLU).unwrap();
-    assert!(machine.code.cache().index.is_empty());
+    assert!(machine.code.index().is_empty());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 1);
 }
 
@@ -10367,12 +10499,14 @@ mod exits;
 mod fast_ipi_native;
 mod floating_point_traps;
 mod instructions_native;
+mod lock_path;
 mod native_exceptions;
 mod one_sided;
 mod permission_kept;
 mod process_switching;
 mod pstate_features;
 mod recovery;
+mod reinstall_cost;
 mod retire_cost;
 mod run_overhead;
 mod shared_code;

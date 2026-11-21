@@ -12,7 +12,7 @@ fn legacy_first_fault_qualification_is_cached_and_reports_dispatcher_cost() {
     make_pending(&mut machine, index, &input);
     let mut owner = machine.code.blocks.recovery().remove(&index).unwrap();
     let started = std::time::Instant::now();
-    let first = owner.qualify(BASE, None).unwrap().rows();
+    let first = owner.qualify(BASE, None, None).unwrap().rows();
     let cold = started.elapsed();
     assert!(
         first
@@ -21,7 +21,7 @@ fn legacy_first_fault_qualification_is_cached_and_reports_dispatcher_cost() {
     );
     let started = std::time::Instant::now();
     for _ in 0..32 {
-        assert_eq!(owner.qualify(BASE, None).unwrap().rows(), first);
+        assert_eq!(owner.qualify(BASE, None, None).unwrap().rows(), first);
     }
     let cached = started.elapsed();
     assert_eq!(
@@ -38,7 +38,7 @@ fn legacy_first_fault_qualification_is_cached_and_reports_dispatcher_cost() {
 }
 
 use super::super::{Offer, Prepared, prepare};
-use super::{Emission, StoredOrigin, Template};
+use super::{Emission, NativeFailureReason, StoredOrigin, Template};
 use crate::translations::{Digest, Record, translator_id};
 use alloc::{sync::Arc, vec::Vec};
 use stela_compiler::block::{FaultRecovery, RecoveryBinding};
@@ -81,7 +81,7 @@ fn a_compiled_owner_keeps_only_its_packed_rows() {
         native_bytes,
         "the code's image, not a copy"
     );
-    assert_eq!(owner.qualify(BASE, None).unwrap().rows(), expected);
+    assert_eq!(owner.qualify(BASE, None, None).unwrap().rows(), expected);
     assert!(
         owner.test_packed_bytes() * 3 < unpacked,
         "{} packed bytes of {unpacked}",
@@ -125,7 +125,11 @@ fn exact_lazy_qualification_replaces_portable_bank_with_only_minted_rows() {
     assert_eq!(owner.code_bytes(), code_bytes);
     assert_eq!(
         &owner
-            .qualify(BASE, Some(&crate::translations::StoredRecord::of(&record)))
+            .qualify(
+                BASE,
+                Some(&crate::translations::StoredRecord::of(&record)),
+                None,
+            )
             .unwrap()
             .rows(),
         expected
@@ -133,8 +137,79 @@ fn exact_lazy_qualification_replaces_portable_bank_with_only_minted_rows() {
     assert_eq!(owner.stored_key(), None);
     assert_eq!(owner.code_bytes(), code_bytes);
     assert_eq!(owner.qualification_attempts, 1);
-    assert_eq!(&owner.qualify(BASE, None).unwrap().rows(), expected);
+    assert_eq!(&owner.qualify(BASE, None, None).unwrap().rows(), expected);
     assert_eq!(owner.qualification_attempts, 1);
+}
+
+/// A block installed from a record that the store let go since (a pack
+/// read on demand keeps a bounded cache of records): its first fault
+/// compiles the entry's bytes in guest memory again and gets the record's
+/// rows; bytes that no longer admit to the entry's input give none.
+#[test]
+fn a_stored_block_whose_record_went_qualifies_from_its_bytes_in_memory() {
+    let preparation = Arc::new(prepare::test_preparation());
+    let source: Vec<u8> = [0x9100_0400u32, 0xf940_0043, 0xd400_0001]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let mut page = [0u8; crate::translations::PAGE_BYTES];
+    page[..source.len()].copy_from_slice(&source);
+    let key = Digest::of(&page);
+    let context = preparation.context(BASE);
+    let offer = Offer::compile(
+        key,
+        BASE,
+        BASE,
+        context,
+        source.clone(),
+        preparation.clone(),
+    )
+    .unwrap();
+    let expected = offer.block().fault_recovery.clone();
+    assert!(!expected.is_empty());
+    let translator = translator_id();
+    let mut record = Record::new(translator, key);
+    record.insert(offer.entry().unwrap());
+    let record = Record::decode(&record.encode(), &translator, &key).unwrap();
+    let installed = || {
+        let origin = Arc::new(StoredOrigin {
+            key,
+            context,
+            page: BASE,
+            preparation: preparation.clone(),
+            kept: None,
+        });
+        let entry = record.find(0, &context).unwrap();
+        let mut relocated = crate::translations::Relocated::default();
+        assert!(entry.relocate(BASE, offer.input(), &mut relocated));
+        Template::stored(entry, &relocated, origin).installed()
+    };
+    let mut owner = installed();
+    let bytes = owner.stored_input_bytes().unwrap();
+    assert_eq!(bytes, offer.input().len());
+    // No record and no bytes: nothing qualifies, as before.
+    assert_eq!(
+        owner.qualify(BASE, None, None).map(|rows| rows.rows()),
+        Err(NativeFailureReason::StoredRecord)
+    );
+    assert_eq!(
+        owner
+            .qualify(BASE, None, Some(&source[..bytes]))
+            .unwrap()
+            .rows(),
+        expected
+    );
+    assert_eq!(owner.stored_input_bytes(), None);
+    // Guest bytes rewritten since: refused, never another block's rows.
+    let mut owner = installed();
+    let mut changed = source.clone();
+    changed[4] ^= 1;
+    assert_eq!(
+        owner
+            .qualify(BASE, None, Some(&changed[..bytes]))
+            .map(|rows| rows.rows()),
+        Err(NativeFailureReason::StoredRecord)
+    );
 }
 
 /// An entry proven during the boot qualifies from itself, at the page it
@@ -176,7 +251,7 @@ fn a_kept_entry_qualifies_at_its_new_page_without_a_record() {
     let mut owner = Template::stored(&entry, &relocated, origin).installed();
     // No pack record is looked up for it.
     assert_eq!(owner.stored_key(), None);
-    assert_eq!(&owner.qualify(moved, None).unwrap().rows(), &expected);
+    assert_eq!(&owner.qualify(moved, None, None).unwrap().rows(), &expected);
 }
 
 #[test]
@@ -197,5 +272,5 @@ fn fault_rows_survive_packing() {
     let expected = compiled.fault_recovery.clone();
     let mut owner =
         Template::compiled(Arc::new(Emission::new(source, compiled, preparation))).installed();
-    assert_eq!(owner.qualify(BASE, None).unwrap().rows(), expected);
+    assert_eq!(owner.qualify(BASE, None, None).unwrap().rows(), expected);
 }

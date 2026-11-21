@@ -742,3 +742,35 @@ fn placed_bytes_count_only_the_blobs_a_plan_writes() {
     );
     assert_eq!(none.placed_bytes(), 0, "a dropped blob writes nothing");
 }
+
+/// A plan that avoids ranges a reader still reads places nothing there
+/// while the file has room elsewhere, and says what the next advance reads
+/// of each blob and where the blob goes.
+#[test]
+fn a_plan_avoiding_ranges_writes_beside_them_and_says_what_it_reads_next() {
+    let size = DATA_START + 16 * ALIGN;
+    let avoid = [(DATA_START, DATA_START + 4 * ALIGN)];
+    assert_eq!(
+        largest_free_avoiding(None, DOMAIN, KEY, size, &avoid),
+        12 * ALIGN
+    );
+    assert_eq!(largest_free(None, DOMAIN, KEY, size), 16 * ALIGN);
+    let change = |length: usize| Change {
+        replace: Vec::new(),
+        remove: Vec::new(),
+        blobs: vec![Blob::new(CACHE, blob(3, length))],
+    };
+    let plan = plan_avoiding(None, DOMAIN, KEY, size, change(3 * ALIGN as usize), &avoid);
+    let mut execution = Execution::new(plan);
+    let at = execution.offset_of(0).unwrap();
+    assert!(at >= avoid[0].1, "{at}");
+    assert_eq!(execution.next_read(ALIGN), Some((0, 0, ALIGN)));
+    let mut file = File::new(size);
+    assert!(!execution.advance(&mut file, ALIGN).unwrap());
+    assert_eq!(execution.next_read(ALIGN), Some((0, ALIGN, ALIGN)));
+    while !execution.advance(&mut file, ALIGN).unwrap() {}
+    assert_eq!(execution.next_read(ALIGN), None);
+    // No room beside the ranges: the blob is dropped.
+    let plan = plan_avoiding(None, DOMAIN, KEY, size, change(13 * ALIGN as usize), &avoid);
+    assert_eq!(plan.dropped, vec![0]);
+}

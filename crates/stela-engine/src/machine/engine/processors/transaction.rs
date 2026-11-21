@@ -188,6 +188,8 @@ impl NativeProcessorState<'_> {
         *self.debug = None;
         self.pointer.close();
         self.mirrors.close_all();
+        // Its lookup contexts went with the translations.
+        self.mirrors.table_switch.forget();
         *self.device_lines = None;
         let pmu_timed = cpu.pmu.as_ref().map(|monitor| monitor.timed());
         let amu_timed = cpu.amu.as_ref().map(|monitors| monitors.timed());

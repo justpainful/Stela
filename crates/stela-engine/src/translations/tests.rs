@@ -210,6 +210,63 @@ fn source_witness_geometry_is_checked_even_with_a_valid_record_checksum() {
     );
 }
 
+/// Packed rows give back every row as it was: its range, its retirement
+/// and each binding of either source, in a tenth of the rows' vectors.
+#[test]
+fn packed_recovery_rows_give_back_the_rows_they_hold() {
+    use stela_compiler::block::RecoveryBinding;
+    let source = words(&[0xd503201f, 0xd503201f, 0xd503201f, 0xd4000001]);
+    let mut entry = proved(&source, 0x40).unwrap();
+    let rows: Vec<UnqualifiedFaultRecovery> = (0..3u16)
+        .map(|at| UnqualifiedFaultRecovery {
+            start: usize::from(at) * 300,
+            end: usize::from(at) * 300 + 1 + usize::from(at),
+            bindings: (0..u8::try_from(at).unwrap() * 3)
+                .map(|guest| RecoveryBinding {
+                    guest,
+                    source: match guest % 2 {
+                        0 => RecoverySource::HostRegister(guest % 16),
+                        _ => RecoverySource::NativeSpill(
+                            SpillOffset::new(8 * u16::from(guest)).unwrap(),
+                        ),
+                    },
+                })
+                .collect(),
+            retirement: RetirementPoint::before(GuestAddress(0x40 + 4 * u64::from(at)), at)
+                .unwrap(),
+            site: RecoverySiteKind::NativeInternal,
+        })
+        .collect();
+    entry.code.resize(1000, 0x90);
+    entry.recovery = Rows::pack(&rows);
+    assert_eq!(entry.recovery.len(), 3);
+    assert_eq!(entry.recovery_at(0).unwrap(), rows);
+    let moved = entry.recovery_at(PAGE).unwrap();
+    for (moved, row) in moved.iter().zip(&rows) {
+        assert_eq!(
+            moved.retirement.instruction_pc().0,
+            PAGE + row.retirement.instruction_pc().0
+        );
+        assert_eq!(moved.bindings, row.bindings);
+    }
+    let vectors = rows.len() * size_of::<UnqualifiedFaultRecovery>()
+        + rows
+            .iter()
+            .map(|row| row.bindings.len() * size_of::<RecoveryBinding>())
+            .sum::<usize>();
+    assert!(
+        entry.recovery.capacity() * 4 < vectors,
+        "{}",
+        entry.recovery.capacity()
+    );
+    // A record keeps them through its encoding.
+    let (translator, key) = (translator_id(), Digest::of(b"packed rows page"));
+    let mut record = Record::new(translator, key);
+    record.insert(entry.clone());
+    let decoded = Record::decode(&record.encode(), &translator, &key).unwrap();
+    assert_eq!(decoded.entries()[0], entry);
+}
+
 #[test]
 fn portable_after_phase_requires_the_kept_fallthrough_instruction() {
     use stela_compiler::Lifter as _;
@@ -218,13 +275,13 @@ fn portable_after_phase_requires_the_kept_fallthrough_instruction() {
     let instruction = stela_compiler::aarch64::Decoder
         .lift(GuestAddress(0x40), 0xd503201f)
         .unwrap();
-    entry.recovery = vec![UnqualifiedFaultRecovery {
+    entry.recovery = Rows::pack(&[UnqualifiedFaultRecovery {
         start: 0,
         end: 1,
         bindings: Vec::new(),
         retirement: RetirementPoint::after_fallthrough(&instruction, 0).unwrap(),
         site: RecoverySiteKind::NativeInternal,
-    }];
+    }]);
     let (translator, key) = (translator_id(), Digest::of(b"phase fixture raw page"));
     let encode = |entry| {
         let mut record = Record::new(translator, key);
@@ -250,7 +307,9 @@ fn portable_after_phase_requires_the_kept_fallthrough_instruction() {
         "serialized After does not authorize RET fallthrough"
     );
     let mut guest_after = entry;
-    guest_after.recovery[0].site = RecoverySiteKind::GuestAccess;
+    let mut rows = guest_after.recovery_at(0).unwrap();
+    rows[0].site = RecoverySiteKind::GuestAccess;
+    guest_after.recovery = Rows::pack(&rows);
     assert_eq!(
         Record::decode(&encode(guest_after), &translator, &key),
         Err(FormatError::Entry)
@@ -263,13 +322,13 @@ fn portable_before_endpoint_keeps_exact_prefix_count_and_checked_relocation() {
     let mut entry = proved(&source, 0x40).unwrap();
     let end = u64::from(entry.offset) + u64::from(entry.source_bytes);
     let count = entry.source_bytes / 4;
-    entry.recovery = vec![UnqualifiedFaultRecovery {
+    entry.recovery = Rows::pack(&[UnqualifiedFaultRecovery {
         start: 0,
         end: 1,
         bindings: Vec::new(),
         retirement: RetirementPoint::before(GuestAddress(end), count).unwrap(),
         site: RecoverySiteKind::NativeInternal,
-    }];
+    }]);
     assert!(entry.consistent());
     let rebased = entry.rebase(PAGE, &source).unwrap();
     assert_eq!(
@@ -296,7 +355,9 @@ fn portable_before_endpoint_keeps_exact_prefix_count_and_checked_relocation() {
         Record::decode(&record.encode(), &translator, &key),
         Ok(record)
     );
-    entry.recovery[0].retirement = RetirementPoint::before(GuestAddress(end), count - 1).unwrap();
+    let mut rows = entry.recovery_at(0).unwrap();
+    rows[0].retirement = RetirementPoint::before(GuestAddress(end), count - 1).unwrap();
+    entry.recovery = Rows::pack(&rows);
     let mut bad = Record::new(translator, key);
     bad.insert(entry);
     assert_eq!(
@@ -789,10 +850,13 @@ fn the_translator_id_covers_every_engine_item_its_inputs_name() {
                 "super::StoredRecord",
                 "super::*",
                 "crate::machine::engine::SharedTranslation",
+                "crate::machine::Looked",
                 "crate::machine::Offer",
                 "crate::machine::Preparation",
                 "crate::machine::Translations",
                 "crate::machine::test_preparation",
+                "crate::platform::sync::Mutex",
+                "crate::platform::sync::MutexGuard",
                 "crate::translations::PAGE_BYTES",
                 "crate::translations::translator_id",
             ],

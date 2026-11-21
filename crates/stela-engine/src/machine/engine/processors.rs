@@ -750,6 +750,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         self.device_lines = device_lines;
         *self.mirrors = incoming.mirrors;
+        // Contexts may have gone while it was parked, with nothing moving
+        // its entries' generation.
+        self.mirrors.table_switch.forget();
         self.mirrors.transition(self.mirror_state());
     }
 

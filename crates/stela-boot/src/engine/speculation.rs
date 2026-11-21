@@ -171,6 +171,11 @@ pub fn fence() {
     }
 }
 
+/// Whether [`isolate`] issues IBPB and refills the return stack.
+pub fn isolates() -> bool {
+    BARRIER.load(Ordering::Relaxed)
+}
+
 /// Keep branch predictions trained before the call from steering
 /// speculation after it: IBPB, then a refill of the return stack buffer
 /// with entries that each lead to a trap, so a return that underflows it
