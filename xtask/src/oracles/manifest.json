@@ -5248,5 +5248,53 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of the xHCI schedule scan; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "kernel_costs",
+    "source": "crates/stela-compiler/src/x86_64/block/kernel_costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of small ARM64 kernels as self-looping EL1 blocks; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "call_return_chain_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/paired.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of call and return chains; run on request"
+  },
+  {
+    "package": "stela-driver-storage",
+    "test": "transfer_cost_of_guest_sized_reads_and_writes",
+    "source": "crates/stela-driver-storage/src/nvme/owned/tests/transfer_cost.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of guest-sized transfers through the owned NVMe driver and its model; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "atomic_costs",
+    "source": "crates/stela-engine/src/machine/engine/atomic_cost.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of atomics, ordered accesses and barriers in native code; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "open_timing",
+    "source": "crates/stela-engine/src/machine/engine/pointer.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the PAC service's open at a thread switch; run on request"
+  },
+  {
+    "package": "stela-soc",
+    "test": "dependent_read_latency_by_disk_and_step_times",
+    "source": "crates/stela-soc/src/ans/host/tests/polling.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host simulation of dependent read latency by disk and step time; run on request"
   }
 ]
