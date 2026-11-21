@@ -10,15 +10,20 @@
 //! A store to any other address or width, like every fault, a pair and CLREX,
 //! exits to the engine at the instruction, with the frame's monitor intact
 //! for it to adopt. Code clobbers RAX, RCX and RDX.
+//!
+//! Each completes inside its block ([`emit_inline`]), whose code runs on
+//! past it, so an LDXR/STXR loop is one block rather than three; a store
+//! the monitor does not cover leaves through a System exit out of line
+//! ([`place`]), which retires the instructions before it.
 use super::atomic::{self, read_rax};
 use super::block::direct_exit;
-use crate::GuestState;
 use crate::aarch64::{
     Register,
     exclusive::{Data, Kind, Operand},
 };
 use crate::block::{ExitKind, SystemInstruction, system::SystemOperation};
-use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Mem, Size, resolve};
+use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Mem, Patch, Size};
+use crate::{GuestAddress, GuestState};
 use core::mem::offset_of;
 
 /// The frame's monitor fields, of which no bytes means none is set.
@@ -44,12 +49,26 @@ pub struct Scalar {
 /// The transfer of `instruction`, if it is one code can complete.
 pub fn operand(instruction: &SystemInstruction) -> Option<Scalar> {
     match instruction.operation {
-        SystemOperation::Exclusive(Ok(Operand::Transfer {
+        SystemOperation::Exclusive(Ok(operand)) => scalar(operand),
+        _ => None,
+    }
+}
+
+/// The transfer `word` encodes, if it is one code can complete.
+pub(crate) fn of_word(word: u32) -> Option<Scalar> {
+    crate::aarch64::exclusive::decode(word)?
+        .ok()
+        .and_then(scalar)
+}
+
+fn scalar(operand: Operand) -> Option<Scalar> {
+    match operand {
+        Operand::Transfer {
             element_bytes,
             base,
             data: Data::Scalar(data),
             kind,
-        })) => Some(Scalar {
+        } => Some(Scalar {
             bytes: element_bytes,
             base,
             data,
@@ -57,6 +76,13 @@ pub fn operand(instruction: &SystemInstruction) -> Option<Scalar> {
         }),
         _ => None,
     }
+}
+
+/// What [`emit_inline`] leaves to [`place`] out of line: the branches a
+/// store the monitor does not cover takes, to the System exit at `pc`.
+pub(crate) struct Slow {
+    pc: GuestAddress,
+    elsewhere: [Patch; 2],
 }
 
 /// `transfer`, the operand of `instruction`, ending with the direct exit
@@ -67,6 +93,21 @@ pub(crate) fn emit(
     instruction: &SystemInstruction,
     checks: super::MemoryChecks,
 ) {
+    let slow = emit_inline(code, transfer, instruction.instruction_pc, checks);
+    direct_exit(code, instruction.next_pc, ExitKind::Fallthrough);
+    if let Some(slow) = slow {
+        place(code, slow);
+    }
+}
+
+/// `transfer`, at `pc`, inside its block: a store the frame's monitor does
+/// not cover branches to the path [`place`] puts out of line.
+pub(crate) fn emit_inline(
+    code: &mut Code,
+    transfer: Scalar,
+    pc: GuestAddress,
+    checks: super::MemoryChecks,
+) -> Option<Slow> {
     let Scalar {
         bytes,
         base,
@@ -86,17 +127,14 @@ pub(crate) fn emit(
             asm.mov_store(Size::Qword, address_field(), Gpr::Rdx);
             asm.mov_rm_imm32(Size::Dword, bytes_field(), i32::from(bytes));
             super::store(code, data);
+            None
         }
         Kind::Store { status, .. } => {
             let mut asm = code.asm();
             asm.alu_load(Alu::Cmp, Size::Qword, Gpr::Rdx, address_field());
-            let elsewhere = asm.jcc8(Cond::Ne);
+            let address = asm.jcc(Cond::Ne);
             asm.alu_imm8(Alu::Cmp, Size::Dword, bytes_field(), bytes as i8);
-            let reserved = asm.jcc8(Cond::E);
-            asm.bind(elsewhere);
-            direct_exit(code, instruction.instruction_pc, ExitKind::System);
-            let compare = code.len();
-            resolve(code, reserved, compare);
+            let width = asm.jcc(Cond::Ne);
             atomic::input_rcx(code, bytes, data);
             code.asm().mov_load(Size::Qword, Gpr::Rax, value_field());
             atomic::locked_compare_exchange(code, bytes, Gpr::Rcx);
@@ -105,9 +143,21 @@ pub(crate) fn emit(
             asm.movzx(Size::Dword, Gpr::Rax, Size::Byte, Gpr::Rax);
             asm.mov_rm_imm32(Size::Dword, bytes_field(), 0);
             super::store(code, status);
+            Some(Slow {
+                pc,
+                elsewhere: [address, width],
+            })
         }
     }
-    direct_exit(code, instruction.next_pc, ExitKind::Fallthrough);
+}
+
+/// `slow`'s path: the System exit at the store, for the engine.
+pub(crate) fn place(code: &mut Code, slow: Slow) {
+    let mut asm = code.asm();
+    for branch in slow.elsewhere {
+        asm.bind(branch);
+    }
+    super::block::direct_exit_with(&mut asm, slow.pc, ExitKind::System);
 }
 
 #[cfg(test)]
@@ -146,12 +196,9 @@ mod tests {
         }
     }
 
-    /// The emitted code runs on the host: a load sets the monitor and a
-    /// store through it passes once, fails once RAM changed, and leaves the
-    /// monitor for the engine when it reaches another address or width.
+    /// The PC and kind of the exit `code` takes from `state`, run on the host.
     #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
-    #[test]
-    fn a_store_passes_by_value_through_the_frame_monitor() {
+    fn exit_of(code: &[u8], state: &mut GuestState) -> (u64, u64) {
         use core::ffi::c_void;
         unsafe extern "C" {
             fn mmap(
@@ -169,7 +216,27 @@ mod tests {
         const MAP_ANONYMOUS: i32 = 0x1000;
         #[cfg(target_os = "linux")]
         const MAP_ANONYMOUS: i32 = 0x20;
-        const PAGE: usize = 4096;
+        let bytes = code.len().next_multiple_of(4096);
+        // SAFETY: private anonymous memory, RX after the copy, unmapped
+        // after the call; the code reads and writes only `state` and the
+        // cell its X1 names.
+        unsafe {
+            let page = mmap(core::ptr::null_mut(), bytes, 3, 2 | MAP_ANONYMOUS, -1, 0);
+            assert_ne!(page as usize, usize::MAX);
+            core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
+            assert_eq!(mprotect(page, bytes, 5), 0);
+            let exit = crate::x86_64::native::call::<u128>(page as *const u8, state, 0, 0);
+            assert_eq!(munmap(page, bytes), 0);
+            (exit as u64, (exit >> 64) as u64)
+        }
+    }
+
+    /// The emitted code runs on the host: a load sets the monitor and a
+    /// store through it passes once, fails once RAM changed, and leaves the
+    /// monitor for the engine when it reaches another address or width.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn a_store_passes_by_value_through_the_frame_monitor() {
         // The kind and target of the direct exit each ends with.
         fn run(word: u32, state: &mut GuestState) -> (u64, u64) {
             let instruction = decode(word);
@@ -181,21 +248,7 @@ mod tests {
                 &instruction,
                 super::super::MemoryChecks::DEFAULT,
             );
-            // SAFETY: private anonymous memory, RX after the copy, unmapped
-            // after the call; the code reads and writes only `state` and the
-            // cell its X1 names.
-            unsafe {
-                let page = mmap(core::ptr::null_mut(), PAGE, 3, 2 | MAP_ANONYMOUS, -1, 0);
-                assert_ne!(page as usize, usize::MAX);
-                core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
-                assert_eq!(mprotect(page, PAGE, 5), 0);
-                let entry = |state: *mut crate::GuestState| -> u128 {
-                    crate::x86_64::native::call::<u128>(page as *const u8, state, 0, 0)
-                };
-                let exit = entry(state);
-                assert_eq!(munmap(page, PAGE), 0);
-                (exit as u64, (exit >> 64) as u64)
-            }
+            exit_of(&code, state)
         }
         let next = (0x4004, ExitKind::Fallthrough as u64);
         let mut cell = [0x1122_3344_5566_7788_u64; 2];
@@ -238,5 +291,54 @@ mod tests {
         state.x[4] = u64::MAX;
         assert_eq!(run(STLXR_W4_W0_X1, &mut state), next);
         assert_eq!((cell[0], state.x[4]), (0xdead_beef_0000_0006, 0));
+    }
+
+    /// A system-mode block of a parallel PE runs on past its exclusives:
+    /// LDXR, ADD and STXR are one block that adds once, and a store the
+    /// monitor does not cover leaves it at the store, after what came
+    /// before it.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_loop_of_exclusives_is_one_block() {
+        use crate::block::{BlockProfile, CompilationPlan, Features};
+        use alloc::vec::Vec;
+        const ADD_X0_1: u32 = 0x9100_0400;
+        let compiled = |words: &[u32]| {
+            let source: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let options = crate::Options::new(
+                BlockProfile::new(Features::SYSTEM_MODE),
+                crate::TargetCpu::detect(),
+            )
+            .with_memory_checks(super::super::MemoryChecks::system(true, false, true, false))
+            .with_native_system(super::super::NativeSystem {
+                exclusive: true,
+                ..super::super::NativeSystem::NONE
+            });
+            let block = CompilationPlan::new(&source, GuestAddress(0x4000), &options)
+                .unwrap()
+                .compile()
+                .unwrap();
+            assert_eq!(block.source_bytes, source.len(), "one block");
+            super::super::pinned::entered(&block.native.x86_64_code)
+        };
+        let mut cell = [0x10_u64; 2];
+        let mut state = GuestState::default();
+        state.x[1] = cell.as_mut_ptr() as u64;
+        state.x[4] = 9;
+        let code = compiled(&[LDXR_X0_X1, ADD_X0_1, STXR_W4_X0_X1]);
+        assert_eq!(
+            exit_of(&code, &mut state),
+            (0x400c, ExitKind::Fallthrough as u64)
+        );
+        assert_eq!((cell[0], state.x[0], state.x[4]), (0x11, 0x11, 0));
+        assert_eq!(state.exclusive_bytes, 0);
+        // A byte's monitor does not cover a doubleword store.
+        let code = compiled(&[LDXRB_W0_X1, ADD_X0_1, STXR_W4_X0_X1]);
+        assert_eq!(
+            exit_of(&code, &mut state),
+            (0x4008, ExitKind::System as u64)
+        );
+        assert_eq!((cell[0], state.x[0], state.x[4]), (0x11, 0x12, 0));
+        assert_eq!(state.exclusive_bytes, 1);
     }
 }

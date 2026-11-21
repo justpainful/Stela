@@ -1410,6 +1410,9 @@ pub(crate) fn emit_instruction(
         Operation::ZeroBlock { .. } => {
             unreachable!("DC ZVA inside a block requires its block size")
         }
+        Operation::NativeExclusive { .. } => {
+            unreachable!("exclusives inside a block require its emission")
+        }
         Operation::FloatingPointRegister(operand) => fp_register::emit(code, &operand),
         Operation::Simd(operand) => simd::emit_for_target(code, &operand, target, checks),
         Operation::Bitfield(operand) => bitfield::emit(code, &operand),

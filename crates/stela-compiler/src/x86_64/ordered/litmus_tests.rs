@@ -27,6 +27,7 @@ const LDAPR_W3_X1: u32 = 0xb8bf_c023;
 const LDAXR_W3_X1: u32 = 0x885f_fc23;
 const STLRB_W2_X0: u32 = 0x089f_fc02;
 const LDARB_W3_X1: u32 = 0x08df_fc23;
+const SWPL_W2_WZR_X0: u32 = 0xb862_801f;
 
 unsafe extern "C" {
     fn mmap(
@@ -185,6 +186,8 @@ fn a_store_release_comes_before_a_later_rcsc_load_acquire() {
     assert_eq!(both_zero(&[vec![STLR_W2_X0, LDAR_W3_X1]]), 0);
     assert_eq!(both_zero(&[vec![STLR_W2_X0], vec![LDAR_W3_X1]]), 0);
     assert_eq!(both_zero(&[vec![STLR_W2_X0], vec![LDAXR_W3_X1]]), 0);
+    // A swap into ZR with release is the same store.
+    assert_eq!(both_zero(&[vec![SWPL_W2_WZR_X0, LDAR_W3_X1]]), 0);
     // Bytes take the same path.
     assert_eq!(both_zero(&[vec![STLRB_W2_X0, LDARB_W3_X1]]), 0);
 }

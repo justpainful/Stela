@@ -8,10 +8,11 @@
 //! compiles it on this host, run on host memory by one thread, then by 2
 //! and 4 at once on the same line. A block holds 16 copies of the case's
 //! instructions; `ATOMIC COST` lines give nanoseconds per copy over a block
-//! of 16 ADDs (the entry's cost cancels). An exclusive ends its block, so
-//! an LDXR/ADD/STXR iteration is three blocks: its line gives the three
-//! blocks' time less three one-ADD blocks', and the transitions are the
-//! chain's. With several threads the time is wall time per thread.
+//! of 16 ADDs (the entry's cost cancels). An LDXR/ADD/STXR iteration runs
+//! as three blocks, as when each exclusive ended its block, less three
+//! one-ADD blocks (the transitions are the chain's), and as the one block
+//! the engine compiles, less one. With several threads the time is wall
+//! time per thread.
 extern crate std;
 
 use alloc::vec::Vec;
@@ -249,5 +250,27 @@ fn atomic_costs() {
             }
         });
         report(what, ns, one.map(|one| 3.0 * one), 1.0);
+    }
+    // The same loop as the one block a parallel PE's engine compiles.
+    for (what, words) in [
+        (
+            "LDXR;ADD;STXR block iteration",
+            [0xc85f_7c02, ADD_X2, 0xc803_7c02],
+        ),
+        (
+            "LDAXR;ADD;STLXR block iteration",
+            [0xc85f_fc02, ADD_X2, 0xc803_fc02],
+        ),
+    ] {
+        let code = block(&words);
+        let ns = on_each(&lines, &|state| {
+            loop {
+                assert_eq!(code.run(state).1, ExitKind::Fallthrough as u64);
+                if state.x[3] == 0 {
+                    break;
+                }
+            }
+        });
+        report(what, ns, one, 1.0);
     }
 }

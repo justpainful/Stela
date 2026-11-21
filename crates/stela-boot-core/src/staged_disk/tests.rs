@@ -840,97 +840,26 @@ fn a_busy_core_hands_each_completion_signal_on_once() {
     assert!(handed.take(6, 4, false), "a later signal");
 }
 
-/// A disk whose completion message never arrives is found silent once, at
-/// its [`SILENT_COMPLETIONS`]th completion; one heard once never is.
+/// A disk whose completion message does not arrive is found silent once, at
+/// its [`SILENT_COMPLETIONS`]th completion, and heard once a signal comes
+/// after all, as one whose first commands completed while its processor
+/// took no interrupt; one heard at first is never found silent.
 #[test]
-fn a_disk_whose_signal_never_comes_is_found_silent_once() {
+fn a_disk_whose_signal_does_not_come_is_found_silent_until_one_does() {
     let mut silent = SignalWatch::default();
-    let found: Vec<Option<Verdict>> = (0..SILENT_COMPLETIONS + 10 * HEARD_WINDOW)
+    let found: Vec<Option<bool>> = (0..SILENT_COMPLETIONS + 10)
         .map(|_| silent.completed(7))
         .collect();
     assert_eq!(found.iter().filter(|found| found.is_some()).count(), 1);
-    assert_eq!(
-        found[SILENT_COMPLETIONS as usize - 1],
-        Some(Verdict::Silent)
-    );
-    assert!(silent.silent());
+    assert_eq!(found[SILENT_COMPLETIONS as usize - 1], Some(false));
+    assert!(silent.silenced());
+    assert_eq!(silent.completed(9), Some(true), "a signal came");
+    assert!(!silent.silenced());
+    assert!((0..2 * SILENT_COMPLETIONS).all(|count| silent.completed(u64::from(count)).is_none()));
     let mut heard = SignalWatch::default();
     assert_eq!(heard.completed(7), None);
     assert_eq!(heard.completed(8), None);
     assert!((0..2 * SILENT_COMPLETIONS).all(|_| heard.completed(8).is_none()));
-    assert!(!heard.silent());
-}
-
-/// A disk found silent while nothing took its signals, as before the guest
-/// runs, is heard again at the end of the first window whose completions
-/// followed enough signals, and found silent again if they stop.
-#[test]
-fn a_disk_found_silent_is_heard_again_once_its_signals_come() {
-    let mut watch = SignalWatch::default();
-    for _ in 0..SILENT_COMPLETIONS - 1 {
-        assert_eq!(watch.completed(3), None);
-    }
-    assert_eq!(watch.completed(3), Some(Verdict::Silent));
-    // Too few signals in a window: still polled.
-    let mut signals = 3;
-    for at in 0..HEARD_WINDOW {
-        if at < HEARD_AGAIN_SIGNALS - 1 {
-            signals += 1;
-        }
-        assert_eq!(watch.completed(signals), None);
-    }
-    assert!(watch.silent());
-    // A window in which enough completions each followed a signal.
-    let verdicts: Vec<Option<Verdict>> = (0..HEARD_WINDOW)
-        .map(|at| {
-            if at % 4 == 0 {
-                signals += 2;
-            }
-            watch.completed(signals)
-        })
-        .collect();
-    assert_eq!(
-        verdicts[..HEARD_WINDOW as usize - 1],
-        [None; HEARD_WINDOW as usize - 1]
-    );
-    assert_eq!(
-        verdicts[HEARD_WINDOW as usize - 1],
-        Some(Verdict::HeardAgain)
-    );
-    assert!(!watch.silent());
-    // Silent once more: polled again after as many completions as at first.
-    let found: Vec<Option<Verdict>> = (0..SILENT_COMPLETIONS)
-        .map(|_| watch.completed(signals))
-        .collect();
-    assert_eq!(
-        found[..SILENT_COMPLETIONS as usize - 1]
-            .iter()
-            .flatten()
-            .count(),
-        0
-    );
-    assert_eq!(
-        found[SILENT_COMPLETIONS as usize - 1],
-        Some(Verdict::Silent)
-    );
-}
-
-/// A disk heard again whose signals keep coming stays heard for good.
-#[test]
-fn a_disk_heard_again_that_keeps_signalling_stays_heard() {
-    let mut watch = SignalWatch::default();
-    let found = (0..SILENT_COMPLETIONS)
-        .filter_map(|_| watch.completed(0))
-        .count();
-    assert_eq!(found, 1);
-    let again = (1..=HEARD_WINDOW as u64)
-        .filter_map(|signals| watch.completed(signals))
-        .collect::<Vec<_>>();
-    assert_eq!(again, [Verdict::HeardAgain]);
-    assert_eq!(watch.completed(HEARD_WINDOW as u64), None);
-    assert_eq!(watch.completed(HEARD_WINDOW as u64 + 1), None);
-    assert!((0..4 * SILENT_COMPLETIONS).all(|_| watch.completed(0).is_none()));
-    assert!(!watch.silent());
 }
 
 /// A disk that moves a command by one device round trip a look shows its

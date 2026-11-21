@@ -23,7 +23,7 @@ use core::{
     cell::Cell,
     panic::Location,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use stela_boot_core::drivers_turn::{self, Call, Entry};
 use stela_boot_core::staged_disk::{self, DiskWorker};
@@ -673,10 +673,8 @@ struct Service {
     /// a busy core takes the disk's signal only at its next interrupt window.
     looked: Cell<staged_disk::LookGate>,
     /// Whether a disk that signals has been heard: one that completes many
-    /// commands without one is polled until it is heard again.
+    /// commands without one is polled, and said so once.
     heard: staged_disk::SignalWatch,
-    /// The changes [`Service::heard`] made, for its reports.
-    verdicts: u64,
     /// Host commands that failed, which the guest sees only as its
     /// controller's error status.
     failures: u64,
@@ -783,30 +781,30 @@ impl Service {
 
     /// A command completed: a disk said to signal that has sent no signal
     /// over [`staged_disk::SILENT_COMPLETIONS`] completions is looked at
-    /// as one that sends none, until its completions follow signals again
-    /// ([`staged_disk::SignalWatch`]); each change is reported, the first
-    /// few and then each power-of-two count.
+    /// as one that sends none, until a signal comes after all, as one does
+    /// once its processor takes interrupts or its message moved
+    /// ([`retarget_signals`]); each reported once.
     fn heard(&mut self) {
-        if !self.heard.silent() && !self.signals() {
+        if !self.signals() && !self.heard.silenced() {
             return;
         }
-        let Some(verdict) = self.heard.completed(super::host::device_signals()) else {
-            return;
-        };
-        let (signals, what) = match verdict {
-            staged_disk::Verdict::Silent => (false, "no completion interrupt, polling"),
-            staged_disk::Verdict::HeardAgain => {
-                (true, "completion interrupt heard again, waiting for it")
+        let serial = || stela_contracts::masked::Tail(&self.inner.identity().serial);
+        match self.heard.completed(super::host::device_signals()) {
+            Some(false) => {
+                self.signals.set(Some(false));
+                output::arguments(format_args!(
+                    "HOST DISK serial={} no completion interrupt, polling\n",
+                    serial()
+                ));
             }
-        };
-        self.signals.set(Some(signals));
-        self.verdicts += 1;
-        if self.verdicts <= 8 || self.verdicts.is_power_of_two() {
-            output::arguments(format_args!(
-                "HOST DISK serial={} {what} (change {})\n",
-                stela_contracts::masked::Tail(&self.inner.identity().serial),
-                self.verdicts
-            ));
+            Some(true) => {
+                self.signals.set(Some(true));
+                output::arguments(format_args!(
+                    "HOST DISK serial={} completion interrupt heard, no longer polling\n",
+                    serial()
+                ));
+            }
+            None => {}
         }
     }
 
@@ -1197,7 +1195,6 @@ impl stela_drivers::probe::Observer for Observer {
             signals: Cell::new(None),
             looked: Cell::new(staged_disk::LookGate::default()),
             heard: staged_disk::SignalWatch::default(),
-            verdicts: 0,
             failures: 0,
             started: Vec::new(),
         });
@@ -1344,14 +1341,95 @@ pub(super) fn ring_owed_steps_at(id: u64) {
     }
 }
 
-/// Wake the owed steps' processor: through the line it waits on with
-/// MWAIT, else its doorbell interrupt.
+/// The PE whose core the host disks' completion signals move to once it
+/// runs ([`retarget_signals`]), `usize::MAX` for none or once moved, and
+/// that core's APIC ID.
+static SIGNAL_PE: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SIGNAL_CORE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The host disks whose signals move, and the loader root their drivers
+/// run in, written once before the PEs run.
+static SIGNAL_DISKS: output::Global<Vec<(String, Shared)>> =
+    output::Global(core::cell::RefCell::new(Vec::new()));
+static SIGNAL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Move `disks`' completion signals, which the handoff sent to the boot
+/// processor, to the core of PE `pe`, APIC ID `apic`, once that PE serves
+/// its host ([`retarget_signals`]): macOS runs the lower PEs first and
+/// leaves the last mostly waiting, so that core takes a signal at once,
+/// where the boot processor, running guest code, takes it only between its
+/// slices. Before the PEs run.
+pub(super) fn set_signal_core(pe: usize, apic: u64, disks: &HostDisks) {
+    if let Ok(mut kept) = SIGNAL_DISKS.0.try_borrow_mut() {
+        kept.clone_from(&disks.disks);
+    }
+    SIGNAL_ROOT.store(disks.root, Ordering::Relaxed);
+    SIGNAL_CORE.store(apic, Ordering::Relaxed);
+    SIGNAL_PE.store(pe, Ordering::Release);
+}
+
+/// From PE `pe`'s host service: if it is [`set_signal_core`]'s, move the
+/// host disks' completion signals to its core, once. Its core runs the
+/// engine's host by then, which takes the signal's vector; a command that
+/// completes meanwhile signals the old core or the new, and the looks for
+/// lost signals find it either way. The owed steps' doorbell moves there
+/// too ([`ring_owed`]).
+pub(super) fn retarget_signals(pe: usize) {
+    if SIGNAL_PE.load(Ordering::Relaxed) != pe
+        || SIGNAL_PE
+            .compare_exchange(pe, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let apic = SIGNAL_CORE.load(Ordering::Relaxed);
+    let Some(message) = super::host::completion_signal(apic) else {
+        return;
+    };
+    let Ok(disks) = SIGNAL_DISKS
+        .0
+        .try_borrow_mut()
+        .map(|mut kept| core::mem::take(&mut *kept))
+    else {
+        return;
+    };
+    let root = SIGNAL_ROOT.load(Ordering::Relaxed);
+    let mut moved = 0;
+    for (serial, disk) in &disks {
+        let retargeted = {
+            // SAFETY: `open` captured the loader root, as for every
+            // service call; the disk's driver keeps the entry it writes.
+            let _root = unsafe { RestoreRoot::enter(root) };
+            disk.retarget_signal(message)
+        };
+        if retargeted {
+            moved += 1;
+            output::arguments(format_args!(
+                "HOST DISK serial={} completion signal moved to APIC {apic:#x}, PE {pe}\n",
+                stela_contracts::masked::Tail(serial)
+            ));
+        }
+    }
+    if moved != 0 {
+        ring_owed_steps_at(apic);
+    }
+}
+
+/// Wake a processor for the owed steps: once the PEs run, one whose guest
+/// sleeps waiting for an interrupt, whose idle service steps the disks at
+/// once (`gpu::call_idle_core`); else the owed steps' processor, through
+/// the line it waits on with MWAIT, else its doorbell interrupt. That one
+/// is the boot processor, which mostly runs guest code and takes the
+/// doorbell only between its slices: owed steps waited 420 us on average
+/// there.
 fn ring_owed() {
     let destination = OWED_DOORBELL.load(Ordering::Relaxed);
     if destination == u32::MAX {
         return;
     }
     OWED_TIMES[0].fetch_add(1, Ordering::Relaxed);
+    if super::gpu::call_idle_core() {
+        return;
+    }
     if !crate::native_idle::doorbell(destination).is_some_and(|doorbell| doorbell.ring()) {
         super::host::ring(destination);
     }
@@ -1445,9 +1523,15 @@ pub(super) fn serve_staged(whole: bool) -> bool {
     let mut finished = false;
     let started = super::host::fresh_counter();
     let budget = super::host::COUNTER_HZ / 1_000_000 * STEP_MICROS;
+    // A waiting PE's steps take what a release left due ([`released`]), as
+    // when a release handed that PE the work: due again only if a step gave
+    // up, so later releases hand on no step already taken.
+    let due = whole && STEP_DUE.swap(false, Ordering::AcqRel);
+    let mut gave_up = false;
     for worker in staged_workers() {
         while worker.work() {
             let step = step(worker);
+            gave_up |= step.is_none();
             finished |= step.as_ref().is_some_and(|step| step.finished != 0);
             if !whole || super::host::interrupted() {
                 break;
@@ -1465,6 +1549,9 @@ pub(super) fn serve_staged(whole: bool) -> bool {
                 break;
             }
         }
+    }
+    if due && gave_up {
+        STEP_DUE.store(true, Ordering::Release);
     }
     finished
 }
@@ -1989,7 +2076,6 @@ pub unsafe fn open(
             signals: Cell::new(None),
             looked: Cell::new(staged_disk::LookGate::default()),
             heard: staged_disk::SignalWatch::default(),
-            verdicts: 0,
             failures: 0,
             started: Vec::new(),
         })
@@ -2411,7 +2497,6 @@ pub unsafe fn open(
                 signals: Cell::new(None),
                 looked: Cell::new(staged_disk::LookGate::default()),
                 heard: staged_disk::SignalWatch::default(),
-                verdicts: 0,
                 failures: 0,
                 started: Vec::new(),
             }) as Box<dyn BlockDevice>

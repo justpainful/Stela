@@ -508,97 +508,71 @@ pub fn signalled(doorbells: u64, seen: u64, owed: bool, work: bool, taken: bool)
 /// polled instead.
 pub const SILENT_COMPLETIONS: u32 = 64;
 
-/// The completions a disk found silent is watched over at a time, and how
-/// many of them must each follow a signal for it to be heard again.
-pub const HEARD_WINDOW: u32 = 32;
-pub const HEARD_AGAIN_SIGNALS: u32 = 8;
-
-/// What a completion told a [`SignalWatch`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// The disk sent no signal over [`SILENT_COMPLETIONS`] completions: poll
-    /// it.
-    Silent,
-    /// A disk found silent now signals: at least [`HEARD_AGAIN_SIGNALS`] of
-    /// its last [`HEARD_WINDOW`] completions each followed a signal.
-    HeardAgain,
-}
-
 /// Whether a disk that says it signals its completions has been heard.
 ///
 /// Its message may never arrive (an interrupt the platform does not route,
 /// a controller that sends none): its commands then still complete, found by
 /// the looks for lost signals, but nothing should wait for a signal.
 ///
-/// A disk found silent is still watched: its signals may only have been
-/// missing while no processor took them, as early in the boot, before the
-/// guest runs, when every completion is waited for with interrupts off. Once
-/// its completions follow signals again it is heard again, and then watched
-/// as a new disk is, so one that falls silent once more is polled again.
+/// The check is not per device: the host handoff gives every device that
+/// signals (each disk, a Wi-Fi adapter) the same message, one vector to one
+/// processor, so a signal does not name its source. Telling them apart
+/// would take a vector and a count per device through the handoff and the
+/// drivers, which this check does not justify; so another device's signal
+/// can make a silent disk look heard, which leaves it at the lost-signal
+/// looks' pace, as before.
 ///
-/// The check is not per device: the host handoff gives every disk that
-/// signals the same message, one vector to one processor, so a signal does
-/// not name its source (a network adapter has a vector of its own). Telling
-/// them apart would take a vector and a count per device through the
-/// handoff and the drivers, which this check does not justify; so another
-/// disk's signals can make a silent disk look heard, which leaves it at the
-/// lost-signal looks' pace, as before.
+/// A disk found silent is heard again once a signal comes after all: the
+/// boot's first commands, before the guest's processors run, complete while
+/// the processor the message names takes no interrupt, so a disk whose
+/// signal arrives can look silent then.
 #[derive(Debug, Default)]
 pub struct SignalWatch {
     /// The signal count at the first completion.
     first: Option<u64>,
     /// Completions since then with the count unmoved.
     silent: u32,
-    /// A signal came: the disk is heard for good.
-    heard: bool,
-    /// Found silent: the signal count at the last completion, the
-    /// completions of the current window and those of them the count moved
-    /// before.
-    found: Option<(u64, u32, u32)>,
+    /// Decided: a signal came, or the disk was found silent.
+    decided: bool,
+    /// The signal count when the disk was found silent, until a completion
+    /// finds it moved.
+    found_silent: Option<u64>,
 }
 
 impl SignalWatch {
-    /// A completion was taken with the signal count at `signals`: a verdict
-    /// when it changes, at the [`SILENT_COMPLETIONS`]th completion with no
-    /// signal since the first, or at the end of the first window of a
-    /// silent disk's completions that followed enough signals.
-    pub fn completed(&mut self, signals: u64) -> Option<Verdict> {
-        if let Some((last, seen, moved)) = &mut self.found {
-            *moved += u32::from(*last != signals);
-            *last = signals;
-            *seen += 1;
-            if *seen < HEARD_WINDOW {
+    /// A completion was taken with the signal count at `signals`:
+    /// `Some(false)` once, at the [`SILENT_COMPLETIONS`]th completion with no
+    /// signal since the first; then `Some(true)` once, at the first
+    /// completion with the count moved since: the disk is heard after all.
+    pub fn completed(&mut self, signals: u64) -> Option<bool> {
+        if let Some(count) = self.found_silent {
+            if count == signals {
                 return None;
             }
-            let again = *moved >= HEARD_AGAIN_SIGNALS;
-            (*seen, *moved) = (0, 0);
-            if !again {
-                return None;
-            }
-            *self = Self {
-                first: Some(signals),
-                ..Self::default()
-            };
-            return Some(Verdict::HeardAgain);
+            self.found_silent = None;
+            return Some(true);
         }
-        if self.heard {
+        if self.decided {
             return None;
         }
         if *self.first.get_or_insert(signals) != signals {
-            self.heard = true;
+            self.decided = true;
             return None;
         }
         self.silent += 1;
         if self.silent < SILENT_COMPLETIONS {
             return None;
         }
-        self.found = Some((signals, 0, 0));
-        Some(Verdict::Silent)
+        self.decided = true;
+        self.found_silent = Some(signals);
+        Some(false)
     }
 
-    /// Whether the disk is found silent and polled.
-    pub fn silent(&self) -> bool {
-        self.found.is_some()
+    /// Whether the disk was found silent and no signal came since: its
+    /// completions still go to [`Self::completed`], which tells once one
+    /// does.
+    pub fn silenced(&self) -> bool {
+        self.found_silent.is_some()
     }
 }
 

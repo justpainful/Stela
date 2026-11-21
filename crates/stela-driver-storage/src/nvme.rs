@@ -19,7 +19,7 @@ use crate::{
         BlockDevice, BlockError, Command, DiscardLimits, Features, Finished, Identity, Rotation,
         Transport, WriteZeroes, ascii,
     },
-    bus::{dma::DmaAllocator, pci::Function},
+    bus::{dma::DmaAllocator, irq::MsiMessage, mmio::Mmio, pci::Function, virtio::retarget_msix},
     registers,
 };
 use alloc::{boxed::Box, format, rc::Rc, vec::Vec};
@@ -241,11 +241,14 @@ const IO_ENTRIES: u16 = 64;
 /// every submission entry but the one that tells a full queue from an empty
 /// one, fewer when CAP.MQES is smaller.
 const DEPTH: usize = IO_ENTRIES as usize - 1;
-/// The most data one command moves.
-const BOUNCE_BYTES: usize = 128 * 1024;
-/// The I/O bounce pages of one controller: as much memory as eight commands
-/// of [`BOUNCE_BYTES`] take, which many more small commands share.
-const POOL_PAGES: usize = 256;
+/// The most data one command moves, less where MDTS says so.
+const BOUNCE_BYTES: usize = 256 * 1024;
+/// The I/O bounce pages of one controller, 4 MiB of the boot's 16 to 24
+/// MiB of DMA memory below 4 GiB: fifteen commands of [`BOUNCE_BYTES`] at
+/// once, which many more small commands share. A sequential read of 1 MiB
+/// commands keeps 3.75 MiB on the disk, where 1 MiB of 128 KiB commands
+/// kept seven.
+const POOL_PAGES: usize = 1024;
 const _: () = assert!(POOL_PAGES >= pages_for(BOUNCE_BYTES) && POOL_PAGES <= u16::MAX as usize);
 // Linux PCI NVME_MAX_BYTES bounds the logical command range independently of
 // payload storage. Write Zeroes transfers no host data through the bounce pool.
@@ -698,6 +701,9 @@ struct Controller {
     /// The I/O completion queue raises MSI-X vector 0, which the host
     /// gave the message of its completion signal.
     signalled: bool,
+    /// Vector 0's MSI-X table entry while `signalled`, where
+    /// [`Self::retarget`] writes another message.
+    msix: Option<Mmio>,
     /// I/O submissions published since the I/O submission doorbell last
     /// rang ([`Controller::ring_submissions`]): a batch rings once, after
     /// its last command, as Linux's `nvme_commit_rqs` does.
@@ -975,6 +981,7 @@ pub fn attach(
         tags: (0..DEPTH).map(|_| Tag::Free).collect(),
         recovery: None,
         signalled: false,
+        msix: None,
         owed: false,
         max_transfer: BOUNCE_BYTES,
         max_command_bytes: MAX_COMMAND_BYTES,
@@ -1006,10 +1013,10 @@ pub fn attach(
     };
     start_after_stop(&mut controller, |_| {
         function.enable_bus_master()?;
-        let Some((message, msix, table)) = msix else {
+        let Some((message, msix, table)) = &msix else {
             return Ok(false);
         };
-        function.enable_msix(msix, || {
+        function.enable_msix(*msix, || {
             table.write32(0, message.address as u32);
             table.write32(4, (message.address >> 32) as u32);
             table.write32(8, message.data);
@@ -1018,6 +1025,9 @@ pub fn attach(
         })?;
         Ok(true)
     })?;
+    if controller.signalled {
+        controller.msix = msix.map(|(_, _, table)| table);
+    }
     discover(controller, format!("{}", function.address), &mut { dma })
 }
 
@@ -1689,6 +1699,11 @@ impl BlockDevice for Namespace {
 
     fn signals(&self) -> bool {
         self.controller.borrow().signalled
+    }
+
+    /// One controller's vector 0, whichever namespace asks.
+    fn retarget_signal(&mut self, message: MsiMessage) -> bool {
+        self.controller.borrow_mut().retarget(message)
     }
 
     /// Flush, then shut the controller down once for all its namespaces.

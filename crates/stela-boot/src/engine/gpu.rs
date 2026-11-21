@@ -246,8 +246,10 @@ pub(super) fn set_hub(hub: Arc<Hub>, pe: usize) {
 /// guest or the host's service, so the work otherwise waits for the boot
 /// PE's pump or the next PE that stops to wait. Whether one was called;
 /// with none asleep, the caller leaves the work to those. Safe with
-/// interrupts on: the kick writes this processor's ICR with them off.
-fn call_idle_core() -> bool {
+/// interrupts on: the kick writes this processor's ICR with them off. A
+/// staged disk's step given up to another core's hold goes the same way
+/// (`storage::ring_owed`): the idle service steps the disks too.
+pub(super) fn call_idle_core() -> bool {
     // SAFETY: a published hub is leaked, so it lives for the boot.
     let Some(hub) = (unsafe { HUB.load(Ordering::Acquire).as_ref() }) else {
         return false;
