@@ -588,7 +588,9 @@ fn kernel_rounds(
 
 /// After a System exit that leaves PSTATE, the device lines and the timer
 /// deadline as the last full step found them, the run loop fetches at
-/// once, and a traced one's schedule and devices take no time.
+/// once, and a traced one's schedule and devices take no time. The loop's
+/// branch exits fetch at once too, so a full step follows every
+/// DIRECT_RUNS fetches at once of either kind.
 #[test]
 fn plain_system_exits_fetch_at_once() {
     let mut machine = kernel_loop(MSR_TPIDR_EL2_X0, 0x1234);
@@ -599,7 +601,18 @@ fn plain_system_exits_fetch_at_once() {
     assert!(machine.host.exits.is_empty());
     assert_eq!(machine.cpu.read(SystemRegister::TPIDR_EL2), 0x1234);
     let paths = machine.take_system_exits().paths;
-    assert_eq!(paths.direct, rounds as u64, "{paths:?}");
+    // The exits alternate, System first; one past DIRECT_RUNS in a row
+    // takes the full step.
+    let (mut expected, mut runs) = (0, 0);
+    for exit in 0..2 * rounds {
+        if runs < super::super::scheduler::DIRECT_RUNS {
+            runs += 1;
+            expected += u64::from(exit % 2 == 0);
+        } else {
+            runs = 0;
+        }
+    }
+    assert_eq!(paths.direct, expected, "{paths:?}");
     assert_eq!((paths.traced, paths.abandoned), (2, 0), "{paths:?}");
     for name in ["schedule", "devices"] {
         let segment = step_timing::PATH_NAMES.iter().position(|&n| n == name);

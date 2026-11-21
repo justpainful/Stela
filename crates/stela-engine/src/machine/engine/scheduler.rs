@@ -18,7 +18,7 @@ const SAMPLED_EXITS: usize = 4096;
 /// between two full steps of the run loop: what reaches the PE without
 /// moving its interrupt epoch (mail left for its next read, a device's
 /// reset or start) waits at most this many native runs more.
-const DIRECT_RUNS: u32 = 8;
+pub(super) const DIRECT_RUNS: u32 = 8;
 
 /// What a step left for the native run it entered: PSTATE, the device
 /// lines and the timer deadline ([`Machine::continues_directly`]).
@@ -303,9 +303,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// Whether the run loop may fetch at once after the System exit at
-    /// `next_pc` that just completed, skipping its schedule and its device
-    /// step, as native code chains on: the instruction completed plainly
-    /// (the PC at the next word, no exception), and PSTATE, the device
+    /// `next_pc` that just completed (`completed`), or the branch exit to
+    /// it, skipping its schedule and its device step, as native code chains
+    /// on: the instruction completed plainly (the PC at the next word, no
+    /// exception), or the branch's target is the PC, and PSTATE, the device
     /// lines and the timer deadline are those the last full step found
     /// (`stepped`), so its interrupt delivery would find what it found, until
     /// the count where its lines may change by time alone (`lines_until`);
@@ -314,7 +315,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// code to forward, a wait, a pause, the time slice's end, a progress
     /// mark, due DMA); and no debug check applies. At most [`DIRECT_RUNS`]
     /// such fetches follow one full step.
-    pub(super) fn continues_directly(&mut self, next_pc: u64, stepped: Stepped) -> bool {
+    pub(super) fn continues_directly(
+        &mut self,
+        next_pc: u64,
+        completed: bool,
+        stepped: Stepped,
+    ) -> bool {
         let (pstate, lines, timers) = stepped;
         let now = Pstate {
             btype: pstate.btype,
@@ -322,7 +328,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let lines_until = self.mirrors.lines_until;
         if self.direct_runs >= DIRECT_RUNS
-            || self.cpu.pc != next_pc.wrapping_add(INSTRUCTION)
+            || self.cpu.pc != next_pc.wrapping_add(if completed { INSTRUCTION } else { 0 })
             || now != pstate
             || pstate.pacm
             || pstate.il
@@ -639,16 +645,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
                 let spent = exhausted;
+                // A System instruction the engine completes, or a branch
+                // native code took whose target it did not find, may fetch
+                // at once; a run whose budget ran out takes its full step.
+                let system = kind == ExitKind::System as u64;
+                let branch = kind <= ExitKind::Return as u64 && !exhausted;
                 let direct = quiet
                     && !transitioned
-                    && kind == ExitKind::System as u64
-                    && !self.device_stub(last, next_pc);
+                    && (branch || (system && !self.device_stub(last, next_pc)));
                 self.set_doing(step_timing::exit_blocker(slot, self.timed_word));
                 let exited = self.exit(last, next_pc, kind);
                 self.trace_point_now(step_timing::PATH_SERVED);
-                if direct && exited.is_ok() && self.continues_directly(next_pc, stepped) {
+                if direct && exited.is_ok() && self.continues_directly(next_pc, system, stepped) {
                     self.direct_next = true;
-                    if self.step_timing.is_some() {
+                    if system && self.step_timing.is_some() {
                         self.system_exits.paths.direct += 1;
                     }
                 }
