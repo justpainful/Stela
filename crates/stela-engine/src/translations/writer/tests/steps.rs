@@ -78,8 +78,8 @@ impl Entries for Store {
     fn added_bytes(&mut self) -> u64 {
         self.bytes
     }
-    fn uses(&mut self) -> BTreeMap<Digest, u32> {
-        self.uses.clone()
+    fn uses_of(&mut self, key: &Digest) -> u32 {
+        self.uses.get(key).copied().unwrap_or(0)
     }
 }
 
@@ -317,6 +317,57 @@ pub(super) fn run<T: Target<Error = String>>(
         })
         .unwrap();
     (steps, added)
+}
+
+/// How far past its deadline a step may end at most: the unit of work it
+/// began before the deadline takes a few milliseconds at most in a debug
+/// build, and a host that runs other work on this one's processor charges
+/// a few more to the thread's CPU clock now and then (a WSL machine on a
+/// busy PC did, up to 6 ms in a part that does a few comparisons).
+const OVERRUN: u64 = 25 * DEADLINE;
+/// The steps a session may have of each slow one ([`SLOW`]).
+const SLOW_SHARE: u64 = 50;
+
+/// A session that fills its arena, so that it compacts, and whose full
+/// merges leave records out to stay within the file's room, so that they
+/// rank records by use: each step ends near its deadline on the thread's
+/// CPU clock, and the file it leaves reads whole, every record whose bytes
+/// a compaction moved among them. Before, in a debug build, a step took up
+/// to 33 ms (a full merge's start and its choice of the records it keeps,
+/// each 25 ms) and 212 of 760 steps more than 5 ms; now up to 9 ms, and 6
+/// of 1025 more than 5 ms.
+#[test]
+fn every_step_ends_near_its_deadline_and_the_file_reads_whole() {
+    let session = Session {
+        records: 32_000,
+        batch: 4_000,
+        entry_bytes: 1 << 10,
+        again: 4,
+        arena: 24 << 20,
+        file: DATA_START + (64 << 20),
+        limit: 1 << 30,
+    };
+    let mut disk = Disk::new(session.file);
+    disk.track = false;
+    let (steps, added) = run(&session, &mut disk);
+    steps.report("bounded");
+    let stats = steps.stats;
+    assert!(steps.stuck.is_none(), "{steps:?}");
+    assert!(stats.compactions > 1 && stats.merges > 0, "{steps:?}");
+    assert!(steps.longest < DEADLINE + OVERRUN, "{steps:?}");
+    assert!(steps.slow * SLOW_SHARE <= steps.steps, "{steps:?}");
+    // Every record the file holds reads whole and is one of a page added.
+    let translator = translator_id();
+    let file = load(&disk.bytes, u64::MAX);
+    let mut kept = 0;
+    for pack in &file.segments {
+        for (key, bytes) in pack.iter() {
+            assert!(added.contains(&key));
+            Record::decode(bytes, &translator, &key).expect("a record whole");
+            kept += 1;
+        }
+    }
+    assert!(kept > added.len() / 4, "{kept} of {}", added.len());
 }
 
 /// A long session's steps: run 20261120's boot wrote 519 435 records in 80

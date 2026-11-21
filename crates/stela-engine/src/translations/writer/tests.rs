@@ -1178,6 +1178,43 @@ fn a_compaction_in_steps_keeps_every_layout_whole_between_them() {
     );
 }
 
+/// Batches held apart lay out the segment their join lays out: a page
+/// several hold keeps the older batch's entry where two have one.
+#[test]
+fn a_segment_of_batches_held_apart_is_one_of_their_join() {
+    let translator = translator_id();
+    let batch = |pages: core::ops::Range<u32>, offset: u16, fill: u8| {
+        pages
+            .map(|page| {
+                let key = page_key(page);
+                let mut record = Record::new(translator, key);
+                record.insert(entry(offset, fill, 64));
+                record.insert(entry(200, fill, 32));
+                (key, record)
+            })
+            .collect::<BTreeMap<Digest, Record>>()
+    };
+    let batches = || vec![batch(0..40, 0, 1), batch(20..60, 8, 2), batch(30..50, 0, 3)];
+    let mut joined = BTreeMap::new();
+    for batch in batches() {
+        for (key, record) in batch {
+            match joined.entry(key) {
+                alloc::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(record);
+                }
+                alloc::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let held: &mut Record = slot.get_mut();
+                    held.merge(record);
+                }
+            }
+        }
+    }
+    let apart = Delta::of(translator, batches()).finish().unwrap();
+    let whole = Delta::new(translator, joined).finish().unwrap();
+    assert_eq!(apart.records(), 60);
+    assert_eq!(apart.to_vec(), whole.to_vec());
+}
+
 /// Batch after batch that presses while a write waits joins the batch held,
 /// within its share of the heap: the store refuses none. Without a known
 /// heap, one batch is held and the rest wait in the store's bound.
