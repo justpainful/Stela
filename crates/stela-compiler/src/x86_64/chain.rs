@@ -521,6 +521,12 @@ pub unsafe fn interrupt(control: *mut ChainControl) {
 /// quiet word [`QUIET`] unless the epoch moved since, which a notifier's
 /// [`interrupt`] may have done before this made the word quiet.
 ///
+/// A word still quiet whose epoch has not moved past `epoch` stays as it is,
+/// with no store: the store, and the full barrier it needs before the
+/// epoch's load, only make quiet a word a notifier zeroed. A notifier
+/// whose post this misses zeroes the word after it, which nothing of this
+/// can overwrite. Every return to the engine of a quiet PE takes this path.
+///
 /// # Safety
 ///
 /// As for [`interrupt`]; the caller owns the control, outside its native
@@ -533,6 +539,9 @@ pub unsafe fn acknowledge(control: *mut ChainControl, epoch: u64) {
         core::ptr::addr_of_mut!((*control).observed_interrupt_epoch).write(observed);
         let epoch = AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch));
         let quiet = AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).quiet.0));
+        if quiet.load(Ordering::Relaxed) == QUIET && epoch.load(Ordering::Acquire) == observed {
+            return;
+        }
         quiet.store(QUIET, Ordering::SeqCst);
         if epoch.load(Ordering::SeqCst) != observed {
             quiet.store(0, Ordering::SeqCst);
