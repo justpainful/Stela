@@ -196,6 +196,21 @@ Also measured, not landed:
 Tests: engine 1976 passed, compiler 1593 (7 FP16 as before); clippy host
 and UEFI clean.
 
+### Later the same day
+
+| Commit | Change | Measured |
+|---|---|---|
+| `faa80d2` | `acknowledge` of a quiet control stores nothing (no locked exchange per exit) | br 2 PEs 157 -> 149 ns; race test 20/20 |
+| `0853fc4` | `STELA_TARGET_FEATURES` build option (popcnt, bmi1/2, lzcnt, movbe) | br serial 136 -> 132 ns |
+| `0b3a64b` | oracle manifest lists six opt-in benches it missed | xtask 210 passed |
+
+Tests after `faa80d2`: compiler 1593 (7 FP16 as before), engine 1976;
+clippy host and UEFI clean.
+
+Looked at and left: PMU mirrors per entry (~67 host instructions a run),
+the interrupt check (~100), the lower-half global page's second ITLB
+probe (~70), `grace.pass`'s locked add (a required full barrier).
+
 ## Owner checkpoints
 
 The owner asks for the difference since their last question. Each line is
