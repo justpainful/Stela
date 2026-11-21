@@ -2545,10 +2545,13 @@ pub const fn half(pc: u64) -> usize {
 }
 
 /// What `context` flips of the ITLB slots of the pages it translates, in an
-/// ITLB of the set mask `sets`: the salt's bits are the mask's highest.
+/// ITLB of the set mask `sets`: the salt's bits are the mask's highest. The
+/// mask is the low bits of a power of two, so its width is its bit count:
+/// one BSR, where a baseline x86-64 build counts bits in a dozen steps.
 pub const fn itlb_salt(context: u64, sets: u32) -> u32 {
+    debug_assert!(sets & sets.wrapping_add(1) == 0, "a set mask of low bits");
     (context as u32 & ((1 << LOOKUP_SALT_BITS) - 1))
-        << sets.count_ones().saturating_sub(LOOKUP_SALT_BITS)
+        << (u32::BITS - sets.leading_zeros()).saturating_sub(LOOKUP_SALT_BITS)
 }
 
 /// The ITLB slot of the page of `pc` in `context`, in an ITLB of the set
