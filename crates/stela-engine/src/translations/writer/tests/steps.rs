@@ -182,11 +182,10 @@ pub(super) fn run(session: &Session) -> Steps {
     let mut quiet = 0;
     while quiet < 2000 {
         if next < session.records && store.added.is_empty() {
-            let repeats = if session.again == 0 {
-                0
-            } else {
-                (session.batch / session.again).min(again.len() as u32)
-            };
+            let repeats = session
+                .batch
+                .checked_div(session.again)
+                .map_or(0, |repeats| repeats.min(again.len() as u32));
             for _ in 0..repeats {
                 let page = again.pop_front().expect("a page to compile again");
                 store.add(page, 64, session.entry_bytes);
