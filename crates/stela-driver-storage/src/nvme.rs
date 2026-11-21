@@ -241,11 +241,14 @@ const IO_ENTRIES: u16 = 64;
 /// every submission entry but the one that tells a full queue from an empty
 /// one, fewer when CAP.MQES is smaller.
 const DEPTH: usize = IO_ENTRIES as usize - 1;
-/// The most data one command moves.
-const BOUNCE_BYTES: usize = 128 * 1024;
-/// The I/O bounce pages of one controller: as much memory as eight commands
-/// of [`BOUNCE_BYTES`] take, which many more small commands share.
-const POOL_PAGES: usize = 256;
+/// The most data one command moves, less where MDTS says so.
+const BOUNCE_BYTES: usize = 256 * 1024;
+/// The I/O bounce pages of one controller, 4 MiB of the boot's 16 to 24
+/// MiB of DMA memory below 4 GiB: fifteen commands of [`BOUNCE_BYTES`] at
+/// once, which many more small commands share. A sequential read of 1 MiB
+/// commands keeps 3.75 MiB on the disk, where 1 MiB of 128 KiB commands
+/// kept seven.
+const POOL_PAGES: usize = 1024;
 const _: () = assert!(POOL_PAGES >= pages_for(BOUNCE_BYTES) && POOL_PAGES <= u16::MAX as usize);
 // Linux PCI NVME_MAX_BYTES bounds the logical command range independently of
 // payload storage. Write Zeroes transfers no host data through the bounce pool.

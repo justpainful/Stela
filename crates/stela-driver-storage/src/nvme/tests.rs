@@ -16,7 +16,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let mut registers = vec![0u64; 1024].into_boxed_slice();
-        let mut memory = vec![0u64; 196608];
+        // The pool, the queues and room for host memory buffers.
+        let mut memory = vec![0u64; (POOL_PAGES + 128) * PAGE / 8];
         let start = memory.as_mut_ptr() as u64;
         // SAFETY: this fixture owns both stable allocations until after
         // all controller operations; no device accesses them.
@@ -853,19 +854,19 @@ fn small_commands_run_past_eight_until_the_pool_cannot_take_the_largest() {
     // One page each: every tag runs while the pool keeps the largest.
     assert_eq!(running.len(), DEPTH.min(POOL_PAGES - largest + 1));
     assert!(running.len() > 8);
-    // Nine pages each: the pool, not the tags, is what runs out.
+    // Seventeen pages each: the pool, not the tags, is what runs out.
     let mut fixture = Fixture::new();
     let disk = &mut fixture.disk;
     let mut running = 0;
     while disk.room() {
         disk.start(Command::Read {
             lba: 0,
-            bytes: 8 * PAGE,
+            bytes: 16 * PAGE,
         })
         .unwrap();
         running += 1;
     }
-    assert_eq!(running, (POOL_PAGES - largest) / pages_for(8 * PAGE) + 1);
+    assert_eq!(running, (POOL_PAGES - largest) / pages_for(16 * PAGE) + 1);
     assert!(running < DEPTH);
     assert!(disk.controller.borrow().pool.free.len() < largest);
 }
@@ -1434,6 +1435,29 @@ fn completions_are_signalled_and_posted_in_memory() {
     assert!(disk.posted());
     assert!(disk.finish(read).is_some());
     assert!(!disk.posted());
+}
+
+/// Reads of the largest transfer keep as many commands on the disk as the
+/// bounce pool holds: fifteen of 256 KiB, where a 1 MiB pool of 128 KiB
+/// commands held seven.
+#[test]
+fn the_bounce_pool_keeps_fifteen_of_the_largest_reads_on_the_disk() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let largest = disk.controller.borrow().max_transfer;
+    assert_eq!(largest, 256 * 1024);
+    let mut started = 0;
+    while disk.room() {
+        disk.start(Command::Read {
+            lba: 0,
+            bytes: largest,
+        })
+        .unwrap();
+        started += 1;
+    }
+    assert_eq!(started, 15);
+    assert_eq!(started, POOL_PAGES / pages_for(largest));
+    assert_eq!(256 / pages_for(128 * 1024), 7, "the former pool");
 }
 
 /// A signalled controller's vector 0 takes another message, written with
