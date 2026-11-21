@@ -1717,7 +1717,9 @@ struct FileRead {
 
 impl FileRead {
     /// Start the read: `None` when the range is outside the file or the
-    /// device refused a command.
+    /// device refused its first command. A command refused after others
+    /// started fails the read but keeps their tags, which [`Self::poll`]
+    /// takes as they end, so the device gets each one back.
     fn start(
         device: &mut dyn BlockDevice,
         extents: &[Extent],
@@ -1740,8 +1742,14 @@ impl FileRead {
                 lba,
                 bytes: length as usize,
             };
-            let tag = device.start_more(command).ok()?;
-            read.reads.push((tag, from));
+            match device.start_more(command) {
+                Ok(tag) => read.reads.push((tag, from)),
+                Err(_) if read.reads.is_empty() => return None,
+                Err(_) => {
+                    read.failed = true;
+                    break;
+                }
+            }
         }
         Some(read)
     }
