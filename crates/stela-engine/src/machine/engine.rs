@@ -57,6 +57,7 @@ mod pointer_authentication;
 mod regime_state;
 mod scheduler;
 mod system_access;
+mod table_switches;
 mod timing;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
@@ -70,6 +71,8 @@ pub use parallel::{
     SourceObservation, SourcePhase,
 };
 pub use rebase::RebaseCounts;
+/// The reasons [`Statistics::switch_misses`] counts.
+pub const SWITCH_MISS_REASONS: usize = table_switches::miss::REASONS;
 pub use stela_contracts::dma::{DmaError, TransferFault};
 mod pointer;
 mod prepare;
@@ -155,13 +158,15 @@ use stela_compiler::{
     },
     x86_64::{
         MemoryChecks, NativeSystem, cache_clean, chain, native_exclusive,
-        pointer as x86_64_pointer, register_read, transition, zero_block,
+        pointer as x86_64_pointer, register_read, table_switch, transition, zero_block,
     },
 };
 pub use stela_contracts::bus::Transition;
 pub use stela_contracts::dma::Memory;
 pub use stela_contracts::gate::{CallerFault, CallerMemory, GateCall, GateOutcome};
-pub use stored::{EntryChecks, Offer, SharedTranslation, StoreEvent, Translations, entry_checks};
+pub use stored::{
+    EntryChecks, Looked, Offer, SharedTranslation, StoreEvent, Translations, entry_checks,
+};
 pub use system::FP_TRAPS_WRITABLE;
 use {
     super::cpu::Cpu, super::cpu::Exception, super::cpu::HCR_AMO, super::cpu::HCR_API,
@@ -637,13 +642,27 @@ struct JumpEntry {
 }
 
 /// A half's recent context number, with the EL, variant and fetch epoch it
-/// was found for.
+/// was found for. The variant is its id, which names one variant for the
+/// board's life ([`Machine::variants`] only grows), so a lookup compares
+/// one word rather than the variant's every field.
 #[derive(Debug, Clone, Copy)]
 struct Recent {
     el: u8,
-    variant: Variant,
+    variant: VariantId,
     epoch: FetchEpoch,
     number: u64,
+}
+
+/// [`Machine::current_variant_id`]'s last answer and the inputs it reads
+/// besides the derived state it is forgotten with (`native_system`): the
+/// fetch's own `single`, PSTATE.SM where the PE has SME, and the DIT tier.
+#[derive(Debug, Clone, Copy)]
+struct VariantMemo {
+    single: bool,
+    scalable: Option<bool>,
+    timing: bool,
+    variant: Variant,
+    id: VariantId,
 }
 
 /// `T` on cache lines of its own: a shared word that PEs read on every
@@ -659,6 +678,12 @@ impl<T> core::ops::Deref for Padded<T> {
         &self.0
     }
 }
+
+/// The exits of which one has its missed transfer classified
+/// (`Statistics::lookup_misses`, `branch_misses`), counting for all of
+/// them: each classification takes an ITLB and a table lookup or two the
+/// run needs for nothing else, and the reports' shares stand.
+const MISS_SAMPLE: u64 = 8;
 
 /// The recent contexts one half finds without comparing controls: enough
 /// for the ELs and GXF states a kernel's exceptions alternate between.
@@ -795,6 +820,12 @@ pub struct Machine<H: Host, D: Devices> {
     /// named since the last promotion step ([`scheduler`]'s
     /// `promote_hot_exits`), and how often recent steps read each exit's.
     promotion_runs: u32,
+    /// Exits since the last one whose missed transfer was classified for
+    /// `Statistics::lookup_misses` and `branch_misses`, and the exits each
+    /// classified one counts for ([`MISS_SAMPLE`] but in tests that count
+    /// every exit).
+    miss_turn: u64,
+    miss_sample: u64,
     cell_samples: Vec<u64>,
     sampled_exits: BTreeMap<u64, u8>,
     /// The paired frames a native run may keep
@@ -986,6 +1017,10 @@ pub struct Machine<H: Host, D: Devices> {
     memory_checks: Option<MemoryChecks>,
     /// [`Variant::system`] for the current EL, while valid.
     native_system: Option<NativeSystem>,
+    /// The current variant's id, forgotten with `native_system` (every
+    /// change that forgets `floating_point` or `memory_checks` forgets it
+    /// too): [`Machine::current_variant_id`].
+    variant_memo: Option<VariantMemo>,
     /// Whether blocks that branch back to their own start run their
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
@@ -1382,6 +1417,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
             promotion_runs: 0,
+            miss_turn: 0,
+            miss_sample: MISS_SAMPLE,
             cell_samples: Vec::new(),
             sampled_exits: BTreeMap::new(),
             frame_bound: chain::DEFAULT_FRAME_BOUND,
@@ -1462,6 +1499,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             floating_point: None,
             memory_checks: None,
             native_system: None,
+            variant_memo: None,
             self_loops: true,
             regions: true,
             event_sample: None,

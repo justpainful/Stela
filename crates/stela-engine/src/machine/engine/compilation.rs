@@ -17,33 +17,36 @@ fn shared_part(code: &board::Code, at: NativeCode) -> u8 {
 const REDONE_INSTALLS: u32 = 64;
 
 /// Put `target`, block `index`'s entry for a fetch at `pc`, in the block
-/// table, under the board's lock (`cache`), if the block is still the
-/// indexed one: a retirement or an IC IVAU takes a block out of the index
-/// and its entries out of the table in one hold, so an entry put in after
-/// would outlive its block. Its slot is the table's now, which a growth
-/// may have changed since the caller read it. Whether the table took it.
-/// `grace` is the caller's ([`Machine::grace`]), for [`grow_table`].
+/// table, under the lock of the block's index shard (`page`) and the
+/// table's, if the block is still the indexed one: a retirement or an IC
+/// IVAU takes a block out of the index and its entries out of the table in
+/// one hold of its shard, so an entry put in after would outlive its block.
+/// Its slot is the table's now, which a growth may have changed since the
+/// caller read it. Whether the table took it. `grace` is the caller's
+/// ([`Machine::grace`]), for [`grow_table`].
 fn insert_target(
     code: &board::Code,
-    cache: &mut board::Cache,
+    page: &mut board::Shard,
     pc: u64,
     index: usize,
     target: chain::LookupEntry,
     grace: (&board::Grace, Option<usize>),
+    site: board::LockSite,
 ) -> bool {
     let block = &code.blocks[index];
-    if cache
+    let indexed = page
         .index
         .get(&code.blocks, pc, block.physical, block.variant)
-        != Some(index)
-    {
+        == Some(index);
+    let mut cache = code.cache_at(site);
+    if !indexed {
         cache.targets_raced += 1;
         return false;
     }
     let slot = cache.targets.slot(pc, target.key);
     cache.targets.insert(slot, target);
     cache.targets_inserted += 1;
-    grow_table(cache, grace, code.blocks.live());
+    grow_table(&mut cache, grace, code.blocks.live());
     true
 }
 
@@ -74,9 +77,9 @@ pub(super) fn grow_table(
 impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn fetch_block(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
         self.linked_at_install = None;
-        let context = self.current_variant(single, false);
+        let (context, context_id) = self.current_variant_id(single);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
-        let contexts = self.contexts(el, context);
+        let contexts = self.contexts_of(el, context, context_id);
         self.chain.set_contexts(contexts);
         if !self.dropped_refills.is_empty() || !self.refills.is_empty() {
             let refilling = self.host.counter();
@@ -145,7 +148,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // non-global fetch): the page is recorded, and dispatchers look
         // up, in their successors.
         if self.translation_generation != generation {
-            let contexts = self.contexts(el, context);
+            let contexts = self.contexts_of(el, context, context_id);
             self.chain.set_contexts(contexts);
         }
         let current = Variant {
@@ -538,8 +541,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
             board::Events::count(&code.events.targets_deferred);
             return false;
         }
-        let mut cache = code.cache_at(board::LockSite::Target);
-        insert_target(code, &mut cache, pc, index, target, self.grace())
+        let mut page = code.page_at(physical, board::LockSite::Target);
+        insert_target(
+            code,
+            &mut page,
+            pc,
+            index,
+            target,
+            self.grace(),
+            board::LockSite::Target,
+        )
     }
 
     /// The block table slot and entry a fetch at `pc` of block `index`
@@ -900,7 +911,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .rebases
                 .look(key, offset as u16, context, pc, again)
             {
-                super::rebase::Found::Entry(entry) => {
+                super::rebase::Found::Entry(entry, origin) => {
                     if entry.input.len() > available && !whole {
                         return Ok(None);
                     }
@@ -912,13 +923,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         }
                         self.code.rebases.hit();
                         self.count_store_source(StoreSource::Rebased);
-                        let origin = Arc::new(recovery::StoredOrigin {
-                            key: *key,
-                            context: *context,
-                            page,
-                            preparation: preparation.clone(),
-                            kept: Some(entry.clone()),
-                        });
+                        // The origin its last install at this page made,
+                        // else a new one the slot keeps for the next.
+                        let origin = match origin.filter(|origin| {
+                            origin.page == page && Arc::ptr_eq(&origin.preparation, &preparation)
+                        }) {
+                            Some(origin) => origin,
+                            None => {
+                                let origin = Arc::new(recovery::StoredOrigin {
+                                    key: *key,
+                                    context: *context,
+                                    page,
+                                    preparation: preparation.clone(),
+                                    kept: Some(entry.clone()),
+                                });
+                                self.code
+                                    .rebases
+                                    .originate(key, offset as u16, context, &origin);
+                                origin
+                            }
+                        };
                         let installed = self
                             .install(
                                 pc,
@@ -1096,6 +1120,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
             timing: self.cpu.pstate.dit && self.timing_target().is_some(),
             translated: false,
         }
+    }
+
+    /// [`Self::current_variant`] with `guarded_page` clear, and its id
+    /// ([`Self::variant_id`]): kept until the derived state it reads is
+    /// forgotten, or the fetch's `single`, PSTATE.SM or the DIT tier
+    /// differs, so a fetch in an unchanged state neither forms the variant
+    /// nor searches the table for it.
+    pub(super) fn current_variant_id(&mut self, single: bool) -> (Variant, VariantId) {
+        let scalable = self
+            .cpu
+            .scalable
+            .is_some()
+            .then(|| self.cpu.svcr() & 1 != 0);
+        let timing = self.cpu.pstate.dit && self.timing_target().is_some();
+        if let Some(memo) = self.variant_memo
+            && (memo.single, memo.scalable, memo.timing) == (single, scalable, timing)
+        {
+            return (memo.variant, memo.id);
+        }
+        let variant = self.current_variant(single, false);
+        let id = self.variant_id(variant);
+        self.variant_memo = Some(super::VariantMemo {
+            single,
+            scalable,
+            timing,
+            variant,
+            id,
+        });
+        (variant, id)
     }
 
     /// `variant`'s id, added to [`Self::variants`] the first time by
@@ -1356,15 +1409,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .blocks
             .recovery()
             .insert(slot, compiled.clone().installed());
-        let mut cache = shared.cache_at(board::LockSite::Install);
-        self.census_installed(
-            &mut cache,
-            pc,
-            physical,
-            variant,
-            installed_bytes,
-            instructions,
-        );
+        let mut cache = shared.page_at(physical, board::LockSite::Install);
+        self.census_installed(pc, physical, variant, installed_bytes, instructions);
         // Another PE installed the block meanwhile: the first install wins,
         // and this one's code stays unreachable until its part goes.
         if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id) {
@@ -1385,9 +1431,31 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // it listed the part's blocks without this one, so the block is
         // never published. Its code is reached by nothing (its thunks only
         // from it) and goes with its part, and the install is done again.
-        if let (Some(arena), Some(place)) = (&shared.arena, taken)
-            && !arena.ring.live(place)
-        {
+        // Checked and listed under the part lists' lock, which a
+        // retirement lists under after its choice: a block listed here is
+        // one the retirement finds, and it takes this shard's lock to
+        // unindex it, so after this hold publishes it.
+        let listed = {
+            let mut code_slots = shared
+                .code_slots
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let live = match (&shared.arena, taken) {
+                (Some(arena), Some(place)) => arena.ring.live(place),
+                _ => true,
+            };
+            if live {
+                code_slots.record(code.0, slot, || {
+                    shared
+                        .arena
+                        .as_ref()
+                        .map(board::Arena::partitions)
+                        .or_else(|| self.host.code_partitions())
+                });
+            }
+            live
+        };
+        if !listed {
             shared.blocks.record(slot).mark_lost();
             shared.blocks.recovery().remove(&slot);
             shared.blocks.retire(slot);
@@ -1400,13 +1468,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Ok(None);
         }
         self.note_churn(&mut cache, slot);
-        cache.code_slots.record(code.0, slot, || {
-            shared
-                .arena
-                .as_ref()
-                .map(board::Arena::partitions)
-                .or_else(|| self.host.code_partitions())
-        });
         if let Some(replaced) = cache.index.insert(&shared.blocks, slot) {
             // Only indexed blocks are reached, which eviction relies on.
             self.detach(&mut cache, &[replaced as u32]);
@@ -1416,13 +1477,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // else for its block table entry ([`Self::remember_or_link`]): it
         // does either in this hold.
         if self.publishing_target == Some(pc) {
+            // In the same page, so under the shard this hold has.
             let waiting = self.direct_exit.filter(|&(block, incarnation, target, _)| {
                 target == pc
                     && shared.blocks.record(block).incarnation() == incarnation
-                    && shared
-                        .blocks
-                        .installed(block)
-                        .is_some_and(|block| (block.pc ^ pc) & !(FETCH_PAGE - 1) == 0)
+                    && shared.blocks.installed(block).is_some_and(|block| {
+                        (block.pc ^ pc) & !(FETCH_PAGE - 1) == 0
+                            && (block.physical ^ physical) & !(FETCH_PAGE - 1) == 0
+                    })
             });
             let linked = waiting.is_some_and(|(block, _, _, word)| {
                 self.direct_exit = None;
@@ -1436,7 +1498,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 && let Some((_, target)) = self.target_entry(pc, slot)
                 && shared.blocks.record(slot).remember()
             {
-                insert_target(&shared, &mut cache, pc, slot, target, self.grace());
+                insert_target(
+                    &shared,
+                    &mut cache,
+                    pc,
+                    slot,
+                    target,
+                    self.grace(),
+                    board::LockSite::Install,
+                );
             }
         }
         drop(cache);
@@ -1540,7 +1610,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// blocks are never elsewhere.
     pub(super) fn census_installed(
         &mut self,
-        cache: &mut board::Cache,
         pc: u64,
         physical: u64,
         variant: Variant,
@@ -1563,15 +1632,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let now = self.host.counter();
         let window = 10 * self.profile.counter_frequency;
         let shared = self.code_hub.is_some();
-        let census = if shared {
-            cache
+        let (thrash, first, age) = if shared {
+            let code = Arc::clone(&self.code);
+            let mut census = code
                 .census
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            census
                 .get_or_insert_with(|| Box::new(install_census::Census::board()))
+                .installed(identity, now, window)
         } else {
             self.census
                 .get_or_insert_with(|| Box::new(install_census::Census::new()))
+                .installed(identity, now, window)
         };
-        let (thrash, first, age) = census.installed(identity, now, window);
         if let Some(age) = age {
             let second = self.profile.counter_frequency;
             let bucket = [second, 10 * second, 60 * second]
@@ -1594,19 +1668,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Count the eviction of block `index`'s code: its bytes, and with the
     /// census on, the block for a later install of it.
     /// Under the board's lock, `cache`.
-    pub(super) fn census_evicted(
-        &mut self,
-        cache: &mut board::Cache,
-        index: usize,
-        bytes: usize,
-        now: u64,
-    ) {
+    pub(super) fn census_evicted(&mut self, index: usize, bytes: usize, now: u64) {
         self.install_causes.evicted_bytes += bytes as u64;
         let shared = self.code_hub.is_some();
-        let census = if shared {
-            &mut cache.census
-        } else {
-            &mut self.census
+        let code = Arc::clone(&self.code);
+        let mut board = shared.then(|| {
+            code.census
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
+        let census = match &mut board {
+            Some(board) => board.as_deref_mut(),
+            None => self.census.as_deref_mut(),
         };
         let Some(census) = census else {
             return;
@@ -1740,7 +1813,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else if let Some(rt) = table_base_write(pc, word) {
             let cell = cell_place(TABLE_BASE_KEPT);
             let written = self.register_fixed_bits(SystemRegister::TTBR0_EL1);
-            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
+            // Code in the lower half continues through a link its own
+            // half's translation found: only the upper half's survives a
+            // switch.
+            if chain::half(pc) == 1 {
+                let sets = self.host.native_sets();
+                self.mirrors.table_switch.sets = sets.map_or(0, |(at, _)| at);
+                let places =
+                    table_switch_places(sets.map(|(_, cr3)| cr3), self.host.isolates_predictions());
+                table_switch::switch_thunk(GuestAddress(pc), rt, cell, written, &places)
+            } else {
+                register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
+            }
         } else if let Some((kept, rt)) = permission_write_word(word) {
             let all = register_read::Written {
                 keep: u64::MAX,

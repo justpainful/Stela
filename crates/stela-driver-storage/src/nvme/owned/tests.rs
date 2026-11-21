@@ -2,6 +2,7 @@
 // Copyright (c) 2011-2014, Intel Corporation.
 mod limits;
 pub(crate) mod protocol;
+mod transfer_cost;
 use super::*;
 use crate::bus::dma::{
     mapping::DomainMapping,

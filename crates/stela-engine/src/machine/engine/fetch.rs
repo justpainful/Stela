@@ -159,12 +159,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The number of the context a fetch in `half` runs in now: the EL with
     /// the guarded level, the variant and the half's translation inputs
     /// ([`contexts::Key`]). ITLB entries name it.
+    #[cfg(test)]
     pub(super) fn context(&mut self, el: u8, variant: Variant, half: usize) -> u64 {
+        let id = self.variant_id(variant);
+        self.context_of(el, variant, id, half)
+    }
+
+    /// [`Self::context`] of `variant`, whose id is `id`.
+    pub(super) fn context_of(
+        &mut self,
+        el: u8,
+        variant: Variant,
+        id: VariantId,
+        half: usize,
+    ) -> u64 {
         let epoch = self.fetch_epoch(half);
         if let Some(recent) = self.recent[half]
             .iter()
             .flatten()
-            .find(|recent| (recent.el, recent.variant, recent.epoch) == (el, variant, epoch))
+            .find(|recent| (recent.el, recent.variant, recent.epoch) == (el, id, epoch))
         {
             return recent.number;
         }
@@ -180,7 +193,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.recent[half].rotate_right(1);
         self.recent[half][0] = Some(Recent {
             el,
-            variant,
+            variant: id,
             // A frame's table may have filled and forgotten every context.
             epoch: self.fetch_epoch(half),
             number,
@@ -199,6 +212,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             });
         if evicted.is_some() {
             self.statistics.itlb_drops[2] += 1;
+            self.mirrors.table_switch.forget();
             // A transition record may name the context that went.
             self.mirrors.transitions.contexts_moved();
         }
@@ -271,9 +285,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// generation, so that neither names a context the other's frame
     /// forgot.
     pub(super) fn contexts(&mut self, el: u8, variant: Variant) -> [u64; 2] {
+        let id = self.variant_id(variant);
+        self.contexts_of(el, variant, id)
+    }
+
+    /// [`Self::contexts`] of `variant`, whose id is `id`.
+    pub(super) fn contexts_of(&mut self, el: u8, variant: Variant, id: VariantId) -> [u64; 2] {
         loop {
             let generation = self.translation_generation;
-            let contexts = [0, 1].map(|half| self.context(el, variant, half));
+            let contexts = [0, 1].map(|half| self.context_of(el, variant, id, half));
             if self.translation_generation == generation {
                 return contexts;
             }

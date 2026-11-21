@@ -585,10 +585,50 @@ pub fn vram_cap(set: bool, shipped: bool) -> Result<bool> {
     Ok(set)
 }
 
+/// The variable that names x86-64 features the boot program's Rust code is
+/// compiled to use, such as `+popcnt,+bmi1,+bmi2,+lzcnt,+movbe`: an image
+/// for one machine, which stops with an invalid opcode on a CPU without
+/// them. Unset, the program runs on every x86-64 CPU.
+pub const TARGET_FEATURES_VARIABLE: &str = "STELA_TARGET_FEATURES";
+
+/// The `--config` arguments that add `features` ([`TARGET_FEATURES_VARIABLE`])
+/// to the UEFI target's rustflags, which Cargo joins after the ones
+/// `.cargo/config.toml` gives. Only general-register features: the target
+/// is soft-float. `None` when unset or empty.
+pub fn target_features(features: Option<&str>) -> Result<Option<[String; 2]>> {
+    let Some(features) = features
+        .map(str::trim)
+        .filter(|features| !features.is_empty())
+    else {
+        return Ok(None);
+    };
+    const ALLOWED: [&str; 6] = ["popcnt", "bmi1", "bmi2", "lzcnt", "movbe", "adx"];
+    for feature in features.split(',') {
+        let name = feature.trim().strip_prefix('+').unwrap_or("");
+        anyhow::ensure!(
+            ALLOWED.contains(&name),
+            "{TARGET_FEATURES_VARIABLE} takes +feature names of {ALLOWED:?}, comma-separated; \
+             `{feature}` is not one"
+        );
+    }
+    Ok(Some([
+        "--config".to_owned(),
+        format!("target.{BOOT_TARGET}.rustflags=['-C', 'target-feature={features}']"),
+    ]))
+}
+
 fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
     let mut command = cargo();
     command.args(["build", "--locked", "--manifest-path", BOOT_MANIFEST]);
     command.args(["--target", BOOT_TARGET, "--target-dir", BOOT_TARGET_DIR]);
+    if let Some(config) = target_features(std::env::var(TARGET_FEATURES_VARIABLE).ok().as_deref())?
+    {
+        eprintln!(
+            "building for a CPU with {}: the image stops on one without them",
+            std::env::var(TARGET_FEATURES_VARIABLE).unwrap_or_default()
+        );
+        command.args(config);
+    }
     if diagnostics {
         command.args(["--features", "diagnostics"]);
     }

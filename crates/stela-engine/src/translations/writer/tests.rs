@@ -1,7 +1,8 @@
 use super::*;
-use crate::translations::pack::Arena;
+use crate::translations::pack::{FileReads, Pack};
 use crate::translations::translator_id;
 use alloc::collections::BTreeSet;
+use core::cell::RefCell;
 use stela_formats::journal::Target;
 
 mod steps;
@@ -24,6 +25,12 @@ struct Disk {
     contents: Vec<BTreeSet<Digest>>,
     /// Whether each commit's keys are kept in `contents`.
     track: bool,
+    /// Reads of the file a merge made, and the read after which every
+    /// read fails (`None`: none does).
+    reads: u64,
+    fail_after: Option<u64>,
+    /// The data writes, offset and bytes.
+    writes: Vec<(u64, u64)>,
 }
 
 impl Disk {
@@ -36,6 +43,22 @@ impl Disk {
             slot: false,
             contents: Vec::new(),
             track: true,
+            reads: 0,
+            fail_after: None,
+            writes: Vec::new(),
+        }
+    }
+
+    /// Carry out every read asked, from the file's bytes now.
+    fn serve(&mut self, reads: &mut FileReads) {
+        while let Some((id, at, bytes)) = reads.take_asked() {
+            self.reads += 1;
+            let failed = self.fail_after.is_some_and(|after| self.reads > after);
+            let at = at as usize;
+            let read = (!failed)
+                .then(|| self.bytes.get(at..at + bytes as usize).map(<[u8]>::to_vec))
+                .flatten();
+            reads.finish(id, read);
         }
     }
 }
@@ -51,6 +74,9 @@ impl Target for Disk {
         self.bytes[at..at + take].copy_from_slice(&bytes[..take]);
         self.written += take as u64;
         self.slot |= offset < DATA_START;
+        if offset >= DATA_START {
+            self.writes.push((offset, take as u64));
+        }
         if let Some(left) = &mut self.left {
             *left -= take as u64;
             if take < bytes.len() {
@@ -203,13 +229,20 @@ fn entry(offset: u16, fill: u8, bytes: usize) -> crate::translations::Entry {
         // A merge decodes what two segments hold with every check.
         source_map: vec![(offset, 0)],
         exits: Vec::new(),
-        recovery: Vec::new(),
+        recovery: Default::default(),
     }
 }
 
 /// The pack file as a boot's loader reads it: the newest commit, whose
 /// blobs must read back whole, and its segments and lists.
 fn load(disk: &[u8], limit: u64) -> File<'static> {
+    load_holding(disk, limit, false)
+}
+
+/// [`load`], each segment's header and index alone when `demand`, as a
+/// boot that reads its pack on demand holds them: its records stay in the
+/// file, which merges read.
+fn load_holding(disk: &[u8], limit: u64, demand: bool) -> File<'static> {
     let translator = translator_id();
     let size = disk.len() as u64;
     let committed = journal::candidates(&disk[..DATA_START as usize], JOURNAL_DOMAIN, size)
@@ -224,10 +257,17 @@ fn load(disk: &[u8], limit: u64) -> File<'static> {
             Some(())
         })
         .expect("the newest commit's blobs read back whole");
-        for (kind, bytes) in blobs {
+        for ((kind, bytes), entry) in blobs.into_iter().zip(&commit.entries) {
             let bytes: &'static [u8] = Vec::leak(bytes);
             match kind {
-                SEGMENT_BLOB => segments.push(Pack::parse(bytes, &translator).unwrap()),
+                SEGMENT_BLOB if demand => {
+                    let prefix = crate::translations::pack::prefix_bytes(bytes, &translator);
+                    let pack = Pack::index_only(&bytes[..prefix.unwrap()], &translator).unwrap();
+                    segments.push(Segment::at(pack, entry.offset));
+                }
+                SEGMENT_BLOB => {
+                    segments.push(Segment::from(Pack::parse(bytes, &translator).unwrap()))
+                }
                 USED_BLOB => used.push(UsedKeys::parse(bytes, &translator).unwrap()),
                 _ => panic!("an unknown blob"),
             }
@@ -236,12 +276,12 @@ fn load(disk: &[u8], limit: u64) -> File<'static> {
     File {
         translator,
         limit,
+        records: u64::MAX,
         file_bytes: size,
         committed,
         segments,
         used,
         partial: false,
-        arena: Arena::default(),
     }
 }
 
@@ -250,7 +290,7 @@ fn keys(disk: &[u8]) -> BTreeSet<Digest> {
     load(disk, u64::MAX)
         .segments
         .iter()
-        .flat_map(|pack| pack.iter().map(|(key, _)| key).collect::<Vec<_>>())
+        .flat_map(Segment::keys)
         .collect()
 }
 
@@ -268,11 +308,7 @@ impl<'a> Run<'a> {
     /// A boot over `file` whose pages are numbered from `seed` millions,
     /// that uses every record the file holds.
     fn new(file: File<'a>, seed: u32) -> Self {
-        let found = file
-            .segments
-            .iter()
-            .flat_map(|pack| pack.iter().map(|(key, _)| key).collect::<Vec<_>>())
-            .collect();
+        let found = file.segments.iter().flat_map(Segment::keys).collect();
         Self {
             writer: Writer::new(file, HZ),
             boot: Boot::new(seed, found),
@@ -284,14 +320,17 @@ impl<'a> Run<'a> {
 
     /// Step for `seconds` of the guest's time.
     fn run(&mut self, disk: &mut Disk, seconds: u64) -> Result<(), String> {
+        let disk = RefCell::new(disk);
         for _ in 0..seconds * STEPS_PER_SECOND {
             let now = self.now;
             self.boot.resident = self.writer.resident();
-            let events =
-                self.writer
-                    .step(&mut || now, now + 1, &mut self.boot, &mut |execution| {
-                        Some(execution.advance(disk, PIECE_BYTES))
-                    })?;
+            let events = self.writer.step(
+                &mut || now,
+                now + 1,
+                &mut self.boot,
+                &mut |execution| Some(execution.advance(&mut **disk.borrow_mut(), PIECE_BYTES)),
+                &mut |reads| disk.borrow_mut().serve(reads),
+            )?;
             self.events.extend(events);
             self.resident_peak = self.resident_peak.max(self.writer.resident());
             self.now += HZ / STEPS_PER_SECOND;
@@ -305,7 +344,13 @@ impl<'a> Run<'a> {
             let now = self.now;
             let events = self
                 .writer
-                .step(&mut || now, now + 1, &mut self.boot, &mut |_| None)
+                .step(
+                    &mut || now,
+                    now + 1,
+                    &mut self.boot,
+                    &mut |_| None,
+                    &mut |_| {},
+                )
                 .unwrap();
             self.events.extend(events);
             self.now += HZ / STEPS_PER_SECOND;
@@ -332,8 +377,6 @@ impl<'a> Run<'a> {
 }
 
 const FILE_BYTES: u64 = DATA_START + 4096 * journal::ALIGN;
-/// The arena of a boot of [`boot_of`].
-const BOOT_ARENA_BYTES: usize = 4 << 20;
 
 /// A boot `seed` of entries added in bursts, each followed by its
 /// seconds, and stopped: the keys it added.
@@ -342,11 +385,8 @@ fn boot_of(
     seed: u32,
     bursts: &[(u64, u32)],
 ) -> Result<(BTreeSet<Digest>, Stopped), String> {
-    // The records of its segments move to an arena of its own, as a boot's
-    // do outside the heap, so merges read them from there.
-    let mut arena = vec![0u8; BOOT_ARENA_BYTES];
-    let mut file: File<'_> = load(&disk.bytes.clone(), u64::MAX);
-    file.arena = Arena::new(&mut arena);
+    // Its segments' records stay in the file, which merges read.
+    let file: File<'_> = load_holding(&disk.bytes.clone(), u64::MAX, true);
     let mut run = Run::new(file, seed);
     let mut added = BTreeSet::new();
     for &(seconds, count) in bursts {
@@ -355,6 +395,30 @@ fn boot_of(
     }
     let stopped = run.stop(disk)?;
     Ok((added, stopped))
+}
+
+#[test]
+fn boots_that_hold_only_indexes_merge_their_segments_from_the_file() {
+    let mut disk = Disk::new(FILE_BYTES);
+    let mut all = BTreeSet::new();
+    let mut merges = 0;
+    for boot in 0..8 {
+        let file = load_holding(&disk.bytes.clone(), u64::MAX, true);
+        assert!(file.segments.iter().all(|segment| !segment.in_memory()));
+        let mut run = Run::new(file, boot + 1);
+        for (seconds, count) in [(30, 200), (100, 50), (200, 10)] {
+            all.extend(run.boot.add(count));
+            run.run(&mut disk, seconds).unwrap();
+        }
+        let stopped = run.stop(&mut disk).unwrap();
+        merges += run.writer.stats().merges;
+        assert!(stopped.segments < MAX_SEGMENTS, "boot {boot}");
+        assert_eq!(keys(&disk.bytes), all, "boot {boot}");
+    }
+    // Every boot read its pack on demand, and merges ran from the file, so
+    // it never ran out of slots.
+    assert!(merges >= 2, "{merges}");
+    assert!(load(&disk.bytes, u64::MAX).segments.len() < MAX_SEGMENTS);
 }
 
 #[test]
@@ -643,9 +707,10 @@ fn a_filling_heap_sheds_the_stores_entries_and_then_lets_the_segments_go() {
     run.run(&mut disk, 1).unwrap();
     assert!(!run.boot.shedding);
 
-    // Entries keep coming with room to spare: the segments laid out grow to
-    // their share of the heap, then the store sheds; they never pass it by
-    // more than the segment that reached it.
+    // Entries keep coming with room to spare: the segments' indexes (and
+    // those waiting for room, whole) grow to their share of the heap, then
+    // the store sheds; they never pass it by more than the segment that
+    // reached it.
     run.boot.filler = HEAP / 4;
     let cap = HEAP / RESIDENT_SHARE;
     let mut most = 0;
@@ -694,9 +759,7 @@ fn a_first_boots_records_all_reach_the_file_while_the_heap_holds_their_index_alo
     const ENTRY: usize = 8 << 10;
     let mut disk = Disk::new(DATA_START + 50_000 * journal::ALIGN);
     disk.track = false;
-    let mut arena = vec![0u8; 72 << 20];
-    let mut file: File<'_> = load(&disk.bytes.clone(), u64::MAX);
-    file.arena = Arena::new(&mut arena);
+    let file: File<'_> = load(&disk.bytes.clone(), u64::MAX);
     let mut run = Run::new(file, 1);
     run.boot.heap_total = HEAP;
     run.boot.filler = HEAP / 2;
@@ -718,13 +781,11 @@ fn a_first_boots_records_all_reach_the_file_while_the_heap_holds_their_index_alo
         "{:?}",
         run.events
     );
-    // Written, every record moved to the arena; the heap held at most a
-    // pressed segment not yet moved, and keeps the indexes alone.
-    let (used, _) = run.writer.arena();
-    assert!(used >= 6600 * ENTRY as u64, "{used}");
+    // Written, every record stays in the file; the heap held at most a
+    // pressed segment being written, and keeps the indexes alone.
     let segment = run.boot.bound as u64 * (ENTRY as u64 + 512);
-    // About a segment and a half: the one being written, and what of the
-    // one before has not moved yet.
+    // About a segment and a half: the one being written, and the batch
+    // held for the next.
     assert!(
         run.resident_peak <= 2 * segment && run.resident_peak < HEAP / RESIDENT_SHARE,
         "{} over {}",
@@ -756,46 +817,251 @@ fn layout_of(first: u32, records: u32, offset: u16, bytes: usize) -> Layout<'sta
     Layout::new(&translator, records)
 }
 
+/// `layouts` written one after another into a file of their own: the
+/// file, and each as a segment left in it.
+fn filed(layouts: &[Layout<'static>]) -> (Vec<u8>, Vec<Segment<'static>>) {
+    let mut file = vec![0u8; 4096];
+    let mut segments = Vec::new();
+    for layout in layouts {
+        let at = file.len() as u64;
+        file.extend(layout.to_vec());
+        file.resize(file.len().next_multiple_of(4096), 0);
+        let index: &'static [u8] = Vec::leak(layout.prefix().to_vec());
+        let pack = Pack::index_only(index, &translator_id()).unwrap();
+        segments.push(Segment::at(pack, at));
+    }
+    (file, segments)
+}
+
+/// A merge carried out with its reads served from `file`, each read
+/// failing after `fail_after` reads: the merge's layout and the reads.
+fn merge_from(
+    segments: Vec<Segment<'static>>,
+    file: &[u8],
+    bound: u64,
+    fail_after: Option<u64>,
+) -> (Option<Merged<'static>>, u64) {
+    let mut merge = Merge::new(translator_id(), segments, Vec::new(), bound);
+    let mut disk = Disk::new(0);
+    disk.bytes = file.to_vec();
+    disk.fail_after = fail_after;
+    let mut steps = 0;
+    while !merge.step(STEP_WORK) {
+        disk.serve(merge.reads());
+        steps += 1;
+        assert!(steps < 1_000_000, "a merge that never ends");
+    }
+    let failed = merge.failed();
+    let reads = disk.reads;
+    let merged = merge.finish();
+    assert_eq!(merged.is_none(), failed);
+    (merged, reads)
+}
+
+/// The bytes a merge's layout writes, its records in the file read from
+/// `file` as the writer's window reads them.
+fn streamed_bytes(layout: Layout<'static>, file: &[u8]) -> Vec<u8> {
+    let layout = Arc::new(layout);
+    let streamed = Streamed::new(layout.clone());
+    let mut out = vec![0u8; layout.bytes() as usize];
+    for offset in (0..layout.bytes()).step_by(PIECE_BYTES as usize) {
+        let bytes = PIECE_BYTES.min(layout.bytes() - offset);
+        let reads: Vec<(u64, Vec<u8>)> = layout
+            .file_runs(offset, bytes)
+            .into_iter()
+            .map(|(at, length, into)| (into, file[at as usize..(at + length) as usize].to_vec()))
+            .collect();
+        streamed.fill(offset, bytes, &reads);
+        journal::Source::read_at(
+            &streamed,
+            offset,
+            &mut out[offset as usize..(offset + bytes) as usize],
+        );
+    }
+    out
+}
+
 #[test]
-fn a_merge_of_segments_moved_to_the_arena_equals_one_of_them_in_the_heap() {
+fn a_merge_of_segments_in_the_file_equals_one_of_them_in_memory() {
     // Two segments sharing a third of their keys, those records holding
     // entries at other offsets: the merge keeps one and merges the shared.
     let translator = translator_id();
     let older = || layout_of(0, 300, 0, 3000);
     let newer = || layout_of(200, 300, 64, 2000);
-    let merge = |segments: Vec<Segment<'_>>| {
-        Merge::new(translator, segments, Vec::new(), u64::MAX)
-            .finish()
-            .layout
-            .to_vec()
-    };
-    let in_heap = merge(vec![
-        Segment::Laid(Arc::new(older())),
-        Segment::Laid(Arc::new(newer())),
-    ]);
-    let mut bytes = vec![0u8; 4 << 20];
-    let mut arena = Arena::new(&mut bytes);
-    let mut settled = Vec::new();
-    for mut layout in [older(), newer()] {
-        let before = layout.to_vec();
-        let owned = layout.owned();
-        while layout.settle(&mut arena, 64 << 10) == crate::translations::pack::Settled::More {}
-        assert!(layout.settled());
-        assert_eq!(layout.to_vec(), before);
-        assert!(layout.owned() < owned / 20, "{} of {owned}", layout.owned());
-        settled.push(Segment::Laid(Arc::new(layout)));
-    }
-    assert!(arena.used() >= 300 * (3000 + 2000), "{}", arena.used());
-    assert_eq!(merge(settled), in_heap);
-    // A full arena keeps the rest in the heap.
-    let mut small = [0u8; 10_000];
-    let mut layout = older();
-    assert_eq!(
-        layout.settle(&mut Arena::new(&mut small), usize::MAX),
-        crate::translations::pack::Settled::Full
+    let in_memory = Merge::new(
+        translator,
+        vec![
+            Segment::Laid(Arc::new(older())),
+            Segment::Laid(Arc::new(newer())),
+        ],
+        Vec::new(),
+        u64::MAX,
+    )
+    .finish()
+    .unwrap()
+    .layout
+    .to_vec();
+    let (file, segments) = filed(&[older(), newer()]);
+    let (merged, reads) = merge_from(segments, &file, u64::MAX, None);
+    let merged = merged.unwrap();
+    assert_eq!(merged.invalid, 0);
+    // The kept records stay in the file until written: the layout holds
+    // its index and the records merged anew alone.
+    assert!(merged.layout.streamed());
+    assert!(
+        merged.layout.owned() < 500 * 2000,
+        "{}",
+        merged.layout.owned()
     );
-    assert!(!layout.settled());
-    assert_eq!(layout.to_vec(), older().to_vec());
+    // Shared records read to merge, the rest read in runs to check them.
+    assert!((100..=400).contains(&reads), "{reads}");
+    assert_eq!(streamed_bytes(merged.layout, &file), in_memory);
+}
+
+/// A record in the file that does not decode whole is left out of the
+/// merge, counted invalid; a read that fails ends the merge, which lays
+/// nothing out.
+#[test]
+fn a_merge_from_the_file_leaves_out_a_damaged_record_and_stops_at_a_failed_read() {
+    let older = layout_of(0, 300, 0, 3000);
+    let newer = layout_of(200, 300, 64, 2000);
+    let (mut file, segments) = filed(&[older.clone(), newer.clone()]);
+    // Damage a record only the older holds, and one both hold.
+    let Segment::Filed { at: older_at, .. } = segments[0] else {
+        unreachable!("filed");
+    };
+    let only = Digest::of(&5u32.to_le_bytes());
+    let shared = Digest::of(&250u32.to_le_bytes());
+    let index = Pack::index_only(older.prefix(), &translator_id()).unwrap();
+    for key in [only, shared] {
+        let (offset, bytes) = index.locate(&key).unwrap();
+        file[(older_at + offset + bytes / 2) as usize] ^= 0x55;
+    }
+    let (merged, _) = merge_from(segments.clone(), &file, u64::MAX, None);
+    let merged = merged.unwrap();
+    assert_eq!(merged.invalid, 2);
+    let bytes = streamed_bytes(merged.layout, &file);
+    let pack = Pack::parse(&bytes, &translator_id()).unwrap();
+    // The damaged record held by one segment alone is gone; the shared one
+    // keeps the newer segment's entries.
+    assert!(pack.get(&only).is_none());
+    assert_eq!(pack.records(), 500 - 1);
+    let record = Record::decode(pack.get(&shared).unwrap(), &translator_id(), &shared).unwrap();
+    assert_eq!(record.entries().len(), 1);
+    // Any read failing ends the merge.
+    for fail_after in [0, 3, 50] {
+        let (merged, reads) = merge_from(segments.clone(), &file, u64::MAX, Some(fail_after));
+        assert!(merged.is_none(), "{fail_after}");
+        assert!(reads > fail_after);
+    }
+}
+
+/// A boot writes nothing where the segments its store reads lie, even once
+/// a merge replaced them, while the file has room elsewhere; when it has
+/// none, it says so once (the store then reads them no more) and keeps
+/// every record.
+#[test]
+fn a_boot_writes_beside_the_segments_its_store_reads_while_the_file_has_room() {
+    let mut retired = 0;
+    'sizes: for blocks in [4096u64, 64, 32, 24, 20, 18, 16, 14, 12] {
+        let mut disk = Disk::new(DATA_START + blocks * journal::ALIGN);
+        let mut all = BTreeSet::new();
+        for boot in 0..MERGE_AT as u32 {
+            // A file too small for the boots before is no case.
+            let Ok((added, stopped)) = boot_of(&mut disk, boot + 1, &[(30, 60)]) else {
+                continue 'sizes;
+            };
+            if stopped.lost != 0 {
+                continue 'sizes;
+            }
+            all.extend(added);
+        }
+        if keys(&disk.bytes) != all {
+            continue;
+        }
+        let file = load_holding(&disk.bytes.clone(), u64::MAX, true);
+        let spans: Vec<(u64, u64)> = file
+            .committed
+            .iter()
+            .flat_map(|commit| commit.entries.iter())
+            .filter(|entry| entry.kind == SEGMENT_BLOB)
+            .map(|entry| (entry.offset, entry.offset + entry.length))
+            .collect();
+        disk.writes.clear();
+        let mut run = Run::new(file, 9);
+        for _ in 0..4 {
+            all.extend(run.boot.add(60));
+            run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
+        }
+        let retire = run
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Retired))
+            .count();
+        assert!(retire <= 1, "{blocks}: {:?}", run.events);
+        assert!(run.writer.stats().merges >= 1, "{blocks}: {:?}", run.events);
+        let overlaps = disk.writes.iter().any(|&(at, bytes)| {
+            spans
+                .iter()
+                .any(|&(start, end)| at < end && start < at + bytes)
+        });
+        assert_eq!(overlaps, retire == 1, "{blocks}: {:?}", run.events);
+        retired += retire;
+        let stopped = run.stop(&mut disk).unwrap();
+        let kept = keys(&disk.bytes);
+        let events: Vec<_> = run
+            .events
+            .iter()
+            .filter(|event| !matches!(event, Event::Segment { .. }))
+            .collect();
+        // What the merges' bounds (their share of a small file) left out
+        // is all that is missing.
+        let evicted: u64 = run
+            .events
+            .iter()
+            .map(|event| match event {
+                Event::Merged { evicted, .. } => *evicted,
+                _ => 0,
+            })
+            .sum();
+        assert!(kept.is_subset(&all), "{blocks}");
+        assert!(
+            (all.len() - kept.len()) as u64 <= evicted,
+            "{blocks}: {} of {} {stopped:?} {events:?}",
+            kept.len(),
+            all.len()
+        );
+    }
+    assert!(retired >= 1);
+}
+
+/// A boot whose merge's read fails keeps the file's content, says so once,
+/// merges no more, and still writes its segments.
+#[test]
+fn a_failed_read_leaves_the_file_as_it_was_and_the_boot_writes_on() {
+    let mut disk = Disk::new(FILE_BYTES);
+    let mut all = BTreeSet::new();
+    for boot in 0..MERGE_AT as u32 {
+        let (added, _) = boot_of(&mut disk, boot + 1, &[(30, 100)]).unwrap();
+        all.extend(added);
+    }
+    let before = keys(&disk.bytes);
+    assert_eq!(before, all);
+    disk.reads = 0;
+    disk.fail_after = Some(1);
+    let file = load_holding(&disk.bytes.clone(), u64::MAX, true);
+    let mut run = Run::new(file, 9);
+    all.extend(run.boot.add(100));
+    run.run(&mut disk, 3 * FIRST_DELTA_SECONDS).unwrap();
+    let abandoned = run
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::Abandoned { .. }))
+        .count();
+    assert_eq!(abandoned, 1, "{:?}", run.events);
+    assert_eq!(run.writer.stats().merges, 0);
+    run.stop(&mut disk).unwrap();
+    assert_eq!(keys(&disk.bytes), all);
 }
 
 #[test]
@@ -816,12 +1082,8 @@ fn boots_reading_their_pack_whole_converge_on_the_code_they_use() {
     disk.track = false;
     for boot in 1..=5u32 {
         let file = load(&disk.bytes.clone(), limit);
-        let read: BTreeSet<Digest> = file
-            .segments
-            .iter()
-            .flat_map(|pack| pack.iter().map(|(key, _)| key).collect::<Vec<_>>())
-            .collect();
-        let pack: u64 = file.segments.iter().map(|pack| pack.bytes() as u64).sum();
+        let read: BTreeSet<Digest> = file.segments.iter().flat_map(Segment::keys).collect();
+        let pack: u64 = file.segments.iter().map(Segment::bytes).sum();
         // The loader reads all of it within the limit: no trim.
         assert!(
             pack <= limit / 8 * LEFT_EIGHTHS,
@@ -848,9 +1110,6 @@ fn boots_reading_their_pack_whole_converge_on_the_code_they_use() {
             .copied()
             .filter(|&page| !read.contains(&page_key(page)))
             .collect();
-        let mut arena = vec![0u8; limit as usize];
-        let mut file: File<'_> = file;
-        file.arena = Arena::new(&mut arena);
         let mut run = Run::new(file, boot);
         run.boot.found = found.clone();
         run.boot.entry_bytes = ENTRY;
@@ -873,7 +1132,7 @@ fn boots_reading_their_pack_whole_converge_on_the_code_they_use() {
         // within its share of the limit.
         assert!(kept.is_superset(&used_keys), "boot {boot}");
         let left = load(&disk.bytes.clone(), limit);
-        let left: u64 = left.segments.iter().map(|pack| pack.bytes() as u64).sum();
+        let left: u64 = left.segments.iter().map(Segment::bytes).sum();
         assert!(left <= limit / 8 * LEFT_EIGHTHS, "boot {boot}: left {left}");
         // Records of pages it used never went while others stayed.
         let evicted_used = found.iter().any(|key| !kept.contains(key));
@@ -916,9 +1175,7 @@ fn a_first_boot_leaves_at_most_its_share_of_the_limit_and_sheds_the_rest() {
     let limit = 1000 * record_bytes;
     let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
     disk.track = false;
-    let mut arena = vec![0u8; limit as usize];
-    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
-    file.arena = Arena::new(&mut arena);
+    let file: File<'_> = load(&disk.bytes.clone(), limit);
     let mut run = Run::new(file, 1);
     run.boot.entry_bytes = ENTRY;
     run.boot.bound = 200;
@@ -930,7 +1187,7 @@ fn a_first_boot_leaves_at_most_its_share_of_the_limit_and_sheds_the_rest() {
     run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
     run.stop(&mut disk).unwrap();
     let left = load(&disk.bytes.clone(), limit);
-    let left: u64 = left.segments.iter().map(|pack| pack.bytes() as u64).sum();
+    let left: u64 = left.segments.iter().map(Segment::bytes).sum();
     assert!(left <= limit / 8 * LEFT_EIGHTHS, "{left} of {limit}");
     assert!(left > limit / 2, "{left} of {limit}");
     assert!(run.boot.shed > 0);
@@ -950,16 +1207,77 @@ fn a_first_boot_leaves_at_most_its_share_of_the_limit_and_sheds_the_rest() {
     assert_eq!(pack_sheds, 1, "{:?}", run.events);
 }
 
+/// A pack read on demand grows to its file, not to the RAM: its limit is
+/// the file's data area less the share a full merge writes beside it.
+#[test]
+fn a_pack_read_on_demand_is_bounded_by_its_file_and_a_merges_room() {
+    let file = 2u64 << 30;
+    let data = file - DATA_START;
+    let limit = demand_limit(file);
+    assert_eq!(limit, data - data / 8 * MERGED_SHARE);
+    // A boot leaves at most 6/8 of it and a full merge keeps 4/8: within
+    // the half of the file past which a full merge runs, and the share
+    // its segment may take.
+    assert!(limit / 8 * LEFT_EIGHTHS <= data / 2);
+    assert!(limit / 8 * KEPT_EIGHTHS <= data / 8 * MERGED_SHARE);
+    assert_eq!(demand_limit(0), 0);
+    // An 8 GiB host's budget holds the indexes of millions of records.
+    assert_eq!(
+        resident_records(496 << 20),
+        (496 << 20) / crate::translations::pack::RESIDENT_RECORD_BYTES
+    );
+}
+
+/// The records whose indexes the RAM holds bound a pack read on demand as
+/// its bytes do: the store sheds once the pack reaches them.
+#[test]
+fn a_pack_sheds_at_the_records_its_ram_holds_the_indexes_of() {
+    const ENTRY: usize = 4 << 10;
+    let record_bytes = {
+        let mut record = Record::new(translator_id(), page_key(0));
+        record.insert(entry(0, 0, ENTRY));
+        record.encode().len() as u64 + 56
+    };
+    let limit = 1000 * record_bytes;
+    let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
+    disk.track = false;
+    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
+    file.records = 300;
+    let mut run = Run::new(file, 1);
+    run.boot.entry_bytes = ENTRY;
+    run.boot.bound = 200;
+    for _ in 0..24 {
+        run.boot.add(50);
+        run.run(&mut disk, 2).unwrap();
+    }
+    run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
+    run.stop(&mut disk).unwrap();
+    let left = load(&disk.bytes.clone(), limit);
+    let records: usize = left.segments.iter().map(Segment::records).sum();
+    // Within the bound and what one look's batch adds past it.
+    assert!(records <= 300 + 50, "{records}");
+    assert!(records >= 300 - 300 / 16, "{records}");
+    let left: u64 = left.segments.iter().map(Segment::bytes).sum();
+    assert!(left < limit / 2, "{left} of {limit}");
+    assert!(run.boot.shed > 0);
+    assert!(run.events.iter().any(|event| matches!(
+        event,
+        Event::Shed {
+            reason: ShedReason::Pack,
+            ..
+        }
+    )));
+}
+
 /// A second boot of 300 of the 600 pages the first left, each given
 /// `phases` more entries of `entry_bytes` (`grow`) or its first again
-/// (else), in an
-/// arena of the limit less the pack read, as a boot's: the events, the
-/// writer's stats, the arena bytes used, and the keys the file keeps.
+/// (else), its pack read on demand: the events, the writer's stats, and
+/// the keys the file keeps.
 fn boot_over_pack(
     grow: bool,
     phases: u16,
     entry_bytes: usize,
-) -> (Vec<Event>, Stats, u64, BTreeSet<Digest>, Vec<Digest>) {
+) -> (Vec<Event>, Stats, BTreeSet<Digest>, Vec<Digest>) {
     const ENTRY: usize = 4 << 10;
     let record_bytes = {
         let mut record = Record::new(translator_id(), page_key(0));
@@ -970,9 +1288,7 @@ fn boot_over_pack(
     let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
     disk.track = false;
     // The first boot leaves 600 pages.
-    let mut arena = vec![0u8; limit as usize];
-    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
-    file.arena = Arena::new(&mut arena);
+    let file: File<'_> = load(&disk.bytes.clone(), limit);
     let mut run = Run::new(file, 1);
     run.boot.entry_bytes = ENTRY;
     run.boot.bound = 200;
@@ -986,12 +1302,9 @@ fn boot_over_pack(
     run.stop(&mut disk).unwrap();
     drop(run);
     // The second uses 300 of them and compiles each anew.
-    let file = load(&disk.bytes.clone(), limit);
-    let read: u64 = file.segments.iter().map(|pack| pack.bytes() as u64).sum();
+    let file = load_holding(&disk.bytes.clone(), limit, true);
+    let read: u64 = file.segments.iter().map(Segment::bytes).sum();
     assert!(read > limit / 2, "{read} of {limit}");
-    let mut arena = vec![0u8; (limit - read) as usize];
-    let mut file: File<'_> = file;
-    file.arena = Arena::new(&mut arena);
     let mut run = Run::new(file, 2);
     let used: Vec<Digest> = (0..300).map(page_key).collect();
     run.boot.found = used.clone();
@@ -1006,10 +1319,9 @@ fn boot_over_pack(
         });
     }
     run.run(&mut disk, 3 * FIRST_DELTA_SECONDS).unwrap();
-    let (arena_used, _) = run.writer.arena();
     let stats = run.writer.stats();
     run.stop(&mut disk).unwrap();
-    (run.events, stats, arena_used, keys(&disk.bytes), used)
+    (run.events, stats, keys(&disk.bytes), used)
 }
 
 /// Offer pages 0 to 300 again, an entry each, 50 every two seconds.
@@ -1031,11 +1343,10 @@ fn compile_again(
 }
 
 /// A boot that compiles pages of the pack it read anew merges their
-/// records anew: the arena, the limit less the pack read, takes back what
-/// the merged records left behind and sheds nothing.
+/// records anew from the file and sheds nothing.
 #[test]
-fn records_merged_anew_leave_the_arena_room_once_compacted() {
-    let (events, stats, _, kept, used) = boot_over_pack(true, 3, 1024);
+fn records_merged_anew_from_the_file_shed_nothing() {
+    let (events, stats, kept, used) = boot_over_pack(true, 3, 1024);
     assert!(
         events
             .iter()
@@ -1048,7 +1359,7 @@ fn records_merged_anew_leave_the_arena_room_once_compacted() {
             .any(|event| matches!(event, Event::Shed { .. })),
         "{events:?}"
     );
-    assert!(stats.compactions > 0 && stats.compacted > 0, "{stats:?}");
+    assert!(stats.file_reads > 0 && stats.abandoned == 0, "{stats:?}");
     assert!(used.iter().all(|key| kept.contains(key)));
 }
 
@@ -1056,7 +1367,7 @@ fn records_merged_anew_leave_the_arena_room_once_compacted() {
 /// holder's bytes: compiled again the same, nothing is copied.
 #[test]
 fn a_merge_copies_no_record_a_holder_already_has() {
-    let (events, stats, arena_used, kept, used) = boot_over_pack(false, 1, 4);
+    let (events, stats, kept, used) = boot_over_pack(false, 1, 4);
     assert!(
         events
             .iter()
@@ -1069,8 +1380,7 @@ fn a_merge_copies_no_record_a_holder_already_has() {
             .any(|event| matches!(event, Event::Shed { .. })),
         "{events:?}"
     );
-    // Only the boot's segments moved to the arena, each record once.
-    assert!(arena_used <= stats.delta_bytes, "{arena_used} {stats:?}");
+    assert_eq!(stats.abandoned, 0, "{stats:?}");
     assert!(
         used.iter().all(|key| kept.contains(key)),
         "{} of {} kept, {} in all {events:?}",
@@ -1078,141 +1388,6 @@ fn a_merge_copies_no_record_a_holder_already_has() {
         used.len(),
         kept.len()
     );
-}
-
-/// Compacted, the arena holds the records the layouts given keep, at its
-/// front and the same bytes, and gives back those of the rest.
-#[test]
-fn a_compacted_arena_keeps_the_records_of_the_layouts_given() {
-    use crate::translations::pack::Settled;
-    let mut bytes = vec![0u8; 4 << 20];
-    let mut arena = Arena::new(&mut bytes);
-    let mut layouts: Vec<_> = (0..3)
-        .map(|index| {
-            let mut layout =
-                layout_of(index * 1000, 200, index as u16, 1000 + 500 * index as usize);
-            while layout.settle(&mut arena, usize::MAX) == Settled::More {}
-            assert!(layout.settled());
-            layout
-        })
-        .collect();
-    let gone = layouts.remove(1);
-    let before: Vec<_> = layouts.iter().map(Layout::to_vec).collect();
-    let used = arena.used();
-    drop(gone);
-    let mut held: Vec<&mut Layout<'_>> = layouts.iter_mut().collect();
-    // SAFETY: these layouts hold every slice of the arena still in use.
-    let given = unsafe { arena.compact(&mut held) };
-    assert!(given > 200 * 1500 && given < used, "{given} of {used}");
-    assert_eq!(arena.used(), used - given);
-    assert_eq!(
-        layouts.iter().map(Layout::to_vec).collect::<Vec<_>>(),
-        before
-    );
-    // The room given back holds new records, the kept ones unchanged.
-    let mut next = layout_of(5000, 200, 9, 1500);
-    let expected = next.to_vec();
-    while next.settle(&mut arena, usize::MAX) == Settled::More {}
-    assert!(next.settled());
-    assert_eq!(next.to_vec(), expected);
-    assert_eq!(
-        layouts.iter().map(Layout::to_vec).collect::<Vec<_>>(),
-        before
-    );
-}
-
-/// A compaction a few records a step reads every layout whole between its
-/// steps, those that share records too, and leaves the arena as compact as
-/// one at once.
-#[test]
-fn a_compaction_in_steps_keeps_every_layout_whole_between_them() {
-    use crate::translations::pack::{Compaction, Settled};
-    let mut bytes = vec![0u8; 4 << 20];
-    let mut arena = Arena::new(&mut bytes);
-    let mut layouts: Vec<_> = (0..4)
-        .map(|index| {
-            let mut layout = layout_of(index * 1000, 200, index as u16, 700 + 300 * index as usize);
-            while layout.settle(&mut arena, usize::MAX) == Settled::More {}
-            layout
-        })
-        .collect();
-    // A merge's layout of a segment written and still held shares its
-    // records; one let go leaves its records behind.
-    layouts.push(layouts[2].clone());
-    drop(layouts.remove(1));
-    let before: Vec<_> = layouts.iter().map(Layout::to_vec).collect();
-    let used = arena.used();
-    let mut compaction = Compaction::new();
-    let mut steps = 0;
-    let given = loop {
-        let mut held: Vec<&mut Layout<'_>> = layouts.iter_mut().collect();
-        // Each step's time is up at its first look.
-        // SAFETY: these layouts hold every slice of the arena in use, and
-        // nothing else changes them between the steps.
-        let given = unsafe { compaction.step(&mut arena, &mut held, &mut || true) };
-        steps += 1;
-        assert_eq!(
-            layouts.iter().map(Layout::to_vec).collect::<Vec<_>>(),
-            before,
-            "step {steps}"
-        );
-        if let Some(given) = given {
-            break given;
-        }
-    };
-    assert!(steps > 20, "{steps}");
-    assert!(given > 200 * 1000 && given < used, "{given} of {used}");
-    assert_eq!(arena.used(), used - given);
-    // Compacted again at once, it has nothing left to give back.
-    let mut held: Vec<&mut Layout<'_>> = layouts.iter_mut().collect();
-    // SAFETY: as above.
-    assert_eq!(unsafe { arena.compact(&mut held) }, 0);
-    // The room given back holds new records, the kept ones unchanged.
-    let mut next = layout_of(5000, 200, 9, 1500);
-    let expected = next.to_vec();
-    while next.settle(&mut arena, usize::MAX) == Settled::More {}
-    assert_eq!(next.to_vec(), expected);
-    assert_eq!(
-        layouts.iter().map(Layout::to_vec).collect::<Vec<_>>(),
-        before
-    );
-}
-
-/// Batches held apart lay out the segment their join lays out: a page
-/// several hold keeps the older batch's entry where two have one.
-#[test]
-fn a_segment_of_batches_held_apart_is_one_of_their_join() {
-    let translator = translator_id();
-    let batch = |pages: core::ops::Range<u32>, offset: u16, fill: u8| {
-        pages
-            .map(|page| {
-                let key = page_key(page);
-                let mut record = Record::new(translator, key);
-                record.insert(entry(offset, fill, 64));
-                record.insert(entry(200, fill, 32));
-                (key, record)
-            })
-            .collect::<BTreeMap<Digest, Record>>()
-    };
-    let batches = || vec![batch(0..40, 0, 1), batch(20..60, 8, 2), batch(30..50, 0, 3)];
-    let mut joined = BTreeMap::new();
-    for batch in batches() {
-        for (key, record) in batch {
-            match joined.entry(key) {
-                alloc::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(record);
-                }
-                alloc::collections::btree_map::Entry::Occupied(mut slot) => {
-                    let held: &mut Record = slot.get_mut();
-                    held.merge(record);
-                }
-            }
-        }
-    }
-    let apart = Delta::of(translator, batches()).finish().unwrap();
-    let whole = Delta::new(translator, joined).finish().unwrap();
-    assert_eq!(apart.records(), 60);
-    assert_eq!(apart.to_vec(), whole.to_vec());
 }
 
 /// Batch after batch that presses while a write waits joins the batch held,
@@ -1245,43 +1420,6 @@ fn batches_that_press_through_a_long_wait_join_the_batch_held() {
     }
 }
 
-/// An arena too small for the boot's records sheds nothing: once full, it
-/// says so once and the rest stay in the heap, within the heap's rules.
-#[test]
-fn a_full_arena_leaves_the_rest_in_the_heap_and_sheds_nothing() {
-    let mut disk = Disk::new(FILE_BYTES);
-    let mut arena = vec![0u8; 64 << 10];
-    let mut file: File<'_> = load(&disk.bytes.clone(), u64::MAX);
-    file.arena = Arena::new(&mut arena);
-    let mut run = Run::new(file, 1);
-    run.boot.heap_total = 1 << 30;
-    run.boot.entry_bytes = 1 << 10;
-    run.boot.bound = 400;
-    let mut added = BTreeSet::new();
-    for _ in 0..6 {
-        added.extend(run.boot.add(200));
-        run.run(&mut disk, 2).unwrap();
-    }
-    run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
-    let full = run
-        .events
-        .iter()
-        .filter(|event| matches!(event, Event::ArenaFull { .. }))
-        .count();
-    assert_eq!(full, 1, "{:?}", run.events);
-    assert!(
-        !run.events
-            .iter()
-            .any(|event| matches!(event, Event::Shed { .. })),
-        "{:?}",
-        run.events
-    );
-    assert_eq!(run.boot.shed, 0);
-    assert!(run.writer.resident() > 0);
-    run.stop(&mut disk).unwrap();
-    assert_eq!(keys(&disk.bytes), added);
-}
-
 /// A boot over a pack of an earlier boot's 600 pages that uses 100 of them
 /// and compiles 400 new ones, allowed `refills` full merges once its pack
 /// reaches its share: the new pages, used pages, unused earlier pages and
@@ -1296,9 +1434,7 @@ fn boot_compiling_past_its_share(refills: u8) -> (usize, usize, usize, u64) {
     let limit = 1000 * record_bytes;
     let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
     disk.track = false;
-    let mut arena = vec![0u8; limit as usize];
-    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
-    file.arena = Arena::new(&mut arena);
+    let file: File<'_> = load(&disk.bytes.clone(), limit);
     let mut run = Run::new(file, 1);
     run.boot.entry_bytes = ENTRY;
     run.boot.bound = 200;
@@ -1311,11 +1447,7 @@ fn boot_compiling_past_its_share(refills: u8) -> (usize, usize, usize, u64) {
     run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
     run.stop(&mut disk).unwrap();
     drop(run);
-    let file = load(&disk.bytes.clone(), limit);
-    let read: u64 = file.segments.iter().map(|pack| pack.bytes() as u64).sum();
-    let mut arena = vec![0u8; (limit - read) as usize];
-    let mut file: File<'_> = file;
-    file.arena = Arena::new(&mut arena);
+    let file = load_holding(&disk.bytes.clone(), limit, true);
     let mut run = Run::new(file, 2);
     run.writer.refills = refills;
     run.boot.found = (0..100).map(page_key).collect();
@@ -1336,7 +1468,7 @@ fn boot_compiling_past_its_share(refills: u8) -> (usize, usize, usize, u64) {
         pages.filter(|&page| kept.contains(&page_key(page))).count()
     };
     let left = load(&disk.bytes.clone(), limit);
-    let left: u64 = left.segments.iter().map(|pack| pack.bytes() as u64).sum();
+    let left: u64 = left.segments.iter().map(Segment::bytes).sum();
     assert!(left <= limit / 8 * LEFT_EIGHTHS, "left {left} of {limit}");
     (
         kept_of(&mut fresh.iter().copied()),
@@ -1392,9 +1524,7 @@ fn second_boot_over_a_full_pack() -> SecondBoot {
     let limit = 1000 * record_bytes;
     let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
     disk.track = false;
-    let mut arena = vec![0u8; limit as usize];
-    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
-    file.arena = Arena::new(&mut arena);
+    let file: File<'_> = load(&disk.bytes.clone(), limit);
     let mut run = Run::new(file, 1);
     run.boot.entry_bytes = ENTRY;
     run.boot.bound = 200;
@@ -1407,11 +1537,7 @@ fn second_boot_over_a_full_pack() -> SecondBoot {
     run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
     run.stop(&mut disk).unwrap();
     drop(run);
-    let file = load(&disk.bytes.clone(), limit);
-    let read: u64 = file.segments.iter().map(|pack| pack.bytes() as u64).sum();
-    let mut arena = vec![0u8; (limit - read) as usize];
-    let mut file: File<'_> = file;
-    file.arena = Arena::new(&mut arena);
+    let file = load_holding(&disk.bytes.clone(), limit, true);
     let mut run = Run::new(file, 2);
     run.boot.entry_bytes = ENTRY;
     run.boot.bound = 200;
@@ -1501,4 +1627,44 @@ fn a_second_boot_over_a_full_pack_keeps_the_code_it_uses() {
     assert_eq!(refills, usize::from(FULL_REFILLS), "{:?}", boot.events);
     assert_eq!(boot.unused.0, 0, "{boot:?}");
     assert!(boot.new.0 + boot.used.0 >= 700, "{boot:?}");
+}
+
+/// The longest step of a merge from the file and what it read: two
+/// segments of 15 000 records of 4 KiB sharing a third of their keys, each
+/// step [`STEP_WORK`] units with the reads served between steps.
+/// `cargo test -p stela-engine --lib --release merge_from_the_file_step_costs -- --ignored --nocapture`
+#[test]
+#[ignore = "manual: opt-in"]
+fn merge_from_the_file_step_costs() {
+    let (file, segments) = filed(&[
+        layout_of(0, 15_000, 0, 4096),
+        layout_of(10_000, 15_000, 64, 4096),
+    ]);
+    let mut merge = Merge::new(translator_id(), segments, Vec::new(), u64::MAX);
+    let mut disk = Disk::new(0);
+    disk.bytes = file;
+    let (mut steps, mut longest, mut total) = (0u64, 0u128, 0u128);
+    loop {
+        let started = std::time::Instant::now();
+        let done = merge.step(STEP_WORK);
+        let took = started.elapsed().as_micros();
+        longest = longest.max(took);
+        total += took;
+        steps += 1;
+        if done {
+            break;
+        }
+        disk.serve(merge.reads());
+    }
+    let reads = (merge.reads().reads, merge.reads().bytes >> 20);
+    let merged = merge.finish().unwrap();
+    std::println!(
+        "MERGE records={} bytes={}M steps={steps} longest_us={longest} total_ms={} reads={} read_mb={} invalid={}",
+        merged.layout.records(),
+        merged.layout.bytes() >> 20,
+        total / 1000,
+        reads.0,
+        reads.1,
+        merged.invalid
+    );
 }

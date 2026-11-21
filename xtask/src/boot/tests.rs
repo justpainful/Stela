@@ -449,3 +449,22 @@ fn a_shipped_image_never_takes_the_memory_cap() {
     let refused = vram_cap(true, true).unwrap_err().to_string();
     assert!(refused.starts_with("STELA_VRAM_CAP_MIB holds"), "{refused}");
 }
+
+/// The target features take only general-register x86-64 features, and add
+/// them to the UEFI target's rustflags through Cargo's `--config`.
+#[test]
+fn target_features_take_general_register_features_only() {
+    assert_eq!(target_features(None).unwrap(), None);
+    assert_eq!(target_features(Some(" ")).unwrap(), None);
+    assert_eq!(
+        target_features(Some("+popcnt,+bmi2")).unwrap(),
+        Some([
+            "--config".to_owned(),
+            "target.x86_64-unknown-uefi.rustflags=['-C', 'target-feature=+popcnt,+bmi2']"
+                .to_owned()
+        ])
+    );
+    for refused in ["+avx2", "popcnt", "+popcnt,-bmi2", "+sse4.2", "+popcnt;x"] {
+        assert!(target_features(Some(refused)).is_err(), "{refused}");
+    }
+}

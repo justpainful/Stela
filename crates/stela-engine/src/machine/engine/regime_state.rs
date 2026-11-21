@@ -146,6 +146,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.floating_point = None;
         self.memory_checks = None;
         self.native_system = None;
+        self.variant_memo = None;
         self.debug = None;
     }
 
@@ -267,6 +268,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub fn set_regions(&mut self, on: bool) {
         self.regions = on;
         self.native_system = None;
+        self.variant_memo = None;
     }
 
     /// Run self-loops inside their blocks ([`NativeSystem::self_loops`]),
@@ -276,6 +278,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub fn set_self_loops(&mut self, on: bool) {
         self.self_loops = on;
         self.native_system = None;
+        self.variant_memo = None;
     }
 
     pub(super) fn sync_regime(&mut self) {

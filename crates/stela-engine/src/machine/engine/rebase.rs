@@ -24,7 +24,11 @@
 //! context digest names every compile input, so a rewritten frame hashes to
 //! another key and never reaches an entry of its old bytes; entries of
 //! content no frame holds any more leave with the bound. Memory is bounded:
-//! when full, the oldest keys go first.
+//! when full, the oldest keys go first, but a kept entry used since its
+//! last turn gets one more (a clock): a hit sets a bit, and moves nothing.
+//! The map orders keys by their digests' first eight bytes, and a slot
+//! holds its whole key: a slot whose key differs is another block's.
+use super::recovery::StoredOrigin;
 use crate::platform::sync::Mutex;
 use crate::translations::{Digest, Entry};
 use alloc::{
@@ -42,12 +46,29 @@ pub(super) const BOUND: usize = 1 << 20;
 const PARTS: usize = 8;
 
 type Key = (Digest, u16, Digest);
+/// A key's place in the map: its digests' first eight bytes.
+type Short = (u64, u16, u64);
+
+fn short((key, offset, context): &Key) -> Short {
+    let first = |digest: &Digest| u64::from_le_bytes(digest.0[..8].try_into().expect("8 bytes"));
+    (first(key), *offset, first(context))
+}
 
 /// What a key, its slot and its place in the order cost, apart from a
-/// kept entry's buffers.
-const KEY_BYTES: usize = 2 * core::mem::size_of::<(Key, Slot, u64)>()
-    + core::mem::size_of::<(Key, u64)>()
+/// kept entry's buffers: a map node's share and the order's place.
+const KEY_BYTES: usize = 2 * core::mem::size_of::<(Short, Held)>()
+    + core::mem::size_of::<Short>()
     + 4 * core::mem::size_of::<usize>();
+
+/// A slot, its whole key, and whether it served since the clock passed it;
+/// for a kept entry, the origin its last install made
+/// ([`Rebases::originate`]).
+struct Held {
+    key: Key,
+    slot: Slot,
+    used: bool,
+    origin: Option<Arc<StoredOrigin>>,
+}
 
 #[derive(Clone)]
 enum Slot {
@@ -63,7 +84,7 @@ impl Slot {
     fn bytes(&self) -> usize {
         KEY_BYTES
             + match self {
-                Self::Kept(entry) => entry.retained_bytes(),
+                Self::Kept(entry) => entry.retained_bytes() + core::mem::size_of::<StoredOrigin>(),
                 _ => 0,
             }
     }
@@ -71,72 +92,80 @@ impl Slot {
 
 #[derive(Default)]
 struct Part {
-    slots: BTreeMap<Key, (Slot, u64)>,
-    /// Keys in the order they were kept, with the stamp they were kept at:
-    /// a key kept again later has a newer stamp, and its older place is
-    /// skipped.
-    order: VecDeque<(Key, u64)>,
+    slots: BTreeMap<Short, Held>,
+    /// Each slot's place once, oldest first: the clock's hand is the front.
+    order: VecDeque<Short>,
     bytes: usize,
-    stamp: u64,
 }
 
 impl Part {
+    /// The slot of `key`, if the map holds it.
+    fn get(&mut self, key: &Key) -> Option<&mut Held> {
+        self.slots
+            .get_mut(&short(key))
+            .filter(|held| held.key == *key)
+    }
+
     fn put(&mut self, key: Key, slot: Slot, bound: usize) {
         let bytes = slot.bytes();
         if bytes > bound {
             return;
         }
-        if let Some((old, _)) = self.slots.remove(&key) {
-            self.bytes -= old.bytes();
-        }
-        while self.bytes + bytes > bound {
-            let Some((oldest, stamp)) = self.order.pop_front() else {
-                break;
+        let at = short(&key);
+        // A key kept again keeps its place; another key at its place is
+        // replaced.
+        if let Some(held) = self.slots.get_mut(&at) {
+            self.bytes -= held.slot.bytes();
+            *held = Held {
+                key,
+                slot,
+                used: false,
+                origin: None,
             };
-            if self
-                .slots
-                .get(&oldest)
-                .is_some_and(|(_, kept)| *kept == stamp)
-                && let Some((gone, _)) = self.slots.remove(&oldest)
-            {
-                self.bytes -= gone.bytes();
-            }
+            self.bytes += bytes;
+            self.evict(bound, Some(at));
+            return;
         }
-        self.compact();
-        self.stamp += 1;
-        self.order.push_back((key, self.stamp));
-        self.slots.insert(key, (slot, self.stamp));
+        self.evict(bound.saturating_sub(bytes), None);
+        self.order.push_back(at);
+        self.slots.insert(
+            at,
+            Held {
+                key,
+                slot,
+                used: false,
+                origin: None,
+            },
+        );
         self.bytes += bytes;
     }
 
-    /// Move `key`, which is kept, to the newest end of the order: an entry
-    /// that keeps serving stays while those not used go.
-    fn touch(&mut self, key: &Key) {
-        self.compact();
-        self.stamp += 1;
-        let stamp = self.stamp;
-        if let Some((_, kept)) = self.slots.get_mut(key) {
-            *kept = stamp;
-            self.order.push_back((*key, stamp));
-        }
-    }
-
-    /// Drop the places of keys kept or used again since: they stay until
-    /// they come up, at most about one more per key, which its charge
-    /// covers.
-    fn compact(&mut self) {
-        if self.order.len() > 2 * self.slots.len() + 16 {
-            let slots = &self.slots;
-            self.order
-                .retain(|(key, stamp)| slots.get(key).is_some_and(|(_, kept)| kept == stamp));
+    /// Let the oldest slots go until the part holds `bound` bytes or less,
+    /// all but `keep`: one used since the hand passed it is passed again.
+    /// Two turns at most, as each pass clears what it passes.
+    fn evict(&mut self, bound: usize, keep: Option<Short>) {
+        let mut passes = 2 * self.order.len();
+        while self.bytes > bound && passes != 0 {
+            passes -= 1;
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            let held = self.slots.get_mut(&oldest).expect("an ordered slot");
+            if held.used || keep == Some(oldest) {
+                held.used = false;
+                self.order.push_back(oldest);
+                continue;
+            }
+            let gone = self.slots.remove(&oldest).expect("an ordered slot");
+            self.bytes -= gone.slot.bytes();
         }
     }
 }
 
 /// What a fetch does with a block the store keys.
 pub(super) enum Found {
-    /// Relocate this entry.
-    Entry(Arc<Entry>),
+    /// Relocate this entry, with the origin its last install made.
+    Entry(Arc<Entry>, Option<Arc<StoredOrigin>>),
     /// Compile it, then keep its stored form ([`Rebases::keep`]): it was
     /// compiled at another PC before.
     Keep,
@@ -212,13 +241,20 @@ impl Rebases {
     ) -> Found {
         let slot = (*key, offset, *context);
         let mut part = self.part(key);
-        match part.slots.get(&slot) {
-            Some((Slot::Kept(entry), _)) => {
-                let entry = Arc::clone(entry);
-                part.touch(&slot);
-                Found::Entry(entry)
+        match part.get(&slot) {
+            Some(Held {
+                slot: Slot::Kept(entry),
+                used,
+                origin,
+                ..
+            }) => {
+                *used = true;
+                Found::Entry(Arc::clone(entry), origin.clone())
             }
-            Some((Slot::Seen(seen), _)) if *seen != pc || again => Found::Keep,
+            Some(Held {
+                slot: Slot::Seen(seen),
+                ..
+            }) if *seen != pc || again => Found::Keep,
             Some(_) => Found::Compile,
             None => {
                 let bound = self.bound();
@@ -243,6 +279,25 @@ impl Rebases {
         };
         self.part(key)
             .put((*key, offset, *context), slot, self.bound());
+    }
+
+    /// Keep `origin` with the entry of `key`, `offset` and `context` it
+    /// names, for the next install at its page: one allocation per page,
+    /// not per install.
+    pub(super) fn originate(
+        &self,
+        key: &Digest,
+        offset: u16,
+        context: &Digest,
+        origin: &Arc<StoredOrigin>,
+    ) {
+        let mut part = self.part(key);
+        if let Some(held) = part.get(&(*key, offset, *context))
+            && let (Slot::Kept(entry), Some(kept)) = (&held.slot, &origin.kept)
+            && Arc::ptr_eq(entry, kept)
+        {
+            held.origin = Some(Arc::clone(origin));
+        }
     }
 
     /// Count an install relocated from a kept entry.
@@ -282,7 +337,7 @@ mod tests {
             relocations: alloc::vec![],
             source_map: alloc::vec![(offset, 0)],
             exits: alloc::vec![],
-            recovery: alloc::vec![],
+            recovery: Default::default(),
         }
     }
 
@@ -307,7 +362,7 @@ mod tests {
         for pc in [0x1008, 0x5008, 0x9008] {
             assert!(matches!(
                 rebases.look(&key, 8, &context, pc, false),
-                Found::Entry(_)
+                Found::Entry(..)
             ));
         }
         // Another context or offset is another block.
@@ -350,13 +405,53 @@ mod tests {
         rebases.keep(&key, 16, &context, Some(entry(16, 64)));
         assert!(matches!(
             rebases.look(&key, 16, &context, 0x2010, false),
-            Found::Entry(_)
+            Found::Entry(..)
         ));
         // Never seen before, and taken away already (its ghost is older than
         // the store's note of it): kept at once.
         assert!(matches!(
             rebases.look(&key, 32, &context, 0x2020, true),
             Found::Keep
+        ));
+    }
+
+    /// An install keeps its origin with the entry, and the next look hands
+    /// it over; an origin of another entry is not kept, and a slot kept
+    /// again starts without one.
+    #[test]
+    fn a_kept_entry_hands_over_the_origin_its_last_install_made() {
+        let rebases = Rebases::new(BOUND);
+        let (key, context) = (Digest([6; 32]), Digest([7; 32]));
+        let _ = rebases.look(&key, 8, &context, 0x1008, false);
+        rebases.keep(&key, 8, &context, Some(entry(8, 64)));
+        let Found::Entry(kept, None) = rebases.look(&key, 8, &context, 0x5008, false) else {
+            panic!("a kept entry without an origin yet")
+        };
+        let preparation = Arc::new(super::super::fetch_costs::system_preparation());
+        let origin = |entry: Arc<Entry>| {
+            Arc::new(StoredOrigin {
+                key,
+                context,
+                page: 0x5000,
+                preparation: preparation.clone(),
+                kept: Some(entry),
+            })
+        };
+        rebases.originate(&key, 8, &context, &origin(Arc::new(entry(8, 64))));
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x5008, false),
+            Found::Entry(_, None)
+        ));
+        let made = origin(kept);
+        rebases.originate(&key, 8, &context, &made);
+        let Found::Entry(_, Some(handed)) = rebases.look(&key, 8, &context, 0x5008, false) else {
+            panic!("the origin kept")
+        };
+        assert!(Arc::ptr_eq(&handed, &made));
+        rebases.keep(&key, 8, &context, Some(entry(8, 64)));
+        assert!(matches!(
+            rebases.look(&key, 8, &context, 0x5008, false),
+            Found::Entry(_, None)
         ));
     }
 
@@ -399,7 +494,7 @@ mod tests {
         }
         assert!(matches!(
             rebases.look(&key(39), 0, &context, 0, false),
-            Found::Entry(_)
+            Found::Entry(..)
         ));
         assert!(matches!(
             rebases.look(&key(0), 0, &context, 0, false),
@@ -409,7 +504,7 @@ mod tests {
         for n in 40..80 {
             assert!(matches!(
                 rebases.look(&key(38), 0, &context, 0, false),
-                Found::Entry(_)
+                Found::Entry(..)
             ));
             rebases.keep(&key(n), 0, &context, Some(entry(0, 256)));
         }
@@ -423,6 +518,6 @@ mod tests {
             let _ = rebases.look(&key(79), 0, &context, 0, false);
         }
         let part = rebases.part(&key(0));
-        assert!(part.order.len() <= 2 * part.slots.len() + 17);
+        assert_eq!(part.order.len(), part.slots.len());
     }
 }

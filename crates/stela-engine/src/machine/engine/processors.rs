@@ -207,6 +207,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 floating_point: &mut self.floating_point,
                 memory_checks: &mut self.memory_checks,
                 native_system: &mut self.native_system,
+                variant_memo: &mut self.variant_memo,
                 debug: &mut self.debug,
                 pointer: &mut self.pointer,
                 mirrors: &mut self.mirrors,
@@ -750,6 +751,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         self.device_lines = device_lines;
         *self.mirrors = incoming.mirrors;
+        // Contexts may have gone while it was parked, with nothing moving
+        // its entries' generation.
+        self.mirrors.table_switch.forget();
         self.mirrors.transition(self.mirror_state());
     }
 

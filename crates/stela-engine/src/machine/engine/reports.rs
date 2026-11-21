@@ -667,6 +667,10 @@ pub struct Statistics {
     /// Fetch pages read again whose known key the store held no record
     /// for: not looked up again.
     pub known_absent: u64,
+    /// Fetch pages whose record the store was reading at their lookup,
+    /// and the lookups again of such pages at later fetches in them.
+    pub awaited_pages: u64,
+    pub awaited_lookups: u64,
     /// Blocks offered to the store while memory was low.
     pub offered_low: u64,
     /// Fetches whose page the store held a record for that gave no block:
@@ -693,6 +697,9 @@ pub struct Statistics {
     /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
     /// (`x86_64::transition`) and `transitions::miss` reason.
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
+    /// Why TTBR0 writes that change the register took the engine path, by
+    /// `table_switches::miss` reason.
+    pub switch_misses: [u64; super::table_switches::miss::REASONS],
     /// Why runs ended at a branch-kind exit, by kind (fallthrough, direct,
     /// indirect, call, return) and [`BranchMiss`] reason; the last slot
     /// counts those of each kind whose run made a native transition.
@@ -729,8 +736,10 @@ pub struct Statistics {
     /// everything.
     pub tlb_maintenance: u64,
     pub scoped_maintenance: u64,
-    /// TTBR0 writes, which drop the lower half's.
+    /// TTBR0 writes, which drop the lower half's, and those native code
+    /// completed (`x86_64::table_switch`).
     pub table_base_changes: u64,
+    pub native_table_switches: u64,
     /// Guest context changes at which the host isolated its branch
     /// predictions ([`PredictionContext`]).
     pub prediction_isolations: u64,
@@ -859,6 +868,8 @@ impl core::ops::AddAssign for Statistics {
             page_ticks,
             known_keys,
             known_absent,
+            awaited_pages,
+            awaited_lookups,
             offered_low,
             record_misses,
             shared_ticks,
@@ -870,6 +881,7 @@ impl core::ops::AddAssign for Statistics {
             native_transitions,
             engine_transitions,
             transition_misses,
+            switch_misses,
             branch_misses,
             line_queries,
             line_ticks,
@@ -893,6 +905,7 @@ impl core::ops::AddAssign for Statistics {
             tlb_maintenance,
             scoped_maintenance,
             table_base_changes,
+            native_table_switches,
             prediction_isolations,
             translated_pages,
             tagged_pages,
@@ -958,6 +971,9 @@ impl core::ops::AddAssign for Statistics {
             .iter_mut()
             .zip(transition_misses.as_flattened())
         {
+            *total += count;
+        }
+        for (total, count) in self.switch_misses.iter_mut().zip(switch_misses) {
             *total += count;
         }
         for (total, count) in self
@@ -1039,6 +1055,8 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.page_ticks, page_ticks),
             (&mut self.known_keys, known_keys),
             (&mut self.known_absent, known_absent),
+            (&mut self.awaited_pages, awaited_pages),
+            (&mut self.awaited_lookups, awaited_lookups),
             (&mut self.offered_low, offered_low),
             (&mut self.shared_ticks, shared_ticks),
             (&mut self.install_ticks, install_ticks),
@@ -1063,6 +1081,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.tlb_maintenance, tlb_maintenance),
             (&mut self.scoped_maintenance, scoped_maintenance),
             (&mut self.table_base_changes, table_base_changes),
+            (&mut self.native_table_switches, native_table_switches),
             (&mut self.prediction_isolations, prediction_isolations),
             (&mut self.translated_pages, translated_pages),
             (&mut self.tagged_pages, tagged_pages),
@@ -1196,6 +1215,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The footprint from a finished walk: the parts its walk summed and the
     /// index and table sizes, which take the board's lock once.
     pub fn footprint_finish(&self, walk: &FootprintWalk) -> Footprint {
+        let index = self
+            .code
+            .every_page(super::board::LockSite::Report)
+            .heap_bytes();
         let cache = self.code.cache_at(super::board::LockSite::Report);
         Footprint {
             blocks: self.code.blocks.heap_bytes(),
@@ -1203,7 +1226,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             owners: 0,
             successors: walk.successors,
             rows: walk.rows,
-            index: cache.index.heap_bytes(),
+            index,
             lookup: cache.targets.index_bytes() + self.itlb.index_bytes(),
             pages: (self.pages.len() + self.spare_pages.len()) * crate::translations::PAGE_BYTES,
         }

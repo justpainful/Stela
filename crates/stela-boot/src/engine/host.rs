@@ -10,14 +10,15 @@
 //! same views while tag checks keep Tagged memory out (`Regime::tag_checks`),
 //! filled on demand by the #PF handler from the software walk of the
 //! guest's tables, a window of the guest leaf per fault. The views keep
-//! their roots of a few values of SPRR_PERM_EL0, SPRR_PERM_EL1 and E0PD1
-//! (`Bank`). Each half
-//! takes its tables from its own part of the pool, so a change of TTBR0
-//! alone (a context switch) detaches the lower half and keeps the upper
-//! half's, and records the leaves it was filled from
-//! (`mmu::shadow::Extents`), so a TLBI unmaps only the ranges it reaches.
-//! The detached lower halves of a few recent TTBR0s stay in their frames
-//! (`mmu::shadow::Kept`), and a switch back attaches its half again.
+//! Each half takes its tables from its own part of the pool and records the
+//! leaves it was filled from (`mmu::shadow::Extents`), so a TLBI unmaps
+//! only the ranges it reaches. The roots come in sets (`Set`), one per
+//! lower half's context (TTBR0 and TCR's lower fields) and rights
+//! (SPRR_PERM_EL0, SPRR_PERM_EL1 and E0PD1): a set holds its context's
+//! lower tables, and the sets of one rights value share the upper half's.
+//! A context switch, by the engine or natively (`x86_64::table_switch`),
+//! loads another set's root and rewrites none, so each set's views keep
+//! their PCIDs' translations.
 //!
 //! With SMAP, EL1's two views share EL1's root, as they differ only in what
 //! PAN takes away, which is all data access or none: a leaf that PAN guards
@@ -34,6 +35,7 @@ use crate::{
 use alloc::{sync::Arc, vec::Vec};
 use core::arch::{asm, global_asm};
 use stela_boot_core::native_resources::{CodeExtents, MAX_CODE_PARTS, code_part_bytes};
+use stela_compiler::x86_64::table_switch;
 use stela_compiler::{GuestState, block::BlockExit};
 use stela_contracts::refuse;
 use stela_engine::machine::FaultCause;
@@ -52,7 +54,6 @@ use stela_engine::machine::mmu::Outcome;
 use stela_engine::machine::mmu::placement::Placement;
 use stela_engine::machine::mmu::shadow;
 use stela_engine::machine::mmu::shadow::Extents;
-use stela_engine::machine::mmu::shadow::Kept;
 use stela_engine::machine::mmu::tlbi::Everywhere;
 use stela_engine::machine::mmu::tlbi::Reach;
 use stela_engine::machine::mmu::translated::Tlb;
@@ -246,30 +247,36 @@ fn differing(from: &mmu::Controls, to: &mmu::Controls) -> [bool; FIELDS] {
 }
 
 /// What decides the views' rights besides the guest's tables and the
-/// controls a bank shares: SPRR_PERM_EL0, SPRR_PERM_EL1 and the E0PD1 bit
+/// controls every set shares: SPRR_PERM_EL0, SPRR_PERM_EL1 and the E0PD1 bit
 /// of TCR ([`USER_TCR`]), which faults EL0's accesses to the upper half.
 type Rights = (u64, u64, u64);
-/// The [`Rights`] whose roots the shadow keeps besides the current ones
-/// ([`Bank`]).
-const BANKS: usize = 6;
+/// What selects a lower half's context: TTBR0 and TCR's lower fields
+/// ([`LOWER_TCR`]).
+type LowerKey = (u64, u64);
 
-/// The roots the shadow filled under other [`Rights`], everything else as
-/// it is now: a guest that alternates a few values, as XNU does around its
-/// writes to protected data and between threads' EL0 permissions, and the
-/// restore kernel with E0PD1, finds each one's tables again instead of
-/// filling them anew and leaving the old ones taken. Every reset and unmap
-/// reaches them as it does the current roots.
-#[derive(Clone, Copy)]
-struct Bank {
-    /// Their rights, `None` while the roots are empty.
-    rights: Option<Rights>,
-    roots: [u64; ROOTS],
-    /// When it was last the current bank, for replacement.
+/// One set of roots: a view's each, for one lower half's context and one
+/// [`Rights`] value, everything else as the current controls say (a change
+/// of any other control empties every set). XNU switches between a few
+/// processes' TTBR0s and the kernel's, around its writes to protected data
+/// between SPRR_PERM_EL1 values and between threads' EL0 permissions, and
+/// the restore kernel toggles E0PD1: each finds its set's tables again
+/// instead of filling them anew, and its views' PCIDs their translations.
+/// Set `s`'s view `v` root is the permanent frame `s * ROOTS + v` after the
+/// host root, loaded in PCID [`root_context`] of that index.
+struct Set {
+    /// The context and rights it holds, `None` while it is free.
+    key: Option<(LowerKey, Rights)>,
+    /// Its lower half's leaves and the root entries its views may hold of
+    /// it, while it is not the current set: the current set's are
+    /// [`State::extents`]`[LOWER]` and [`State::lower_used`].
+    extents: Extents,
+    lower_used: [u64; ROOT_ENTRIES / 64],
+    /// When it was last the current set, for replacement.
     used: u64,
 }
 const ROOTS: usize = 2 * VIEWS;
-const SHADOW_ROOTS: usize = ROOTS * (BANKS + 1);
-const _: () = assert!(SHADOW_ROOTS <= u64::BITS as usize);
+const _: () = assert!(ROOTS == table_switch::SET_ROOTS);
+const SETS: usize = table_switch::SETS;
 
 /// Root `view`'s TLB context while PCIDE is set.
 /// Set in a [`State::native_view`] word, with the view in bits 7:0 and the
@@ -302,24 +309,25 @@ fn view_of(regime: &Regime) -> usize {
     view + if regime.tag_checked() { VIEWS } else { 0 }
 }
 
-const fn view_context(view: usize) -> u64 {
-    view as u64 + 2
+/// The PCID of root `index` (a set's first view's index plus the view).
+const fn root_context(index: usize) -> u64 {
+    table_switch::FIRST_CONTEXT + index as u64
 }
 
 /// Every PCID a root loads in while PCIDE is set: the host root's 0, the
-/// loader root's 1 (`storage::TaggedRoots`) and the views'.
-pub(crate) const CONTEXTS: u64 = view_context(ROOTS);
+/// loader root's 1 (`storage::TaggedRoots`) and every set's views'.
+pub(crate) const CONTEXTS: u64 = root_context(SETS * ROOTS);
 
 /// What the views' TLB contexts hold. With a context of its own, a change of
-/// view keeps its own translations of the engine, the translated code and
-/// the guest, which no mapping marks global. An invalidation reaches the
-/// other contexts through INVPCID, or else marks them to flush when loaded.
+/// view or of set keeps its own translations of the engine, the translated
+/// code and the guest, which no mapping marks global. An invalidation
+/// reaches the current set's other contexts through INVPCID, or else marks
+/// them to flush when loaded, as it marks other sets'
+/// ([`table_switch::Sets::stale`]).
 struct Contexts {
     /// PCIDE is set ([`tag_views`]). Kept here because a hypervisor may
     /// intercept every CR4 read, and views change at each exception.
     tagged: bool,
-    /// May hold what was invalidated since; so is one never loaded.
-    stale: [bool; ROOTS],
     invpcid: bool,
     /// CR4.SMAP is set, and RFLAGS.AC stands for PAN ([`tag_views`]).
     pan_flag: bool,
@@ -332,6 +340,7 @@ pub(super) fn tag_views(tagged: bool, pan_flag: bool) {
     if let Some(state) = local::installed() {
         state.contexts.tagged = tagged;
         state.contexts.pan_flag = pan_flag;
+        state.native_sets.tagged = u64::from(tagged);
     }
 }
 
@@ -366,39 +375,9 @@ pub(super) fn views_tagged() -> Option<bool> {
     local::installed().map(|state| state.contexts.tagged)
 }
 
-impl Contexts {
-    /// Drop `page`, which root `current` may translate, from every context.
-    fn forget(&mut self, page: u64, current: usize) {
-        invlpg(page);
-        for view in 0..ROOTS {
-            if view != current {
-                self.forget_inactive(page, view);
-            }
-        }
-    }
-
-    /// Drop a page from one inactive view, whose context can be retained
-    /// across CR3 loads only while tagged and fresh.
-    fn forget_inactive(&mut self, page: u64, view: usize) {
-        if !self.tagged || self.stale[view] {
-            return;
-        }
-        if self.invpcid {
-            let descriptor = [view_context(view), page];
-            // SAFETY: a valid single-address INVPCID of an inactive PCID.
-            unsafe {
-                asm!("invpcid {}, [{}]", in(reg) 0u64, in(reg) &descriptor,
-                    options(nostack, preserves_flags))
-            };
-        } else {
-            self.stale[view] = true;
-        }
-    }
-}
-/// Frames reserved for roots and other permanent tables.
-const PERMANENT_FRAMES: u64 = 64;
-// The current roots and the banks', and the host root.
-const _: () = assert!(ROOTS * (1 + BANKS) < PERMANENT_FRAMES as usize);
+/// Frames reserved for roots: the host root, then every set's.
+const PERMANENT_FRAMES: u64 = stela_boot_core::native_resources::SHADOW_PERMANENT_FRAMES;
+const _: () = assert!(PERMANENT_FRAMES == (1 + SETS * ROOTS) as u64);
 /// A root's entries.
 const ROOT_ENTRIES: usize = 512;
 /// log2 of the bytes a four-level root entry maps: 512 GiB.
@@ -418,6 +397,9 @@ const HISTORY_BITS: u32 = 12;
 const ABANDONED: usize = 3;
 /// Pages a scoped invalidation flushes one by one; more reload CR3.
 const INVLPG_PAGES: u64 = 16;
+/// The INVPCIDs a TLBI by address of the upper half spends on other sets'
+/// views, which share its tables, before it marks the rest stale.
+const OTHER_SET_INVPCIDS: usize = 64;
 const FAULT_KIND: u64 = 0xffff;
 pub(crate) const COUNTER_HZ: u64 = 24_000_000;
 
@@ -527,10 +509,17 @@ pub struct State {
     /// Original loader root kept from install, never caller metadata.
     window_root: u64,
     _loader_tables: &'static crate::paging::loader::LoaderTables,
+    /// The current set's roots ([`State::set`]).
     roots: [u64; ROOTS],
-    /// The roots of other SPRR_PERM_EL0 and SPRR_PERM_EL1 pairs.
-    banks: [Bank; BANKS],
-    /// Switches to a bank's roots, and those that found the bank empty.
+    /// Every set, the current one, the uses of sets so far (which order
+    /// them for replacement) and the next class a set may take.
+    sets: Vec<Set>,
+    set: usize,
+    set_uses: u64,
+    next_class: u64,
+    /// The sets as native switches read them, which they move between.
+    native_sets: table_switch::Sets,
+    /// Switches to another [`Rights`] value's set, and those that made it.
     bank_switches: u64,
     bank_misses: u64,
     /// Root loads for a change of view (EL, PAN, GXF or tag checks).
@@ -602,24 +591,26 @@ pub struct State {
     extents: [Extents; 2],
     /// The span of global lower-half leaves other PEs' broadcasts read.
     lower_globals: Option<Arc<GlobalSpan>>,
-    /// The lower halves of other TTBR0 contexts.
-    kept: Kept,
-    /// The lower half's root entries any root may hold, by index: a switch
-    /// of TTBR0 visits these, a few, rather than every entry of the half.
+    /// The lower half's root entries the current set's roots may hold, by
+    /// index: dropping the half visits these, a few, rather than every
+    /// entry of the half.
     lower_used: [u64; ROOT_ENTRIES / 64],
-    /// Physical shadow roots that may hold any lower entry, indexed by
-    /// their permanent pool frame after the host root.
-    lower_roots: u64,
+    /// The upper half's root entries any set's roots may hold.
+    upper_used: [u64; ROOT_ENTRIES / 64],
+    /// The roots' contexts that may hold the translated helper's window
+    /// since its pages last changed, by root index.
+    window_contexts: [u64; (SETS * ROOTS).div_ceil(64)],
     /// Switches of the lower half to another TTBR0, those that found its
-    /// half kept, and the kept halves a TLBI or a bank's replacement
-    /// dropped.
+    /// set holding a half (natively or not), those native code made, and
+    /// the other sets' halves a TLBI or a set's replacement dropped.
     pub lower_switches: u64,
     pub lower_found: u64,
+    pub native_switches: u64,
     pub kept_dropped: u64,
     /// TLBIs that unmapped ranges rather than whole halves.
     pub scoped: u64,
-    /// Kept lower halves whose tables went back to the pool: replaced,
-    /// dropped by a TLBI or given up for a half out of frames.
+    /// Other sets' lower halves whose tables went back to the pool:
+    /// replaced, dropped by a TLBI or given up for a half out of frames.
     pub reclaimed: u64,
     /// Pages a region's first fill since its half was lost mapped again
     /// from the fill history (`shadow_fills`).
@@ -779,19 +770,26 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
         Ok(frame)
     };
     let host_root = root()?;
-    let mut roots = [0; ROOTS];
-    let mut banks = [Bank {
-        rights: None,
-        roots: [0; ROOTS],
-        used: 0,
-    }; BANKS];
-    let shadow_roots = roots
-        .iter_mut()
-        .chain(banks.iter_mut().flat_map(|bank| &mut bank.roots));
-    for (index, slot) in shadow_roots.enumerate() {
-        *slot = root()?;
-        assert_eq!(*slot, host_root + (index as u64 + 1) * PAGE);
+    for index in 0..SETS * ROOTS {
+        let frame = root()?;
+        assert_eq!(frame, host_root + (index as u64 + 1) * PAGE);
     }
+    let sets_base = host_root + PAGE;
+    let roots = core::array::from_fn(|view| sets_base + view as u64 * PAGE);
+    let mut sets = Vec::new();
+    sets.try_reserve_exact(SETS)
+        .map_err(|_| refuse!("root set allocation failed"))?;
+    sets.extend((0..SETS).map(|_| Set {
+        key: None,
+        extents: Extents::new(),
+        lower_used: [0; ROOT_ENTRIES / 64],
+        used: 0,
+    }));
+    let native_sets = table_switch::Sets {
+        base: sets_base,
+        current: sets_base,
+        ..table_switch::Sets::default()
+    };
     load_root(host_root);
     let apic = Apic::new(
         config.apic_base,
@@ -808,13 +806,16 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             window_root: config.window_root,
             _loader_tables: config.loader_tables,
             roots,
-            banks,
+            sets,
+            set: 0,
+            set_uses: 0,
+            next_class: 1,
+            native_sets,
             bank_switches: 0,
             bank_misses: 0,
             view_switches: 0,
             contexts: Contexts {
                 tagged: false,
-                stale: [true; ROOTS],
                 invpcid: crate::native_mmio::shootdown::invpcid(),
                 pan_flag: false,
             },
@@ -864,11 +865,12 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             last_controls: None,
             extents: [Extents::new(), Extents::new()],
             lower_globals: None,
-            kept: Kept::new(),
             lower_used: [0; ROOT_ENTRIES / 64],
-            lower_roots: 0,
+            upper_used: [0; ROOT_ENTRIES / 64],
+            window_contexts: [0; (SETS * ROOTS).div_ceil(64)],
             lower_switches: 0,
             lower_found: 0,
+            native_switches: 0,
             kept_dropped: 0,
             scoped: 0,
             reclaimed: 0,
@@ -948,10 +950,14 @@ pub struct Statistics {
     pub exhausted: u64,
     pub lower_resets: u64,
     /// Switches of the lower half to another TTBR0, those that found its
-    /// half kept, and the kept halves dropped.
+    /// set holding a half, those native code made, and the other sets'
+    /// halves dropped.
     pub lower_switches: u64,
     pub lower_found: u64,
+    pub native_switches: u64,
     pub kept_dropped: u64,
+    /// CR3 loads that flushed a stale view ([`table_switch::Sets::flushes`]).
+    pub flushed_loads: u64,
     /// Whole resets by cause: exhausted frames, SPRR, TTBR0 and other
     /// controls, tag checks, invalidations and TLBIs of everything.
     pub reset_causes: [u64; CAUSES],
@@ -1014,6 +1020,8 @@ pub fn statistics() -> Statistics {
         lower_resets: state.lower_resets,
         lower_switches: state.lower_switches,
         lower_found: state.lower_found,
+        native_switches: state.native_switches,
+        flushed_loads: state.native_sets.flushes,
         kept_dropped: state.kept_dropped,
         reset_causes: state.reset_causes,
         control_fields: state.control_fields,
@@ -1216,16 +1224,20 @@ impl State {
     /// of that ASID alone (Arm `TLBIMatch`), so of the current shadow only
     /// a half that holds a non-global translation goes
     /// (`mmu::shadow::Extents::private`); the kernel's global upper half
-    /// stays.
-    /// Clearing the lower half drops the kept halves too, as their tables
-    /// share its frames.
+    /// stays. Other sets' halves were dropped by their own ASIDs
+    /// ([`State::invalidate_other_sets`]).
     fn drop_non_global(&mut self) {
         let mut cleared = false;
-        for half in [LOWER, UPPER] {
-            if self.extents[half].private() {
-                self.clear(half);
-                cleared = true;
+        if self.extents[LOWER].private() {
+            if let Some((key, _)) = self.sets[self.set].key {
+                self.history.switched(key, key, false);
             }
+            self.drop_lower(self.set);
+            cleared = true;
+        }
+        if self.extents[UPPER].private() {
+            self.clear(UPPER);
+            cleared = true;
         }
         self.tlb.clear();
         if cleared {
@@ -1235,7 +1247,7 @@ impl State {
         }
     }
 
-    /// Drop the lower half's translations only, and the kept halves.
+    /// Drop every set's lower half.
     fn reset_lower(&mut self) {
         self.clear(LOWER);
         self.tlb.clear();
@@ -1243,74 +1255,271 @@ impl State {
         self.reload();
     }
 
-    /// TTBR0 or the lower half's TCR fields changed from `from` to `to`:
-    /// detach the lower half from every root and keep it, and attach the
-    /// half kept for `to`, if any. Return the views the caller must flush.
-    fn switch_lower(&mut self, from: (u64, u64), to: (u64, u64)) -> [bool; ROOTS] {
-        self.lower_switches += 1;
-        // XNU switches thousands of times a second: reuse a list's storage.
-        let mut entries = self.kept.buffer();
-        let mut changed = 0;
-        let lower_roots = core::mem::take(&mut self.lower_roots);
-        for entry in self.lower_entries() {
-            let mut roots = lower_roots;
-            while roots != 0 {
-                let index = roots.trailing_zeros();
-                roots &= roots - 1;
-                let root = self.host_root + (u64::from(index) + 1) * PAGE;
-                // SAFETY: permanent root frames through the physmap.
-                let slot = unsafe { (layout::physical(root) as *mut u64).add(entry) };
-                // SAFETY: as above.
-                let value = unsafe { slot.read() };
-                if value != 0 {
-                    entries.push((root, entry, value));
-                    // SAFETY: as above.
-                    unsafe { slot.write(0) };
-                    changed |= 1 << index;
+    /// Root `view` of set `set`.
+    fn root(&self, set: usize, view: usize) -> u64 {
+        self.host_root + (1 + set * ROOTS + view) as u64 * PAGE
+    }
+
+    /// Entry `entry` of root `root`, through the physmap.
+    fn root_entry(root: u64, entry: usize) -> *mut u64 {
+        // SAFETY: permanent root frames, whose 512 entries the physmap maps.
+        unsafe { (layout::physical(root) as *mut u64).add(entry) }
+    }
+
+    /// Make the set of lower context `key` and `rights` current, from the
+    /// least recently used other set where none holds them; whether the
+    /// current set changed. The caller loads the view.
+    fn select_set(&mut self, key: LowerKey, rights: Rights) -> bool {
+        let wanted = Some((key, rights));
+        let Some((from, from_rights)) = self.sets[self.set].key else {
+            // The first regime: the current set takes it.
+            self.label(self.set, key, rights);
+            return false;
+        };
+        if self.sets[self.set].key == wanted {
+            return false;
+        }
+        let found = self.sets.iter().position(|set| set.key == wanted);
+        let target = match found {
+            Some(target) => target,
+            None => self.make_set(key, rights),
+        };
+        let kept = self.enter_set(target);
+        if from != key {
+            self.lower_switches += 1;
+            self.lower_found += u64::from(kept);
+            self.history.switched(from, key, kept);
+        }
+        if from_rights != rights {
+            self.bank_switches += 1;
+            self.bank_misses += u64::from(found.is_none());
+        }
+        true
+    }
+
+    /// Make set `target` current: the current one keeps its lower half's
+    /// records, `target`'s become the State's. Whether its lower half
+    /// holds anything.
+    fn enter_set(&mut self, target: usize) -> bool {
+        let current = self.set;
+        self.sets[current].extents = core::mem::take(&mut self.extents[LOWER]);
+        self.sets[current].lower_used = self.lower_used;
+        self.extents[LOWER] = core::mem::take(&mut self.sets[target].extents);
+        self.lower_used = self.sets[target].lower_used;
+        self.set = target;
+        self.set_uses += 1;
+        self.sets[target].used = self.set_uses;
+        self.roots = core::array::from_fn(|view| self.root(target, view));
+        self.native_sets.current = self.roots[0];
+        self.lower_used != [0; ROOT_ENTRIES / 64]
+    }
+
+    /// A set for `key` and `rights`: a free one or the least recently used
+    /// other one, whose lower half goes back to the pool, with the upper
+    /// half's entries of another set of `rights`, or none.
+    fn make_set(&mut self, key: LowerKey, rights: Rights) -> usize {
+        let target = (0..SETS)
+            .filter(|&set| set != self.set)
+            .min_by_key(|&set| (self.sets[set].key.is_some(), self.sets[set].used))
+            .expect("more than one set");
+        if self.sets[target].key.is_some() {
+            self.kept_dropped += 1;
+            self.drop_lower(target);
+        }
+        let source = (0..SETS).find(|&set| {
+            set != target && self.sets[set].key.is_some_and(|(_, held)| held == rights)
+        });
+        let upper = self.upper_used;
+        for view in 0..ROOTS {
+            let root = self.root(target, view);
+            let from = source.map(|set| self.root(set, view));
+            for entry in self.used_entries(upper, UPPER) {
+                // SAFETY: entries of permanent roots.
+                let value = from.map_or(0, |from| unsafe { Self::root_entry(from, entry).read() });
+                // SAFETY: as above; the target is no current root.
+                unsafe { Self::root_entry(root, entry).write(value) };
+            }
+        }
+        self.label(target, key, rights);
+        target
+    }
+
+    /// Give set `set` to `key` and `rights`: a new generation, the class
+    /// of the sets that differ from it in TTBR0 alone, and stale views.
+    fn label(&mut self, set: usize, key: LowerKey, rights: Rights) {
+        self.sets[set].key = Some((key, rights));
+        let class = (0..SETS)
+            .filter(|&other| other != set)
+            .find(|&other| {
+                self.sets[other]
+                    .key
+                    .is_some_and(|((_, tcr), held)| held == rights && tcr == key.1)
+            })
+            .map(|other| self.native_sets.classes[other]);
+        self.native_sets.classes[set] = class.unwrap_or_else(|| {
+            let class = self.next_class;
+            self.next_class += 1;
+            class
+        });
+        self.native_sets.generations[set] += 1;
+        self.stale_set(set);
+    }
+
+    /// Set `set`'s views may hold what was removed: each flushes as it
+    /// next loads.
+    fn stale_set(&mut self, set: usize) {
+        self.native_sets.stale[set * ROOTS..(set + 1) * ROOTS].fill(1);
+    }
+
+    /// Every set but the current one ([`State::stale_set`]).
+    fn stale_other_sets(&mut self) {
+        let current = self.set;
+        for set in (0..SETS).filter(|&set| set != current) {
+            self.stale_set(set);
+        }
+    }
+
+    /// Drop `pages`, of the upper half every set may share, from every
+    /// other set's views: those whose context holds anything by INVPCID,
+    /// until [`OTHER_SET_INVPCIDS`] are spent, and the rest flush when
+    /// next loaded.
+    fn forget_other_sets(&mut self, pages: &[u64]) {
+        let mut budget = OTHER_SET_INVPCIDS;
+        let current = self.set;
+        for index in (0..SETS * ROOTS).filter(|index| index / ROOTS != current) {
+            if self.native_sets.stale[index] != 0 {
+                continue;
+            }
+            match budget.checked_sub(pages.len()) {
+                Some(left) if self.contexts.invpcid => {
+                    budget = left;
+                    for &page in pages {
+                        self.forget_inactive(page, index);
+                    }
                 }
+                _ => self.native_sets.stale[index] = 1,
             }
         }
-        self.lower_used = [0; ROOT_ENTRIES / 64];
-        let extents = core::mem::take(&mut self.extents[LOWER]);
-        let kept = self.kept.switch(from, entries, extents, to);
-        self.reclaim_kept();
-        self.history.switched(from, to, kept.is_some());
-        if let Some(half) = kept {
-            self.lower_found += 1;
-            for &(root, entry, value) in &half.entries {
-                // SAFETY: as above; the half's tables are still the pool's.
-                unsafe { (layout::physical(root) as *mut u64).add(entry).write(value) };
-                self.record_lower(root, entry);
-                changed |= self.lower_root_bit(root);
-            }
-            self.extents[LOWER] = half.extents;
-            self.kept.recycle(half.entries);
-        }
-        if changed == 0 {
-            [false; ROOTS]
+    }
+
+    /// Give the lower half's pool back the tables of set `set`'s lower half
+    /// and detach it from the set's roots, whose views are stale after.
+    /// The current set's view must load again before native code runs.
+    fn drop_lower(&mut self, set: usize) {
+        let current = set == self.set;
+        let used = if current {
+            self.extents[LOWER].clear();
+            core::mem::take(&mut self.lower_used)
         } else {
-            // Inactive bank roots have no PCID; selecting a bank flushes it.
-            self.roots
-                .map(|root| changed & self.lower_root_bit(root) != 0)
+            self.sets[set].extents.clear();
+            core::mem::take(&mut self.sets[set].lower_used)
+        };
+        let mut free = core::mem::take(&mut self.pool.free[LOWER]);
+        for view in 0..ROOTS {
+            let root = self.root(set, view);
+            for entry in self.used_entries(used, LOWER) {
+                let slot = Self::root_entry(root, entry);
+                // SAFETY: an entry of a permanent root.
+                let value = unsafe { slot.read() };
+                if value == 0 {
+                    continue;
+                }
+                tables::tables_under(&self.pool, value, &mut |frame| {
+                    // Room for every frame of the half was reserved; a
+                    // frame beyond it would be one given back twice.
+                    if free.len() < free.capacity() {
+                        free.push(frame);
+                    }
+                });
+                // SAFETY: as above.
+                unsafe { slot.write(0) };
+            }
+        }
+        self.pool.free[LOWER] = free;
+        self.reclaimed += 1;
+        self.stale_set(set);
+    }
+
+    /// The least recently used set but the current one whose lower half
+    /// holds anything, for its frames: what a lower half out of frames
+    /// takes before it empties every set's.
+    fn oldest_lower(&self) -> Option<usize> {
+        (0..SETS)
+            .filter(|&set| set != self.set && self.sets[set].lower_used != [0; ROOT_ENTRIES / 64])
+            .min_by_key(|&set| self.sets[set].used)
+    }
+
+    /// Apply a TLBI that removes `everywhere` to every set's lower half but
+    /// the current one's, within `bounds`, under the TCR `tcr` the sets
+    /// share outside the lower half's fields: as `mmu::shadow::Kept` did
+    /// for detached halves. A TLBI by VA of an ASID reaches the global
+    /// pages of a half that may hold no entry of that ASID
+    /// ([`shadow::same_asid`]) and every page at its addresses of one that
+    /// may; the views of a set that lost a page are stale. A half whose
+    /// extents are unknown for the TLBI's addresses, or that a TLBI of
+    /// non-global or all entries reaches, goes.
+    fn invalidate_other_sets(&mut self, everywhere: Everywhere, tcr: u64, bounds: (u64, u64)) {
+        let (reach, asid) = match everywhere {
+            Everywhere::Addresses(reach) => (reach, None),
+            Everywhere::AsidAddresses(reach, asid) => (reach, Some(asid)),
+            Everywhere::NonGlobal(_) | Everywhere::All => (Reach::All, None),
+        };
+        for set in 0..SETS {
+            if set == self.set || self.sets[set].lower_used == [0; ROOT_ENTRIES / 64] {
+                continue;
+            }
+            let Some(((ttbr0, _), _)) = self.sets[set].key else {
+                continue;
+            };
+            let keep = match everywhere {
+                Everywhere::NonGlobal(asid) => {
+                    !(self.sets[set].extents.private() && shadow::same_asid(ttbr0, tcr, asid))
+                }
+                _ => {
+                    let other = asid.is_some_and(|asid| {
+                        self.sets[set].extents.private() && !shadow::same_asid(ttbr0, tcr, asid)
+                    });
+                    let mut ranges = Vec::new();
+                    let extents = &mut self.sets[set].extents;
+                    let kept = if other {
+                        extents.visit_global_ranges(reach, bounds, |first, last| {
+                            ranges.push((first, last));
+                        })
+                    } else {
+                        extents.visit_ranges(reach, bounds, |first, last| {
+                            ranges.push((first, last));
+                        })
+                    };
+                    let mut removed = false;
+                    for (first, last) in ranges {
+                        for view in 0..ROOTS {
+                            self.unmap_walks += 1;
+                            tables::unmap(&self.pool, self.root(set, view), first, last, |_| {
+                                removed = true
+                            });
+                        }
+                    }
+                    if removed {
+                        self.stale_set(set);
+                    }
+                    kept
+                }
+            };
+            if !keep {
+                self.kept_dropped += 1;
+                self.drop_lower(set);
+            }
         }
     }
 
-    fn lower_root_bit(&self, root: u64) -> u64 {
-        let index = (root - self.host_root) / PAGE - 1;
-        debug_assert!(root.is_multiple_of(PAGE) && index < SHADOW_ROOTS as u64);
-        1 << index
-    }
-
-    fn record_lower(&mut self, root: u64, entry: usize) {
-        self.lower_used[entry / 64] |= 1 << (entry % 64);
-        self.lower_roots |= self.lower_root_bit(root);
-    }
-
-    /// The lower half's root entries [`State::lower_used`] names.
-    fn lower_entries(&self) -> impl Iterator<Item = usize> + use<> {
-        let (first, last) = self.half_entries(LOWER);
-        self.lower_used
-            .into_iter()
+    /// The entries `used` names of `half`'s root entries.
+    fn used_entries(
+        &self,
+        used: [u64; ROOT_ENTRIES / 64],
+        half: usize,
+    ) -> impl Iterator<Item = usize> + use<> {
+        let (first, last) = self.half_entries(half);
+        used.into_iter()
             .enumerate()
             .flat_map(|(word, mut bits)| {
                 core::iter::from_fn(move || {
@@ -1322,105 +1531,64 @@ impl State {
             .filter(move |entry| (first..=last).contains(entry))
     }
 
-    /// Drop the kept lower halves; their frames return with the half's.
-    fn drop_kept(&mut self) {
-        self.kept_dropped += self.kept.clear() as u64;
+    /// The current set's root entry `entry` of the lower half may be in use.
+    fn record_lower(&mut self, entry: usize) {
+        self.lower_used[entry / 64] |= 1 << (entry % 64);
     }
 
-    /// Give the lower half back the tables of the kept halves the switches
-    /// replaced or TLBIs dropped. Their root entries were detached, and
-    /// those views flushed, when the switch away from each kept it, so no
-    /// root and no TLB reaches them.
-    fn reclaim_kept(&mut self) {
-        while let Some(half) = self.kept.take_dropped() {
-            self.free_kept(half);
-        }
-    }
-
-    /// Give the lower half back the tables of `half`, a kept half no root
-    /// or kept list holds any more.
-    fn free_kept(&mut self, half: mmu::shadow::KeptHalf) {
-        let mut free = core::mem::take(&mut self.pool.free[LOWER]);
-        for &(_, _, value) in &half.entries {
-            tables::tables_under(&self.pool, value, &mut |frame| {
-                // Room for every frame of the half was reserved; a frame
-                // beyond it would be one given back twice.
-                if free.len() < free.capacity() {
-                    free.push(frame);
-                }
-            });
-        }
-        self.pool.free[LOWER] = free;
-        self.reclaimed += 1;
-        self.kept.recycle(half.entries);
-    }
-
-    /// Take the roots of rights `to` from their bank, leaving those of
-    /// `from` there: a bank of `to`, or else the least recently used,
-    /// emptied. The caller must flush the views.
-    fn switch_bank(&mut self, from: Rights, to: Rights) {
-        self.bank_switches += 1;
-        let index = match self.banks.iter().position(|bank| bank.rights == Some(to)) {
-            Some(index) => index,
-            None => {
-                self.bank_misses += 1;
-                let (index, _) = self
-                    .banks
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, bank)| bank.used)
-                    .expect("banks");
-                for root in self.banks[index].roots {
-                    self.detach(root, LOWER);
-                    self.detach(root, UPPER);
-                }
-                // The kept halves may hold entries of these roots, which
-                // take other rights now.
-                self.drop_kept();
-                self.history.emptied(LOWER);
-                self.history.emptied(UPPER);
-                index
-            }
+    /// A fill made the current set's upper root entry `entry` of root
+    /// `view` `value`: every set of the same rights shares the table.
+    fn share_upper(&mut self, view: usize, entry: usize, value: u64) {
+        self.upper_used[entry / 64] |= 1 << (entry % 64);
+        let Some((_, rights)) = self.sets[self.set].key else {
+            return;
         };
-        let bank = &mut self.banks[index];
-        core::mem::swap(&mut bank.roots, &mut self.roots);
-        bank.rights = Some(from);
-        bank.used = self.bank_switches;
+        for set in 0..SETS {
+            if set != self.set && self.sets[set].key.is_some_and(|(_, held)| held == rights) {
+                // SAFETY: an entry of a permanent root.
+                unsafe { Self::root_entry(self.root(set, view), entry).write(value) };
+            }
+        }
     }
 
-    /// Every root the shadow fills: the current ones and the banks'.
+    /// Every root a set may load.
     fn all_roots(&self) -> impl Iterator<Item = u64> + use<> {
-        let banked = self.banks.map(|bank| bank.roots);
-        self.roots.into_iter().chain(banked.into_iter().flatten())
+        let base = self.host_root + PAGE;
+        (0..(SETS * ROOTS) as u64).map(move |index| base + index * PAGE)
     }
 
-    /// Unmap `half` from every root and free its frames, the kept lower
-    /// halves' too.
+    /// Unmap `half` from every set and free its frames.
     fn clear(&mut self, half: usize) {
         self.pool.reset_half(half);
         self.extents[half].clear();
         self.history.emptied(half);
-        for root in self.all_roots() {
-            self.detach(root, half);
-        }
         if half == LOWER {
-            self.lower_used = [0; ROOT_ENTRIES / 64];
-            self.lower_roots = 0;
-            self.drop_kept();
+            for set in 0..SETS {
+                let used = if set == self.set {
+                    core::mem::take(&mut self.lower_used)
+                } else {
+                    self.sets[set].extents.clear();
+                    core::mem::take(&mut self.sets[set].lower_used)
+                };
+                self.detach(set, used, LOWER);
+            }
+        } else {
+            let used = core::mem::take(&mut self.upper_used);
+            for set in (0..SETS).filter(|&set| self.sets[set].key.is_some() || set == self.set) {
+                self.detach(set, used, UPPER);
+            }
         }
     }
 
-    /// Unmap `half` from `root`, leaving its tables' frames taken.
-    fn detach(&self, root: u64, half: usize) {
-        let write = |entry: usize| {
-            // SAFETY: permanent root frames through the physmap.
-            unsafe { (layout::physical(root) as *mut u64).add(entry).write(0) };
-        };
-        if half == LOWER {
-            self.lower_entries().for_each(write);
-        } else {
-            let (first, last) = self.half_entries(half);
-            (first..=last).for_each(write);
+    /// Unmap the entries `used` names of `half` from set `set`'s roots,
+    /// leaving their tables' frames taken.
+    fn detach(&self, set: usize, used: [u64; ROOT_ENTRIES / 64], half: usize) {
+        for view in 0..ROOTS {
+            let root = self.root(set, view);
+            for entry in self.used_entries(used, half) {
+                // SAFETY: an entry of a permanent root.
+                unsafe { Self::root_entry(root, entry).write(0) };
+            }
         }
     }
 
@@ -1458,9 +1626,21 @@ impl State {
         }
     }
 
-    /// The view and requester a native transition left (`native_view`):
-    /// the walks and the view follow, as the engine's next regime will.
+    /// The index among every set's roots of the current set's root of the
+    /// current view, if there is a view.
+    fn current_index(&self) -> Option<usize> {
+        (self.current < ROOTS).then(|| self.set * ROOTS + self.root_of(self.current))
+    }
+
+    /// What native code left the host: a switch to another set
+    /// ([`table_switch::Sets::switched`]), then the view and requester a
+    /// native transition moved to (`native_view`). The walks and the view
+    /// follow, as the engine's next regime will.
     fn follow_native(&mut self) {
+        let switched = core::mem::take(&mut self.native_sets.switched);
+        if switched != 0 {
+            self.follow_switch(switched as usize - 1);
+        }
         let word = core::mem::take(&mut self.native_view);
         if word & NATIVE_VIEW == 0 {
             return;
@@ -1474,6 +1654,36 @@ impl State {
                 guarded: word >> 11 & 1 != 0,
             };
         }
+    }
+
+    /// Native code switched TTBR0 to set `target`'s context and loaded its
+    /// root (`x86_64::table_switch`), which differs from the current set
+    /// in TTBR0 alone: it becomes current as an engine-path switch makes
+    /// it, and the regime's TTBR0 is its.
+    fn follow_switch(&mut self, target: usize) {
+        if target >= SETS || target == self.set {
+            return;
+        }
+        let from = self.sets[self.set].key;
+        let to = self.sets[target].key;
+        let kept = self.enter_set(target);
+        self.lower_switches += 1;
+        self.lower_found += u64::from(kept);
+        self.native_switches += 1;
+        if let (Some((from, _)), Some((to, _))) = (from, to) {
+            self.history.switched(from, to, kept);
+            if let Some(regime) = &mut self.regime {
+                regime.controls.ttbr0 = to.0;
+            }
+        }
+        // The helper's software TLB keys no TTBR0.
+        self.tlb.clear();
+    }
+
+    /// Whether native switches may load other sets: the upper half's
+    /// translations must not depend on the ASID a switch may change.
+    fn update_open(&mut self) {
+        self.native_sets.open = u64::from(self.regime.is_some() && !self.extents[UPPER].private());
     }
 
     /// PSTATE.PAN is `pan`, as native code set it behind the engine, whose
@@ -1505,31 +1715,82 @@ impl State {
         }
     }
 
-    /// Load root `view` in its context, which keeps what the context holds
-    /// unless it is stale.
+    /// Load the current set's root of `view` in its context, which keeps
+    /// what the context holds unless it is stale.
     fn load_view(&mut self, view: usize) {
-        let view = self.root_of(view);
-        let root = self.roots[view];
+        let root_view = self.root_of(view);
+        let root = self.roots[root_view];
         if !self.contexts.tagged {
             return load_root(root);
         }
-        let stale = core::mem::replace(&mut self.contexts.stale[view], false);
+        let index = self.set * ROOTS + root_view;
+        let stale = core::mem::replace(&mut self.native_sets.stale[index], 0) != 0;
         let keep = if stale {
+            self.native_sets.flushes += 1;
             0
         } else {
             super::storage::KEEP_ENTRIES
         };
-        load_root(root | view_context(view) | keep);
+        load_root(root | root_context(index) | keep);
     }
 
-    /// Flush the TLB of every view: the current root's context now, the
-    /// others' when next loaded.
+    /// Flush the TLB of every view of every set: the current root's context
+    /// now, the others' when next loaded.
     fn reload(&mut self) {
-        self.contexts.stale = [true; ROOTS];
+        self.native_sets.stale.fill(1);
         if self.current < ROOTS {
             self.load_view(self.current);
         } else {
             load_root(self.host_root);
+        }
+    }
+
+    /// Drop a page from root `index`'s context while it is inactive, which
+    /// keeps its translations across CR3 loads only while tagged and fresh.
+    fn forget_inactive(&mut self, page: u64, index: usize) {
+        if !self.contexts.tagged || self.native_sets.stale[index] != 0 {
+            return;
+        }
+        if self.contexts.invpcid {
+            let descriptor = [root_context(index), page];
+            // SAFETY: a valid single-address INVPCID of an inactive PCID.
+            unsafe {
+                asm!("invpcid {}, [{}]", in(reg) 0u64, in(reg) &descriptor,
+                    options(nostack, preserves_flags))
+            };
+        } else {
+            self.native_sets.stale[index] = 1;
+        }
+    }
+
+    /// The loaded root's context may now hold the window's translations
+    /// ([`State::forget_window`]).
+    fn window_used(&mut self) {
+        if let Some(index) = self.current_index() {
+            self.window_contexts[index / 64] |= 1 << (index % 64);
+        }
+    }
+
+    /// Drop `pages` of the window, which every root maps, from every
+    /// context that used the window: the loaded one's now, the others'
+    /// through INVPCID or when next loaded. None holds the window after.
+    fn forget_window(&mut self, pages: [Option<u64>; 2]) {
+        if pages == [None; 2] {
+            return;
+        }
+        let current = self.current_index();
+        let used = core::mem::take(&mut self.window_contexts);
+        for page in pages.into_iter().flatten() {
+            invlpg(page);
+            for (word, mut bits) in used.into_iter().enumerate() {
+                while bits != 0 {
+                    let index = word * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if Some(index) != current {
+                        self.forget_inactive(page, index);
+                    }
+                }
+            }
         }
     }
 }

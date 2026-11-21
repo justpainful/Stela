@@ -51,10 +51,17 @@ enum Rows {
     },
     /// A stored record's entry, whose template and portable rows its first
     /// fault reads and emits again to qualify: replaced by the minted rows.
+    /// A record the store no longer holds in memory (a pack read on demand
+    /// lets records go) is not read at a fault: the entry's admitted input,
+    /// `input_bytes` long and hashing to `input_hash`, is read from guest
+    /// memory again and compiled, which gives the entry's template, as the
+    /// record's context names every compile input.
     Stored {
         origin: Arc<StoredOrigin>,
         code_bytes: u32,
         offset: u16,
+        input_bytes: u16,
+        input_hash: u32,
     },
     /// A template and portable rows in hand, as a record's entry gives them.
     #[cfg(test)]
@@ -201,27 +208,28 @@ impl<'a> Template<'a> {
     /// of tags never grants private/APX admission: that must be derived from an
     /// compiler/profile ABI permit before future eager invocation.
     pub(super) fn portable_requires_unavailable_capture(&self) -> bool {
-        use stela_compiler::block::{
-            RecoveryBinding, RecoverySource, RetirementPhase, RetirementPoint,
-        };
-        let requires = |retirement: RetirementPoint, bindings: &[RecoveryBinding]| {
-            retirement.phase() != RetirementPhase::Before
-                || bindings.iter().any(|binding| match binding.source {
+        use stela_compiler::block::{RecoveryBinding, RecoverySource, RetirementPhase};
+        fn requires(
+            phase: RetirementPhase,
+            mut bindings: impl Iterator<Item = RecoveryBinding>,
+        ) -> bool {
+            phase != RetirementPhase::Before
+                || bindings.any(|binding| match binding.source {
                     RecoverySource::HostRegister(register) => register >= 16,
                     RecoverySource::NativeSpill(_) => true,
                 })
-        };
+        }
         // Rebasing a row moves its PC alone, not its phase or bindings.
         match self {
             Self::Stored { entry, .. } => entry
                 .recovery
                 .iter()
-                .any(|row| requires(row.retirement, &row.bindings)),
+                .any(|row| requires(row.phase, row.bindings())),
             Self::Compiled(emission) => emission
                 .block
                 .fault_recovery
                 .iter()
-                .any(|row| requires(row.retirement, &row.bindings)),
+                .any(|row| requires(row.retirement.phase(), row.bindings.iter().copied())),
         }
     }
     pub(super) fn matches_source(&self, source: &[u8]) -> bool {
@@ -241,6 +249,8 @@ impl<'a> Template<'a> {
                 origin,
                 code_bytes,
                 offset: entry.offset,
+                input_bytes: entry.input.len() as u16,
+                input_hash: input_hash(&entry.input),
             },
             Self::Compiled(emission) => Rows::Qualified {
                 code_bytes,
@@ -253,6 +263,22 @@ impl<'a> Template<'a> {
             qualification_attempts: 0,
         }
     }
+}
+
+/// A word-wise hash of an entry's admitted input: what a stored block's
+/// owner keeps to know its bytes in guest memory again ([`Rows::Stored`]).
+fn input_hash(bytes: &[u8]) -> u32 {
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut hash = (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for word in words {
+        hash = (hash ^ u64::from_le_bytes(*word))
+            .wrapping_mul(0x0100_0000_01b3)
+            .rotate_left(29);
+    }
+    for &byte in rest {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    (hash ^ hash >> 32) as u32
 }
 
 impl CodeRecovery {
@@ -335,6 +361,19 @@ impl CodeRecovery {
         *rows = pushed.into_boxed_slice();
     }
 
+    /// The bytes of guest memory, from the block's entry, that compile its
+    /// rows again when its record is not in memory ([`Self::qualify`]).
+    pub(super) fn stored_input_bytes(&self) -> Option<usize> {
+        match &self.rows {
+            Rows::Stored {
+                origin,
+                input_bytes,
+                ..
+            } if origin.kept.is_none() => Some(usize::from(*input_bytes)),
+            _ => None,
+        }
+    }
+
     /// The key of the record whose entry this owner's rows still are.
     pub(super) fn stored_key(&self) -> Option<Digest> {
         match &self.rows {
@@ -345,11 +384,14 @@ impl CodeRecovery {
 
     /// The rows, qualifying a stored record's on its first fault at `pc`, the
     /// block's entry: in the dispatcher, before any guest projection. `record`
-    /// is the one [`Self::stored_key`] names.
+    /// is the one [`Self::stored_key`] names; without it, `memory` holds the
+    /// guest's bytes at the block's entry ([`Self::stored_input_bytes`]),
+    /// whose compile gives the rows when they admit to the entry's input.
     pub(super) fn qualify(
         &mut self,
         pc: u64,
         record: Option<&StoredRecord>,
+        memory: Option<&[u8]>,
     ) -> Result<&PackedRecovery, NativeFailureReason> {
         if !matches!(self.rows, Rows::Qualified { .. }) {
             #[cfg(test)]
@@ -358,7 +400,13 @@ impl CodeRecovery {
             }
             let block = match &self.rows {
                 Rows::Qualified { .. } => unreachable!("unqualified above"),
-                Rows::Stored { origin, offset, .. } => {
+                Rows::Stored {
+                    origin,
+                    offset,
+                    code_bytes,
+                    input_bytes,
+                    input_hash: hash,
+                } => {
                     let decoded;
                     let entry = match &origin.kept {
                         Some(kept) => Some(&**kept).filter(|kept| kept.offset == *offset),
@@ -367,8 +415,30 @@ impl CodeRecovery {
                                 record.and_then(|record| record.find(*offset, &origin.context));
                             decoded.as_ref()
                         }
-                    }
-                    .ok_or(NativeFailureReason::StoredRecord)?;
+                    };
+                    let Some(entry) = entry else {
+                        let mut input = memory
+                            .filter(|memory| memory.len() == usize::from(*input_bytes))
+                            .ok_or(NativeFailureReason::StoredRecord)?
+                            .to_vec();
+                        origin.preparation.admit(&mut input);
+                        if input_hash(&input) != *hash {
+                            return Err(NativeFailureReason::StoredRecord);
+                        }
+                        let block = origin
+                            .preparation
+                            .recompile(&input, pc)
+                            .filter(|block| block.native.x86_64_code.len() == *code_bytes as usize)
+                            .ok_or(NativeFailureReason::StoredRecord)?;
+                        self.rows = Rows::Qualified {
+                            code_bytes: *code_bytes,
+                            rows: PackedRecovery::new(&block.fault_recovery),
+                        };
+                        let Rows::Qualified { rows, .. } = &self.rows else {
+                            unreachable!("qualified above");
+                        };
+                        return Ok(rows);
+                    };
                     let stored = entry
                         .rebase(origin.page, &entry.input)
                         .ok_or(NativeFailureReason::StoredRecord)?;

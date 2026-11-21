@@ -751,6 +751,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// engine's.
     fn table_base_write(&mut self, word: u32, access: RegisterAccess) -> Step {
         let before = self.completion_point();
+        let from = self.switch_point();
+        self.note_switch_miss(word, from.as_ref());
         self.plain_read = None;
         let step = self.register_access(word, access);
         let value = self
@@ -765,6 +767,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .and_then(|(register, index)| self.cpu.registers.address(register, index));
         if let (Ok(()), true, Some(value)) = (&step, self.position() == before, value) {
             self.mirrors[TABLE_BASE_KEPT] = register_read::Cell { readable: 1, value };
+            if let Some(from) = from {
+                self.keep_table_switches(from, value);
+            }
         }
         step
     }

@@ -26,9 +26,9 @@
 //! the PE's cells anchor, ITLB contexts and salts for the next lookup,
 //! closes the native ISR_EL1 read and the cells of the new state the
 //! engine refreshes at each transition (the record's `close`), and moves the host to the new view when
-//! the record names one: CR3 for the view's root, which must still be the
-//! one the record names and not stale, the host's view word and RFLAGS.AC
-//! for PAN. Then it leaves through the exit to the target in RAX: linked
+//! the record names one: CR3 for the current root set's root of the view,
+//! where that set is of the record's class (`table_switch::Sets`), the
+//! host's view word and RFLAGS.AC for PAN. Then it leaves through the exit to the target in RAX: linked
 //! (`Thunk::dynamic`) while the table's and the record's `chain` words allow
 //! the next state's code to run in this native run, else through an exit
 //! that is never linked. It clobbers RAX, RCX, RDX and flags, and the pinned SP.
@@ -45,6 +45,7 @@
 use super::asm::{Alu, Asm, Cond, Gpr, Mem, Patch, ShiftOp, Size, Unary};
 use super::flag_word::{ARM_MASK, ARM_SHIFT, PACK_MULTIPLIER, UNPACK_MULTIPLIER, WORD_MASK};
 use super::pointer::Thunk;
+use super::table_switch::{self, Cr3, SET_ROOTS, SETS, Sets};
 use crate::{Anchor, GuestAddress, GuestState, Place, aarch64::Register, block::ExitKind};
 use alloc::vec::Vec;
 use core::mem::offset_of;
@@ -108,14 +109,16 @@ pub struct Record {
     /// Nonzero when the host's view after it is exact for native code to
     /// continue there ([`Table::chain`] permitting).
     pub chain: u64,
-    /// The host's CR3 for the new view, 0 when the view stays.
-    pub cr3: u64,
-    /// The host's root of that view, which must be `root`, and its stale
-    /// flag (a byte): a stale context loads without the no-flush bit (bit
-    /// 63), which clears the flag.
-    pub root_at: u64,
+    /// The host's root sets (`table_switch::Sets`) when the transition
+    /// moves the host to another view, 0 when the view stays. The record
+    /// holds in every set of the class `class` (sets of one class differ
+    /// in TTBR0 alone, which no transition changes): the thunk loads the
+    /// current set's root of view `root`, in its PCID while the sets are
+    /// tagged, without the no-flush bit while the view's stale byte is
+    /// set, which it clears.
+    pub sets: u64,
     pub root: u64,
-    pub stale_at: u64,
+    pub class: u64,
     /// The host's view word and its new value.
     pub view_at: u64,
     pub view: u64,
@@ -304,6 +307,8 @@ pub struct Places {
     /// `InstructionCounter`) a logged transition folds.
     pub cycles: Place,
     pub instructions: Place,
+    /// How a record's view loads CR3: the register, or for tests a word.
+    pub cr3: Cr3,
 }
 
 const RECORD_BYTES: usize = size_of::<Record>();
@@ -320,9 +325,7 @@ fn frame_field(offset: usize) -> Mem {
 /// SPSR's DAIF shift and PAN bit.
 const SPSR_DAIF_SHIFT: u8 = 6;
 const SPSR_PAN_SHIFT: u8 = 22;
-const MOV_CR3_RCX: [u8; 3] = [0x0f, 0x22, 0xd9];
-/// CR3's bit that keeps the PCID's entries (with CR4.PCIDE).
-const KEEP_ENTRIES: u64 = 1 << 63;
+const MOV_CR3_RDX: [u8; 3] = [0x0f, 0x22, 0xda];
 const STAC: [u8; 3] = [0x0f, 0x01, 0xcb];
 const CLAC: [u8; 3] = [0x0f, 0x01, 0xca];
 
@@ -369,18 +372,93 @@ fn locate(asm: &mut Asm<'_>, places: &Places, slot: usize, misses: &mut Vec<Patc
     misses.push(asm.jcc(Cond::Ne));
 }
 
-/// The branch to the original exit unless the host's root of the record's
-/// view is still the record's and fresh.
+/// RAX = the index among every set's roots of the current set's first
+/// root, from the sets at RCX ([`Sets::current`]).
+fn current_first_root(asm: &mut Asm<'_>) {
+    use Gpr::{Rax, Rcx};
+    use Size::Qword;
+    asm.mov_load(Qword, Rax, Mem::base(Rcx, offset_of!(Sets, current) as i32));
+    asm.alu_load(
+        Alu::Sub,
+        Qword,
+        Rax,
+        Mem::base(Rcx, offset_of!(Sets, base) as i32),
+    );
+    asm.shift_imm(ShiftOp::Shr, Qword, Rax, 12);
+}
+
+/// The branch to the original exit unless the host's current root set is
+/// of the record's class, when the record moves the host's view.
 fn check_host(asm: &mut Asm<'_>, misses: &mut Vec<Patch>) {
     use Gpr::{Rax, Rcx};
     use Size::Qword;
-    asm.alu_imm8(Alu::Cmp, Qword, record_field(offset_of!(Record, cr3)), 0);
+    asm.alu_imm8(Alu::Cmp, Qword, record_field(offset_of!(Record, sets)), 0);
     let stays = asm.jcc8(Cond::E);
-    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, root_at)));
-    asm.mov_load(Qword, Rax, Mem::base(Rcx, 0));
-    asm.alu_load(Alu::Cmp, Qword, Rax, record_field(offset_of!(Record, root)));
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, sets)));
+    current_first_root(asm);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rax, SET_ROOTS.trailing_zeros() as u8);
+    asm.alu_imm32(Alu::Cmp, Qword, Rax, SETS as i32);
+    misses.push(asm.jcc(Cond::Ae));
+    asm.mov_load(
+        Qword,
+        Rax,
+        Mem::indexed(Rcx, Rax, 8, offset_of!(Sets, classes) as i32),
+    );
+    asm.alu_load(
+        Alu::Cmp,
+        Qword,
+        Rax,
+        record_field(offset_of!(Record, class)),
+    );
     misses.push(asm.jcc(Cond::Ne));
     asm.bind(stays);
+}
+
+/// Load CR3 for the current set's root of the record's view (RDX at the
+/// record, RCX at its sets): in the root's PCID where the sets are
+/// tagged, keeping its entries unless its stale byte is set, which it
+/// clears, counting the flush ([`Sets::flushes`]). It keeps RDX, saving it
+/// and R8 on the stack.
+fn load_view(asm: &mut Asm<'_>, cr3: Cr3) {
+    use Gpr::{R8, Rax, Rcx, Rdx};
+    use Size::{Byte, Dword, Qword};
+    let sets = |field: usize| Mem::base(Rcx, field as i32);
+    asm.push(Rdx);
+    asm.push(R8);
+    current_first_root(asm);
+    asm.alu_load(Alu::Add, Qword, Rax, record_field(offset_of!(Record, root)));
+    asm.mov(Qword, Rdx, Rax);
+    asm.shift_imm(ShiftOp::Shl, Qword, Rdx, 12);
+    asm.alu_load(Alu::Add, Qword, Rdx, sets(offset_of!(Sets, base)));
+    asm.alu_imm8(Alu::Cmp, Qword, sets(offset_of!(Sets, tagged)), 0);
+    let untagged = asm.jcc8(Cond::E);
+    asm.lea(
+        Qword,
+        Rdx,
+        Mem::indexed(Rdx, Rax, 1, table_switch::FIRST_CONTEXT as i32),
+    );
+    let stale = Mem::indexed(Rcx, Rax, 1, offset_of!(Sets, stale) as i32);
+    asm.movzx(Dword, R8, Byte, stale);
+    asm.test(Dword, R8, R8);
+    let flush = asm.jcc8(Cond::Ne);
+    asm.mov_imm64(R8, table_switch::KEEP_ENTRIES);
+    asm.alu(Alu::Or, Qword, Rdx, R8);
+    let load = asm.jmp8();
+    asm.bind(flush);
+    asm.alu_imm8(Alu::Add, Qword, sets(offset_of!(Sets, flushes)), 1);
+    asm.alu(Alu::Xor, Dword, R8, R8);
+    asm.mov_store(Byte, stale, R8);
+    asm.bind(load);
+    asm.bind(untagged);
+    match cr3 {
+        Cr3::Register => asm.fixed(&MOV_CR3_RDX),
+        Cr3::Word(address) => {
+            asm.mov_imm64(Rcx, address);
+            asm.mov_store(Qword, Mem::base(Rcx, 0), Rdx);
+        }
+    }
+    asm.pop(R8);
+    asm.pop(Rdx);
 }
 
 /// Move SP to the record's save slot and load it from its load slot.
@@ -554,26 +632,13 @@ fn commit(
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     // The jump cache's entries name the contexts they hold in.
     // The host's view.
-    asm.alu_imm8(Alu::Cmp, Qword, to(offset_of!(Record, cr3)), 0);
+    asm.alu_imm8(Alu::Cmp, Qword, to(offset_of!(Record, sets)), 0);
     let stays = asm.jcc(Cond::E);
     asm.mov_load(Qword, Rax, to(offset_of!(Record, view)));
     asm.mov_load(Qword, Rcx, to(offset_of!(Record, view_at)));
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
-    // A stale context flushes as it loads (`load_view`).
-    asm.mov_load(Qword, Rcx, to(offset_of!(Record, stale_at)));
-    asm.movzx(Size::Dword, Rax, Size::Byte, Mem::base(Rcx, 0));
-    asm.alu(Alu::Or, Size::Dword, Rax, Rax);
-    let fresh = asm.jcc8(Cond::E);
-    asm.alu(Alu::Xor, Size::Dword, Rax, Rax);
-    asm.mov_store(Size::Byte, Mem::base(Rcx, 0), Rax);
-    asm.mov_load(Qword, Rcx, to(offset_of!(Record, cr3)));
-    asm.mov_imm64(Rax, !KEEP_ENTRIES);
-    asm.alu(Alu::And, Qword, Rcx, Rax);
-    let load = asm.jmp8();
-    asm.bind(fresh);
-    asm.mov_load(Qword, Rcx, to(offset_of!(Record, cr3)));
-    asm.bind(load);
-    asm.fixed(&MOV_CR3_RCX);
+    asm.mov_load(Qword, Rcx, to(offset_of!(Record, sets)));
+    load_view(&mut asm, places.cr3);
     asm.alu_imm8(Alu::Cmp, Qword, to(offset_of!(Record, ac)), AC_SET as i8);
     let not_set = asm.jcc8(Cond::Ne);
     asm.fixed(&STAC);
@@ -1124,6 +1189,7 @@ mod tests {
         pointer_generation: Place::new(Anchor::Mirrors, offset_of!(Words, pointer_generation)),
         cycles: Place::new(Anchor::Mirrors, offset_of!(Words, cycles)),
         instructions: Place::new(Anchor::Mirrors, offset_of!(Words, instructions)),
+        cr3: Cr3::Register,
     };
     const MISS: Exit = Exit {
         pc: PC.0,

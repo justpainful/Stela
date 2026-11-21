@@ -8,11 +8,14 @@
 //! `cargo test --release -p stela-compiler --lib kernel_costs -- --ignored
 //! --nocapture`; `KERNEL_COSTS_DUMP=<dir>` writes each block's code there
 //! (`<kernel>.bin`) for a disassembler, and `KERNEL_COSTS_MASKED=1` compiles
-//! for a guest that discloses FEAT_CSV3 (every access masked).
+//! for a guest that discloses FEAT_CSV3 (every access masked). The code is
+//! the owner's host's ([`owner_target`]) unless `KERNEL_COSTS_HOST=1` asks
+//! for this host's own features.
 use crate::{
     GuestAddress, GuestState, Options, TargetCpu,
     block::{BlockProfile, CompilationPlan, Features},
     state::Limit,
+    target::HostCpuid,
     x86_64::{MemoryChecks, NativeSystem, RangeCheck, pinned},
 };
 use alloc::{format, vec, vec::Vec};
@@ -109,7 +112,32 @@ fn kernels() -> Vec<Kernel> {
 /// slices.
 const RANGE: RangeCheck = RangeCheck::four_level(2);
 
-/// The engine's options for an EL1 block on this host.
+/// The owner's i7-12700KF as this host reports it: AVX2, FMA, BMI2 and
+/// AVX-VNNI, with no AVX-512, AMX, AVX10 or APX state. Built from this
+/// host's CPUID with that state cleared from XCR0 and the later leaves, so
+/// a host with more (a cloud Xeon) compiles what the owner's PEs run. A
+/// host without AVX2 cannot run that code, and compiles its own.
+fn owner_target() -> TargetCpu {
+    if std::env::var_os("KERNEL_COSTS_HOST").is_some() {
+        return TargetCpu::detect();
+    }
+    let host = HostCpuid::read();
+    let owner = TargetCpu::from_cpuid(&HostCpuid {
+        // Opmask, ZMM_Hi256 and Hi16_ZMM; TILECFG and TILEDATA.
+        xcr0: host.xcr0 & !(0xe0 | 0x6_0000),
+        avx512_on_demand: false,
+        leaf24_ebx: 0,
+        leaf29_ebx: 0,
+        ..host
+    });
+    if owner.supports(TargetCpu::Avx2) {
+        owner
+    } else {
+        TargetCpu::detect()
+    }
+}
+
+/// The engine's options for an EL1 block on the owner's host.
 fn options(masked: bool) -> Options {
     let checks = MemoryChecks::system(true, false, true, masked).with_range(RANGE);
     let native = NativeSystem {
@@ -118,12 +146,9 @@ fn options(masked: bool) -> Options {
         regions: true,
         ..NativeSystem::NONE
     };
-    Options::new(
-        BlockProfile::new(Features::SYSTEM_MODE),
-        TargetCpu::detect(),
-    )
-    .with_memory_checks(checks)
-    .with_native_system(native)
+    Options::new(BlockProfile::new(Features::SYSTEM_MODE), owner_target())
+        .with_memory_checks(checks)
+        .with_native_system(native)
 }
 
 /// Guest instructions each timing retires.

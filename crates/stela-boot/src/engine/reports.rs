@@ -90,7 +90,7 @@ impl TranslatedSeen {
 /// The host's shadow counters at the last heartbeat.
 #[derive(Default)]
 pub(super) struct ShadowSeen {
-    pub(super) counts: [u64; 29],
+    pub(super) counts: [u64; 31],
     pub(super) gate: [u64; 7],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
@@ -104,7 +104,8 @@ impl ShadowSeen {
     /// TTBR0 or other controls, tag checks, invalidations and TLBIs of
     /// everything, and for other controls the fields that differed); the
     /// resets of the lower half, its switches to another TTBR0, those that
-    /// found the half kept, and the kept halves dropped; the switches
+    /// found the half kept, the kept halves dropped, and the switches that
+    /// native code made without an exit; the switches
     /// between the roots of SPRR_PERM_EL0, SPRR_PERM_EL1 and E0PD1 values
     /// and those that found none kept; the TLBIs that unmapped ranges
     /// instead; and the root loads for a change of view. Then every #PF
@@ -132,6 +133,8 @@ impl ShadowSeen {
             host.lower_switches,
             host.lower_found,
             host.kept_dropped,
+            host.native_switches,
+            host.flushed_loads,
             host.bank_switches,
             host.bank_misses,
             host.scoped,
@@ -172,6 +175,8 @@ impl ShadowSeen {
             lower_switches,
             lower_found,
             kept_dropped,
+            native_switches,
+            flushed_loads,
             bank_switches,
             bank_misses,
             scoped,
@@ -232,6 +237,7 @@ impl ShadowSeen {
              invalidated={invalidated} maintained={maintained} \
              lower_resets={lower_resets} lower_switches={lower_switches} \
              lower_found={lower_found} kept_dropped={kept_dropped} \
+             native_switches={native_switches} flushed_loads={flushed_loads} \
              bank_switches={bank_switches} bank_misses={bank_misses} scoped={scoped} \
              view_switches={view_switches} fill_ns_each={fill_ns_each} around={around} \
              faults={faults} fault_ns_each={fault_ns_each} guest_faults={guest_faults} \

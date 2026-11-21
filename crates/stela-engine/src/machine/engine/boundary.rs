@@ -429,6 +429,25 @@ pub trait Host {
     fn native_view(&mut self, _from: &Regime, _to: &Regime) -> Option<NativeView> {
         None
     }
+    /// The host's root sets as native TTBR0 switches load them
+    /// (`x86_64::table_switch::Sets`), and how native code reaches CR3:
+    /// `None` on a host whose translations need no CR3 load, where a native
+    /// switch changes the guest's state alone.
+    fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
+        None
+    }
+    /// The set that holds what `controls` translate, as
+    /// [`Host::set_regime`] last kept it, if it differs from the current
+    /// regime's controls only in TTBR0 and a native switch may load it:
+    /// its index and generation (`x86_64::table_switch::Entry::set`).
+    fn native_set(&mut self, _controls: &mmu::Controls) -> Option<(u64, u64)> {
+        None
+    }
+    /// Whether [`Host::isolate_predictions`] issues IBPB and refills the
+    /// return stack, which a native TTBR0 switch then issues itself.
+    fn isolates_predictions(&self) -> bool {
+        false
+    }
     /// The PE invalidated instruction caches (IC IVAU of `Some(page)`, a
     /// physical page; IC IALLU or IALLUIS for `None`), which this machine
     /// already applied to its own compiled code. A host that runs other
@@ -1171,16 +1190,18 @@ impl Devices for NoDevices {
 }
 
 /// What native code does to move a host to another view of one regime
-/// ([`Host::native_view`]), as `x86_64::transition::Record` keeps it: load
-/// `cr3` while the word at `root_at` is still `root` and the byte at
-/// `stale_at` clear, write `view` to the word at `view_at`, and leave
-/// RFLAGS.AC as `ac` says.
+/// ([`Host::native_view`]), as `x86_64::transition::Record` keeps it: while
+/// the current set of the host's root sets at `sets`
+/// (`x86_64::table_switch::Sets`) is of class `class`, load CR3 for that
+/// set's root of view `root` (in its PCID, flushing it if stale), write
+/// `view` to the word at `view_at`, and leave RFLAGS.AC as `ac` says.
+/// Sets of one class differ in TTBR0 alone, so a record made in one set
+/// holds after the PE switched to another of its class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeView {
-    pub cr3: u64,
-    pub root_at: u64,
+    pub sets: u64,
     pub root: u64,
-    pub stale_at: u64,
+    pub class: u64,
     pub view_at: u64,
     pub view: u64,
     pub ac: u64,

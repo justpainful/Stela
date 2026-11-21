@@ -156,6 +156,10 @@ pub(super) struct Mirrors {
     /// The plain device reads native device sites complete again
     /// ([`DEVICE_READ_KEY`]), a slot per site.
     pub(super) device_reads: [register_read::DeviceRead; register_read::DEVICE_READS],
+    /// The TTBR0 values a native MSR TTBR0 switches to
+    /// (`x86_64::table_switch`), and the switches it made since the engine
+    /// last settled them ([`Machine::settle_native_switches`]).
+    pub(super) table_switch: table_switch::Table,
 }
 
 /// Where native code finds the cell at `index` of the PE's state.
@@ -473,6 +477,7 @@ impl Default for Mirrors {
             stream: register_read::EventStream::default(),
             fast_ipi: register_read::FastIpi::default(),
             device_reads: [register_read::DeviceRead::default(); register_read::DEVICE_READS],
+            table_switch: table_switch::Table::default(),
         }
     }
 }
@@ -499,8 +504,40 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     ),
     cycles: CYCLES,
     instructions: INSTRUCTION_COUNTER,
+    cr3: stela_compiler::x86_64::table_switch::Cr3::Register,
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
+
+/// The places a native TTBR0 switch writes besides the host's
+/// (`x86_64::table_switch::Places`): its table, the chain's lookup
+/// contexts and salts, the transition records' contexts generation, and the
+/// code-page and device-read cells of every state, which a TTBR0 change
+/// closes ([`Machine::advance_table_generation`]).
+pub(super) fn table_switch_places(
+    cr3: Option<table_switch::Cr3>,
+    isolate: bool,
+) -> table_switch::Places {
+    let cell = |state: usize, index: usize| {
+        Place::new(
+            Anchor::Mirrors,
+            offset_of!(Mirrors, banks) + (state * CELLS + index) * size_of::<register_read::Cell>(),
+        )
+    };
+    table_switch::Places {
+        table: Place::new(Anchor::Mirrors, offset_of!(Mirrors, table_switch)),
+        contexts: Place::new(Anchor::Control, offset_of!(chain::ChainControl, contexts)),
+        salts: Place::new(Anchor::Control, offset_of!(chain::ChainControl, salts)),
+        contexts_generation: Place::new(
+            Anchor::Mirrors,
+            offset_of!(Mirrors, transitions) + offset_of!(transition::Table, contexts_generation),
+        ),
+        closes: (0..MIRROR_STATES)
+            .flat_map(|state| [cell(state, CODE_PAGE), cell(state, DEVICE_READ_KEY)])
+            .collect(),
+        cr3,
+        isolate,
+    }
+}
 
 /// The PSTATE fields with registers of their own that a kernel saves and
 /// restores around each exception, which only the engine reads besides

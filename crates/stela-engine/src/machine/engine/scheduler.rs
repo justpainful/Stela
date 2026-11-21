@@ -18,7 +18,7 @@ const SAMPLED_EXITS: usize = 4096;
 /// between two full steps of the run loop: what reaches the PE without
 /// moving its interrupt epoch (mail left for its next read, a device's
 /// reset or start) waits at most this many native runs more.
-const DIRECT_RUNS: u32 = 8;
+pub(super) const DIRECT_RUNS: u32 = 8;
 
 /// What a step left for the native run it entered: PSTATE, the device
 /// lines and the timer deadline ([`Machine::continues_directly`]).
@@ -303,9 +303,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// Whether the run loop may fetch at once after the System exit at
-    /// `next_pc` that just completed, skipping its schedule and its device
-    /// step, as native code chains on: the instruction completed plainly
-    /// (the PC at the next word, no exception), and PSTATE, the device
+    /// `next_pc` that just completed (`completed`), or the branch exit to
+    /// it, skipping its schedule and its device step, as native code chains
+    /// on: the instruction completed plainly (the PC at the next word, no
+    /// exception), or the branch's target is the PC, and PSTATE, the device
     /// lines and the timer deadline are those the last full step found
     /// (`stepped`), so its interrupt delivery would find what it found, until
     /// the count where its lines may change by time alone (`lines_until`);
@@ -314,7 +315,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// code to forward, a wait, a pause, the time slice's end, a progress
     /// mark, due DMA); and no debug check applies. At most [`DIRECT_RUNS`]
     /// such fetches follow one full step.
-    pub(super) fn continues_directly(&mut self, next_pc: u64, stepped: Stepped) -> bool {
+    pub(super) fn continues_directly(
+        &mut self,
+        next_pc: u64,
+        completed: bool,
+        stepped: Stepped,
+    ) -> bool {
         let (pstate, lines, timers) = stepped;
         let now = Pstate {
             btype: pstate.btype,
@@ -322,7 +328,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let lines_until = self.mirrors.lines_until;
         if self.direct_runs >= DIRECT_RUNS
-            || self.cpu.pc != next_pc.wrapping_add(INSTRUCTION)
+            || self.cpu.pc != next_pc.wrapping_add(if completed { INSTRUCTION } else { 0 })
             || now != pstate
             || pstate.pacm
             || pstate.il
@@ -487,6 +493,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if transitioned {
             self.adopt_native_state();
         }
+        if self.mirrors.table_switch.switches != 0 {
+            self.settle_native_switches();
+        }
         // An exception return native code made ends the interrupt handler
         // the engine saw taken, as one the engine handles does.
         if transitions[transition::EXCEPTION_RETURN] != 0
@@ -605,9 +614,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if let Some(count) = self.statistics.exit_kinds.get_mut(kind as usize) {
                     *count += 1;
                 }
-                let probed = self.lookup_miss(last, next_pc, kind, exhausted);
+                // Why a transfer was missed is classified at one exit in
+                // `miss_sample`, which counts for them all.
+                self.miss_turn += 1;
+                let classify = self.miss_turn >= self.miss_sample;
+                if classify {
+                    self.miss_turn = 0;
+                }
+                let probed = if classify {
+                    self.lookup_miss(last, next_pc, kind, exhausted)
+                } else {
+                    None
+                };
                 if let Some(miss) = probed {
-                    self.statistics.lookup_misses[miss] += 1;
+                    self.statistics.lookup_misses[miss] += self.miss_sample;
                 }
                 let mut slot = kind as usize;
                 if kind == ExitKind::System as u64 && self.step_timing.is_some() {
@@ -625,25 +645,31 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
                 let spent = exhausted;
+                // A System instruction the engine completes, or a branch
+                // native code took whose target it did not find, may fetch
+                // at once; a run whose budget ran out takes its full step.
+                let system = kind == ExitKind::System as u64;
+                let branch = kind <= ExitKind::Return as u64 && !exhausted;
                 let direct = quiet
                     && !transitioned
-                    && kind == ExitKind::System as u64
-                    && !self.device_stub(last, next_pc);
+                    && (branch || (system && !self.device_stub(last, next_pc)));
                 self.set_doing(step_timing::exit_blocker(slot, self.timed_word));
                 let exited = self.exit(last, next_pc, kind);
                 self.trace_point_now(step_timing::PATH_SERVED);
-                if direct && exited.is_ok() && self.continues_directly(next_pc, stepped) {
+                if direct && exited.is_ok() && self.continues_directly(next_pc, system, stepped) {
                     self.direct_next = true;
-                    if self.step_timing.is_some() {
+                    if system && self.step_timing.is_some() {
                         self.system_exits.paths.direct += 1;
                     }
                 }
                 if exited.is_ok()
+                    && classify
                     && let Some(miss) = self.branch_miss(last, next_pc, kind, spent, probed)
                 {
+                    let weight = self.miss_sample;
                     let counts = &mut self.statistics.branch_misses[kind as usize];
-                    counts[miss as usize] += 1;
-                    counts[BranchMiss::COUNT] += u64::from(transitioned);
+                    counts[miss as usize] += weight;
+                    counts[BranchMiss::COUNT] += u64::from(transitioned) * weight;
                 }
                 if exited.is_ok() {
                     let btype = self.cpu.pstate.btype;
@@ -839,18 +865,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let code = Arc::clone(&self.code);
         // Another PE may link or detach it meanwhile: found again under the
-        // lock, for a block still installed.
-        let mut cache = code.cache_at(board::LockSite::Link);
+        // lock of its page's shard, for a block still installed.
+        let physical = code.blocks[index].physical;
+        let mut cache = code.page_at(physical, board::LockSite::Link);
         self.link_held(&code, &mut cache, index, next_pc, word)
     }
 
-    /// [`Self::link`]'s work under the board's lock, `cache` its hold of
-    /// `code`: the exit of block `index` to `next_pc` with `word`, found
-    /// again, linked if both blocks are indexed.
+    /// [`Self::link`]'s work under the lock of the index shard of block
+    /// `index`'s page, `cache` its hold of `code`: the exit of the block to
+    /// `next_pc` with `word`, found again, linked if both blocks are
+    /// indexed. An exit to another page links through a cell, under the
+    /// block table's lock too.
     pub(super) fn link_held(
         &mut self,
         code: &board::Code,
-        cache: &mut board::Cache,
+        cache: &mut board::Shard,
         index: usize,
         next_pc: u64,
         word: ExitWord,
@@ -890,12 +919,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // compiled never takes again. The fetch of the target that
             // follows translates its page and links the exit
             // ([`Self::link_direct_exit`]).
-            if self.translated_entry(cache, next_pc).is_none() {
+            let mut table = code.cache_at(board::LockSite::Link);
+            if self.translated_entry(&table, next_pc).is_none() {
                 self.direct_exit = Some((index, record.incarnation(), next_pc, word));
                 return false;
             }
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(cache, point, next_pc, retired, word, 0, false) {
+            if self.link_through_cell(&mut table, point, next_pc, retired, word, 0, false) {
                 record.settle(position);
                 return true;
             }

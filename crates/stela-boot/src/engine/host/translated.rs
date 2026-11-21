@@ -14,7 +14,7 @@
 //! guest address in RCX and the access's size and flags in the two bytes
 //! after its CALL, returns past them with the host address in RAX, and
 //! keeps every other register, XMM registers and MXCSR included.
-use super::{Contexts, FaultCause, Recorded, State, flags_pan, layout, resolve, state, tables};
+use super::{FaultCause, Recorded, State, flags_pan, layout, resolve, state, tables};
 use core::arch::global_asm;
 use stela_engine::machine::mmu::translated::Lookup;
 
@@ -170,9 +170,11 @@ impl Bounce {
         }
     }
 
-    /// Map host frames `first` and `second` at the slot, which every view
-    /// shares and `current` is loaded; its address.
-    fn map(&mut self, first: u64, second: u64, contexts: &mut Contexts, current: usize) -> u64 {
+    /// Map host frames `first` and `second` at the slot, which every root
+    /// shares: its address, and the pages whose mapping changed, which the
+    /// caller drops from every context.
+    fn map(&mut self, first: u64, second: u64) -> (u64, [Option<u64>; 2]) {
+        let mut changed = [None; 2];
         for (index, frame) in [first, second].into_iter().enumerate() {
             if self.mapped[index] != frame {
                 let entry = layout::physical(self.entries[index]) as *mut u64;
@@ -181,11 +183,11 @@ impl Bounce {
                 unsafe {
                     entry.write_volatile(frame | tables::PRESENT | tables::WRITABLE | tables::NX)
                 };
-                contexts.forget(self.address + index as u64 * tables::PAGE, current);
+                changed[index] = Some(self.address + index as u64 * tables::PAGE);
                 self.mapped[index] = frame;
             }
         }
-        self.address
+        (self.address, changed)
     }
 }
 
@@ -200,7 +202,6 @@ extern "sysv64" fn translate(saved: &mut Saved) -> u64 {
     let [bytes, flags] = unsafe { (saved.ret as *const [u8; 2]).read_unaligned() };
     let write = flags & WRITE != 0;
     let view = state.current as u8;
-    let current = state.root_of(state.current);
     state.helper_calls += 1;
     for _ in 0..FILLS {
         match state.tlb.lookup(address, u64::from(bytes), write, view) {
@@ -215,7 +216,9 @@ extern "sysv64" fn translate(saved: &mut Saved) -> u64 {
                     abandon(state, saved, address, write, FaultCause::NonCanonical)
                 };
                 state.bounces += 1;
-                let slot = bounce.map(first, second, &mut state.contexts, current);
+                let (slot, changed) = bounce.map(first, second);
+                state.forget_window(changed);
+                state.window_used();
                 return slot + (address & (tables::PAGE - 1));
             }
             Lookup::Miss { address: missing } => {
