@@ -1,0 +1,83 @@
+# Performance log
+
+Running log of the cloud agent's sessions. Numbers say which machine they
+come from. Owner-boot numbers come from `stela log D:`.
+
+## 2026-11-21, session 1 (cloud)
+
+Machine: cloud container, 4 vCPU Intel Xeon (AVX-512, AVX-512 FP16, AMX),
+15 GB. Not the owner's i7-12700KF; no timing here is the owner's.
+
+### Base
+
+`performance/daily-driver` at `0bc7857`. Upstream `tylertms/Stela` main was
+32 commits ahead (`140ffaf`).
+
+### Baseline tests (daily-driver `0bc7857`)
+
+- `stela-compiler` lib: 1583 passed, 7 failed, 21 ignored.
+  All 7 failures are AVX-512 FP16 (EVEX maps 5 and 6) cases that only run
+  on a host that has FP16:
+  `modeled::tests::models_match_the_host_instructions` (map 6, opcode 0x62,
+  sample 187: two result bytes and the flags differ), 
+  `simd::arithmetic::half_tests::half_arithmetic_lanes_match_the_reference`,
+  and five `simd::half_integer_tests::half_to_integer_*` ("covered input
+  exited"). The owner's CPU has no AVX-512, so these do not reach the
+  owner's machine, but they are real model gaps on FP16 hosts.
+- The first run stopped there (cargo stops at the first failing crate);
+  the other suites are run with `--no-fail-fast` below.
+- UEFI clippy of `stela-boot` failed on daily-driver: unused
+  `Assembler::mfence`. Fixed by cherry-picking `agent/atomics` `fda312d`.
+
+### Changes
+
+Branch `claude/magical-lamport-hekj7b` (to be merged into
+`performance/daily-driver`):
+
+1. `5329e69` perf(nvme): a host NVMe command moves up to 1 MiB within MDTS
+   (was 128 KiB); the bounce pool is 2056 pages (8 MiB, eight largest
+   commands; was 256 pages, 1 MiB). A 1 MiB guest ANS transfer is one host
+   command instead of eight where MDTS >= 8. Command contents, FUA, flush,
+   discard, ordering and block ranges are unchanged.
+   Tests: `stela-driver-storage` lib 314 passed.
+2. `183fcc2` fix(storage): the "no completion interrupt, polling" verdict
+   is no longer final. A disk found silent is watched in windows of 32
+   completions; 8 or more that each follow a signal make it heard again.
+   Session 4 judged the NVMe silent at about 36 s, before the guest ran,
+   and polled it for the whole boot.
+   Tests: `stela-boot-core` lib 1128 passed (2 new).
+3. cherry-pick of `fda312d`: removes the unused MFENCE helper, so the
+   UEFI clippy lane passes again.
+
+Clippy: UEFI `stela-boot`, `stela-driver-storage`, `stela-boot-core
+--features native-acpi`, and host `--all-targets` for both crates: clean.
+
+Branch `agent/merge-upstream-1121` (`a5d87ab`): upstream main merged into
+daily-driver. Conflicts:
+- `translations/writer.rs`: upstream reads packs on demand and removed the
+  writer's arena, so the arena compaction on `agent/pack-writer`
+  (`83f9307`, `d2c75b2`, `1df4b2e`) is obsolete (upstream wins). The
+  per-part step timing (`a83b223`) is ported onto upstream's step:
+  `parts_us=` now names govern, begin, hold, delta, merge, plan, fetch,
+  write, commit.
+- `system/memory.rs`: upstream's `sizes_with_room` with the branch's
+  runner count.
+- engine `tests.rs`: upstream's `real_counter` replaces the branch's
+  `stamped`; the run loop bench uses it.
+
+### Needs an owner boot
+
+- Lines: `HOST DISK serial=... completion interrupt heard again` (new),
+  `HOST DISK serial=... no completion interrupt, polling`,
+  `HOST DISK STAGED ... calls/total_us start=... owed=...`,
+  `TRANSLATIONS writer ... parts_us=...`, `PES STALLS`, `AUDIO out=`.
+- The latest boot's log (stick build `eeeb70f3f`) is still needed as the
+  M1 baseline for audio stutter and freezes.
+
+### Next
+
+- M1 audio: read the `AUDIO out=` fields of the `eeeb70f3f` boot.
+- M1 disk: ring a waiting processor for owed steps instead of the boot
+  processor (`OWED_DOORBELL`).
+- Indirect branches `b9e131f` and system exits (`103cccd`, `69e09b7`) onto
+  the merged branch, with full compiler and engine suites.
