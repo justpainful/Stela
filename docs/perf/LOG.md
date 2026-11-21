@@ -135,6 +135,26 @@ passed. Clippy host and UEFI clean.
   slot: integer_alu median 0.177 -> 0.186 ns, others within 1 %. Memory
   renaming already forwards these; reverted.
 
+## 2026-11-21, merge of the updated daily-driver (`27575a5`)
+
+`performance/daily-driver` moved to `6fedcaf` (11 commits by the local
+agents) while this branch worked. Merged into the upstream-merged branch:
+
+- Disk: daily-driver's `7bc4fff` (owed steps to a waiting PE), `8cf55c7`
+  (NVMe signal to the last PE's core; silent disk heard again) and
+  `6fedcaf` (256 KiB commands, 4 MiB pool) win; this branch's `183fcc2`
+  did the "heard again" part alone and gives way. The transfer bench
+  here measured 256 KiB at +5 % host copy cost per MiB against 4x fewer
+  commands (table above); 6fedcaf argues the in-flight bytes on the disk.
+- Translations: `8c8041d`, `e692959`, `1748fca` (arena compaction) give
+  way to upstream's on-demand pack, which has no arena.
+- MFENCE removal and the jump probe were on both sides.
+
+Tests on the merged tree: engine 1976, soc 1629, boot-core 1127,
+driver-base 1120, audio 405, storage 316 passed; compiler 1593 passed,
+7 FP16 failures (as before). fmt, host clippy and the UEFI clippy lanes
+(engine, compiler, storage, boot-core, stela-boot) clean.
+
 ## Owner checkpoints
 
 The owner asks for the difference since their last question. Each line is
