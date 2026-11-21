@@ -16,7 +16,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let mut registers = vec![0u64; 1024].into_boxed_slice();
-        let mut memory = vec![0u64; (POOL_PAGES + 128) * PAGE / 8];
+        let mut memory = vec![0u64; 196608];
         let start = memory.as_mut_ptr() as u64;
         // SAFETY: this fixture owns both stable allocations until after
         // all controller operations; no device accesses them.
@@ -84,7 +84,7 @@ impl Fixture {
                     location: "fixture".into(),
                     model: "fixture".into(),
                     serial: "fixture".into(),
-                    blocks: 4096,
+                    blocks: 1024,
                     block_size: 512,
                     read_only: false,
                     features: Features {
@@ -739,8 +739,7 @@ fn prps(controller: &Controller, tag: u32) -> (u64, u64) {
 fn prp_lists_name_every_page_a_command_holds_across_page_boundaries() {
     let mut fixture = Fixture::new();
     let disk = &mut fixture.disk;
-    // One, two, three and the largest command's pages: PRP2 unused, a
-    // page, a list.
+    // One, two, three and thirty-two pages: PRP2 unused, a page, a list.
     let sizes = [512, PAGE + 512, 2 * PAGE + 512, BOUNCE_BYTES];
     let tags: Vec<u32> = sizes
         .iter()
@@ -853,19 +852,19 @@ fn small_commands_run_past_eight_until_the_pool_cannot_take_the_largest() {
     // One page each: every tag runs while the pool keeps the largest.
     assert_eq!(running.len(), DEPTH.min(POOL_PAGES - largest + 1));
     assert!(running.len() > 8);
-    // Sixty-five pages each: the pool, not the tags, is what runs out.
+    // Nine pages each: the pool, not the tags, is what runs out.
     let mut fixture = Fixture::new();
     let disk = &mut fixture.disk;
     let mut running = 0;
     while disk.room() {
         disk.start(Command::Read {
             lba: 0,
-            bytes: 64 * PAGE,
+            bytes: 8 * PAGE,
         })
         .unwrap();
         running += 1;
     }
-    assert_eq!(running, (POOL_PAGES - largest) / pages_for(64 * PAGE) + 1);
+    assert_eq!(running, (POOL_PAGES - largest) / pages_for(8 * PAGE) + 1);
     assert!(running < DEPTH);
     assert!(disk.controller.borrow().pool.free.len() < largest);
 }

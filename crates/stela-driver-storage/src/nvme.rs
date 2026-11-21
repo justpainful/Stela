@@ -241,15 +241,11 @@ const IO_ENTRIES: u16 = 64;
 /// every submission entry but the one that tells a full queue from an empty
 /// one, fewer when CAP.MQES is smaller.
 const DEPTH: usize = IO_ENTRIES as usize - 1;
-/// The most data one command moves, less where MDTS is smaller: the guest
-/// storage's own largest transfer (`stela_soc` ANS `MAX_TRANSFER`), so one
-/// guest transfer is one host command, within Linux's usual request size
-/// (`BLK_DEF_MAX_SECTORS_CAP`, 1280 KiB). Its PRP list fits one page.
-const BOUNCE_BYTES: usize = 1024 * 1024;
-const _: () = assert!(BOUNCE_BYTES / PAGE <= PAGE / 8);
+/// The most data one command moves.
+const BOUNCE_BYTES: usize = 128 * 1024;
 /// The I/O bounce pages of one controller: as much memory as eight commands
 /// of [`BOUNCE_BYTES`] take, which many more small commands share.
-const POOL_PAGES: usize = 8 * pages_for(BOUNCE_BYTES);
+const POOL_PAGES: usize = 256;
 const _: () = assert!(POOL_PAGES >= pages_for(BOUNCE_BYTES) && POOL_PAGES <= u16::MAX as usize);
 // Linux PCI NVME_MAX_BYTES bounds the logical command range independently of
 // payload storage. Write Zeroes transfers no host data through the bounce pool.
