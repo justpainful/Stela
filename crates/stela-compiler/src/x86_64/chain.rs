@@ -1171,6 +1171,13 @@ pub const STAMP_COUNTS_BYTES: usize = 64;
 /// moved; the table's writer stores the entry, fences and then reads the
 /// caches, so one of the two sees the other.
 pub const JUMP_CACHE_ENTRIES: usize = 256;
+/// A table probe transfer replaces another PC's jump cache entry at one
+/// transfer in this many (an empty entry at every one): two hot targets
+/// of one entry then keep one of them cached most of the time, where each
+/// took the other's place at every transfer, and fewer probes pay the
+/// fill's locked exchange.
+const JUMP_REPLACE: u8 = 4;
+const _: () = assert!(JUMP_REPLACE.is_power_of_two());
 /// Bytes of one jump cache entry, a cache line: the PC, the block's code,
 /// its index and the table entry's last word as the probe read it, whose
 /// low byte is the BTYPEs the block accepts ([`LookupEntry`]), then the
@@ -3424,6 +3431,12 @@ pub fn lookup_dispatcher(btype: u8) -> Option<Vec<u8>> {
     dispatcher_with_policy(btype, Interruption::Quiet)
 }
 fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
+    dispatcher_with(btype, policy, JUMP_REPLACE)
+}
+
+/// [`dispatcher_with_policy`] whose table probe replaces another PC's jump
+/// cache entry at one transfer in `replace` ([`JUMP_REPLACE`]).
+fn dispatcher_with(btype: u8, policy: Interruption, replace: u8) -> Option<Vec<u8>> {
     if btype > 3 {
         return None;
     }
@@ -3481,7 +3494,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     misses.extend(seqlock_check(&mut asm, R10));
     spend_transfer(&mut asm);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
-    fill_jump_cache(&mut asm);
+    fill_jump_cache(&mut asm, replace);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     found(&mut asm);
@@ -4096,18 +4109,27 @@ fn lookup_tail_code(
 /// R9, its index in R8D and the entry's last word in R11D, as the probe
 /// read them, whose low byte is the BTYPEs it accepts (`META_TARGETS`),
 /// with the context and this PE's ITLB drop epoch of the target's half;
-/// nothing for a control without stamps. An entry of another PC loses its
-/// PC first; the PC goes in last, by a locked exchange, and the table
+/// nothing for a control without stamps. An entry of another PC is kept
+/// but at one transfer in [`JUMP_REPLACE`], and loses its PC first when it
+/// is not; the PC goes in last, by a locked exchange, and the table
 /// entry's last word is read again after it: a writer that changed the
 /// entry meanwhile either finds the PC and takes it out ([`forget_jumps`]),
 /// or this does. An entry that holds the PC already keeps it, without the
 /// exchange: a writer finds it there, and one that took it out leaves the
 /// exchange to this. Clobbers RDX and R11.
-fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
+fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm, replace: u8) {
     const _: () = assert!(META_TARGETS == 0xff);
+    assert!(replace.is_power_of_two());
     let entry = |field: i32| Mem::base(Rdx, JUMP_CACHE + field);
     asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, STAMPS), 0);
     let none = asm.jcc(Cond::E);
+    asm.mov_load(Qword, Rdx, Mem::base(Rcx, STAMPS));
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rdx, StampCount::Filled.offset()),
+        1,
+    );
     // RDX = the entry's address, its PC out first unless it is the target.
     asm.mov(Dword, Rdx, Rax);
     asm.alu_imm32(Alu::And, Dword, Rdx, JUMP_INDEX);
@@ -4115,18 +4137,22 @@ fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
     asm.alu_load(Alu::Add, Qword, Rdx, Mem::base(Rcx, STAMPS));
     asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
     let held = asm.jcc8(Cond::E);
+    // Another PC's entry gives way at one transfer in JUMP_REPLACE, by the
+    // probe transfers' count, which the probe just advanced: an empty one
+    // at every one.
+    let mut kept_other = None;
+    if replace > 1 {
+        asm.alu_imm8(Alu::Cmp, Qword, entry(JUMP_PC), 0);
+        let empty = asm.jcc8(Cond::E);
+        asm.test_imm(Size::Byte, Mem::base(Rcx, HITS), i32::from(replace - 1));
+        kept_other = Some(asm.jcc(Cond::Ne));
+        asm.bind(empty);
+    }
     asm.mov_rm_imm32(Qword, entry(JUMP_PC), 0);
     asm.bind(held);
     asm.mov_store(Qword, entry(JUMP_CODE), R9);
     asm.mov_store(Dword, entry(JUMP_BLOCK), R8);
     asm.mov_store(Dword, entry(JUMP_TARGETS), R11);
-    asm.mov_load(Qword, R11, Mem::base(Rcx, STAMPS));
-    asm.alu_imm8(
-        Alu::Add,
-        Qword,
-        Mem::base(R11, StampCount::Filled.offset()),
-        1,
-    );
     asm.mov(Qword, R11, Rax);
     asm.shift_imm(ShiftOp::Shr, Qword, R11, 55);
     asm.alu_imm8(Alu::And, Dword, R11, 1);
@@ -4151,6 +4177,9 @@ fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
     asm.mov_rm_imm32(Qword, entry(JUMP_PC), 0);
     asm.bind(kept);
     asm.bind(kept_pc);
+    if let Some(kept_other) = kept_other {
+        asm.bind(kept_other);
+    }
     asm.bind(none);
 }
 

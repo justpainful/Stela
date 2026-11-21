@@ -34,6 +34,15 @@ const MOST_TARGETS: usize = (REGION - BLOCKS) / BLOCK_BYTES;
 /// The target sequence's length, a power of two.
 const SEQUENCE: usize = 1 << 12;
 const RAN: u32 = 3;
+/// The replacement rate of the probes the cases run ([`JUMP_REPLACE`]),
+/// which [`jump_replace_costs`] sets.
+static REPLACE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(JUMP_REPLACE);
+
+/// The probes of BTYPE 0 the cases run, of [`REPLACE`]'s rate.
+fn probes() -> Vec<u8> {
+    let replace = REPLACE.load(core::sync::atomic::Ordering::Relaxed);
+    dispatcher_with(0, Interruption::Quiet, replace).unwrap()
+}
 const CONTEXTS: [u64; 2] = [5 << LOOKUP_SALT_BITS, 9 << LOOKUP_SALT_BITS];
 const KEY: u64 = block_key(0x8_0040_0000, 1);
 /// Guest PCs of the targets: one function entry every 0x44 bytes of a
@@ -116,7 +125,7 @@ fn fill(region: &Pages, target: Target, tail: &[u8], direct: bool) {
     if !direct {
         put(region, TAIL, tail);
     }
-    put(region, PROBES, &lookup_dispatcher(0).unwrap());
+    put(region, PROBES, &probes());
     for block in 0..MOST_TARGETS {
         let offset = BLOCKS + BLOCK_BYTES * block;
         let end = at + offset as u64 + 5;
@@ -466,7 +475,7 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
     let mut out = vec![0xb8, 1, 0, 0, 0, 0xba, 2, 0, 0, 0];
     out.extend(EXIT_RETURN);
     put(&region, 0, &out);
-    put(&region, PROBES, &lookup_dispatcher(0).unwrap());
+    put(&region, PROBES, &probes());
     // The ring: a random cycle through every block, from block 0.
     let mut order: Vec<usize> = (1..blocks).collect();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -809,4 +818,57 @@ fn jump_probe_spread_costs() {
             );
         }
     }
+}
+
+/// A table probe transfer replacing another PC's jump cache entry at
+/// every transfer (as before [`JUMP_REPLACE`]) and at one in four, side by
+/// side: lookups over more targets than the cache holds, a predicted
+/// tail's misses over many targets and lookup sites spread over many
+/// blocks. Each pair is measured in turn three times and the best of each
+/// kept.
+#[test]
+#[ignore = "manual: opt-in"]
+fn jump_replace_costs() {
+    let rates = [1, JUMP_REPLACE];
+    let set = |replace| REPLACE.store(replace, core::sync::atomic::Ordering::Relaxed);
+    for path in [
+        Path::Lookup(64),
+        Path::Lookup(256),
+        Path::Lookup(1024),
+        Path::LookupRuns(1024, 32),
+        Path::PredictedMiss(1024, JUMP_PROBE_ENTRY),
+    ] {
+        let mut best = [(f64::MAX, 0.0); 2];
+        for _ in 0..3 {
+            for (at, replace) in rates.into_iter().enumerate() {
+                set(replace);
+                let (ns, _, table) = cost(path);
+                if ns < best[at].0 {
+                    best[at] = (ns, table);
+                }
+            }
+        }
+        std::println!(
+            "{path:?}: every miss {:.2} ns ({:.2} table probes), one in {JUMP_REPLACE} {:.2} ns ({:.2})",
+            best[0].0,
+            best[0].1,
+            best[1].0,
+            best[1].1
+        );
+    }
+    for blocks in [1024, 4096, 16384] {
+        let mut best = [f64::MAX; 2];
+        for _ in 0..3 {
+            for (at, replace) in rates.into_iter().enumerate() {
+                set(replace);
+                best[at] = best[at].min(spread_cost(Ring::Lookup, blocks).0);
+            }
+        }
+        std::println!(
+            "{blocks} lookup sites: every miss {:.1}, one in {JUMP_REPLACE} {:.1} TSC ticks per transfer",
+            best[0],
+            best[1]
+        );
+    }
+    set(JUMP_REPLACE);
 }

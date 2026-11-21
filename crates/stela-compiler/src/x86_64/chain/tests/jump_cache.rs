@@ -476,3 +476,37 @@ fn an_older_entry_beside_its_replacement_leaves_with_its_cache_entry() {
         assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
     }
 }
+
+/// Two PCs of one entry: the first fills it, empty; the other's table
+/// probe transfers leave it until the probe transfers' count reaches a
+/// multiple of [`JUMP_REPLACE`], when it takes the entry; the first's,
+/// now through the table probe too, wait their turn in the same way.
+#[test]
+fn another_pcs_entry_gives_way_at_one_transfer_in_jump_replace() {
+    const FIRST: u64 = 0x3_0000_0040;
+    const OTHER: u64 = FIRST + (JUMP_CACHE_ENTRIES * 4) as u64;
+    let key = block_key(0x4000_0000, 1);
+    let mut world = World::new();
+    world.map(FIRST, key, 1, 0b1111);
+    world.map(OTHER, key, 2, 0b1111);
+    let entry = jump_entry(world.control.stamps, FIRST);
+    assert_eq!(entry, jump_entry(world.control.stamps, OTHER));
+    // SAFETY: the entry's PC word, in the world's live stamps.
+    let held = || unsafe { *(entry as *const u64) };
+    assert_eq!(world.run(0, FIRST), (0x7701, 99));
+    assert_eq!((held(), world.control.hits), (FIRST, 1));
+    let replace = u64::from(JUMP_REPLACE);
+    for hits in 2..=replace {
+        assert_eq!(world.run(0, OTHER), (0x7702, 99));
+        assert_eq!(world.control.hits, hits);
+        let expected = if hits % replace == 0 { OTHER } else { FIRST };
+        assert_eq!(held(), expected, "hits {hits}");
+    }
+    // The first PC's entry is gone: its transfers probe the table and take
+    // the entry back at the next multiple.
+    for hits in replace + 1..=2 * replace {
+        assert_eq!(world.run(0, FIRST), (0x7701, 99));
+        let expected = if hits % replace == 0 { FIRST } else { OTHER };
+        assert_eq!(held(), expected, "hits {hits}");
+    }
+}
