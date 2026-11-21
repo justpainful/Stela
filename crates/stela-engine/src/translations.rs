@@ -9,12 +9,14 @@
 //! and the pack `stela.efi` keeps
 //! ([`pack`]).
 pub mod pack;
+#[cfg(test)]
+mod replay;
 mod stored;
 pub mod writer;
 
 pub use stored::StoredRecord;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use stela_compiler::block::Features;
 use stela_compiler::{
     GuestAddress, NativeBlock,
@@ -100,6 +102,209 @@ pub struct Exit {
     pub skipped: u16,
 }
 
+/// A recovery binding's source as a kind and a value: the record's and
+/// [`Rows`]' encoding of it.
+fn binding_word(source: RecoverySource) -> (u8, u32) {
+    match source {
+        RecoverySource::HostRegister(host) => (0, u32::from(host)),
+        RecoverySource::NativeSpill(offset) => (1, u32::from(offset.bytes())),
+    }
+}
+
+/// The source a kind and a value name, if they name one.
+fn binding_of(kind: u8, value: u32) -> Option<RecoverySource> {
+    match kind {
+        0 => u8::try_from(value).ok().map(RecoverySource::HostRegister),
+        1 => SpillOffset::new(u16::try_from(value).ok()?)
+            .ok()
+            .map(RecoverySource::NativeSpill),
+        _ => None,
+    }
+}
+
+fn put(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// An entry's recovery rows packed in one allocation: what the decoded
+/// records and the kept forms hold of them, about a tenth of the rows'
+/// own vectors. Each value is LEB128: the row count, then per row its
+/// start, its end less its start (zigzag), its retirement's page-relative
+/// PC and count, a byte of phase (bit 0) and site (the rest), and its
+/// bindings: their count, and each its guest register, its source's kind
+/// and value ([`binding_word`]). Only [`Rows::push`] writes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rows(Box<[u8]>);
+
+impl Default for Rows {
+    /// No rows.
+    fn default() -> Self {
+        Self::build(0, |_| {})
+    }
+}
+
+/// One row of [`Rows`], its retirement page-relative as stored.
+#[derive(Debug, Clone, Copy)]
+pub struct Row<'a> {
+    pub start: usize,
+    pub end: usize,
+    pub pc: u64,
+    pub retired_before: u16,
+    pub phase: RetirementPhase,
+    pub site: RecoverySiteKind,
+    bindings: (usize, &'a [u8]),
+}
+
+/// A reader of what [`Rows`] wrote.
+struct Packed<'a>(&'a [u8]);
+
+impl Packed<'_> {
+    fn byte(&mut self) -> u8 {
+        let (&first, rest) = self.0.split_first().expect("written by Rows::push");
+        self.0 = rest;
+        first
+    }
+
+    fn value(&mut self) -> u64 {
+        let (mut value, mut shift) = (0, 0);
+        loop {
+            let byte = self.byte();
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn binding(&mut self) -> RecoveryBinding {
+        let guest = self.byte();
+        let kind = self.byte();
+        let value = self.value() as u32;
+        RecoveryBinding {
+            guest,
+            source: binding_of(kind, value).expect("written by Rows::push"),
+        }
+    }
+}
+
+impl Rows {
+    /// Rows of `count` that `write` pushes ([`Self::push`]).
+    fn build(count: usize, write: impl FnOnce(&mut Vec<u8>)) -> Self {
+        let mut out = Vec::new();
+        put(&mut out, count as u64);
+        write(&mut out);
+        Self(out.into_boxed_slice())
+    }
+
+    /// Write one row of `bindings` into `out`.
+    fn push(
+        out: &mut Vec<u8>,
+        start: usize,
+        end: usize,
+        retirement: (u64, u16, RetirementPhase),
+        site: RecoverySiteKind,
+        bindings: &[RecoveryBinding],
+    ) {
+        let (pc, retired_before, phase) = retirement;
+        put(out, start as u64);
+        let length = (end as i64).wrapping_sub(start as i64);
+        put(out, ((length << 1) ^ (length >> 63)) as u64);
+        put(out, pc);
+        put(out, u64::from(retired_before));
+        let phase = match phase {
+            RetirementPhase::Before => 0,
+            RetirementPhase::AfterFallthrough => 1,
+        };
+        out.push(phase | (site as u8) << 1);
+        put(out, bindings.len() as u64);
+        for binding in bindings {
+            let (kind, value) = binding_word(binding.source);
+            out.push(binding.guest);
+            out.push(kind);
+            put(out, u64::from(value));
+        }
+    }
+
+    /// `rows` packed, their retirements as they are.
+    pub fn pack(rows: &[UnqualifiedFaultRecovery]) -> Self {
+        Self::build(rows.len(), |out| {
+            for row in rows {
+                let point = row.retirement;
+                Self::push(
+                    out,
+                    row.start,
+                    row.end,
+                    (
+                        point.instruction_pc().0,
+                        point.retired_before(),
+                        point.phase(),
+                    ),
+                    row.site,
+                    &row.bindings,
+                );
+            }
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        Packed(&self.0).value() as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The heap bytes it owns.
+    pub fn capacity(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Row<'_>> + '_ {
+        let mut packed = Packed(&self.0);
+        let count = packed.value() as usize;
+        (0..count).map(move |_| {
+            let start = packed.value() as usize;
+            let length = packed.value();
+            let length = (length >> 1) as i64 ^ -((length & 1) as i64);
+            let pc = packed.value();
+            let retired_before = packed.value() as u16;
+            let flags = packed.byte();
+            let phase = match flags & 1 {
+                0 => RetirementPhase::Before,
+                _ => RetirementPhase::AfterFallthrough,
+            };
+            let site = RecoverySiteKind::try_from(flags >> 1).expect("written by Rows::push");
+            let bindings = packed.value() as usize;
+            let from = packed.0;
+            for _ in 0..bindings {
+                packed.binding();
+            }
+            let used = from.len() - packed.0.len();
+            Row {
+                start,
+                end: (start as i64).wrapping_add(length) as usize,
+                pc,
+                retired_before,
+                phase,
+                site,
+                bindings: (bindings, &from[..used]),
+            }
+        })
+    }
+}
+
+impl<'a> Row<'a> {
+    pub fn bindings(&self) -> impl ExactSizeIterator<Item = RecoveryBinding> + 'a {
+        let mut packed = Packed(self.bindings.1);
+        (0..self.bindings.0).map(move |_| packed.binding())
+    }
+}
+
 /// One stored block translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -120,7 +325,8 @@ pub struct Entry {
     /// Page offset of each guest instruction and its native offset.
     pub source_map: Vec<(u16, u32)>,
     pub exits: Vec<Exit>,
-    pub recovery: Vec<UnqualifiedFaultRecovery>,
+    /// Its recovery rows, their retirements page-relative ([`Rows`]).
+    pub recovery: Rows,
 }
 
 /// A rebased immutable template. Persisted fault tags remain unchecked until
@@ -149,11 +355,7 @@ impl Entry {
         bytes += self.relocations.capacity() * core::mem::size_of::<u32>();
         bytes += self.source_map.capacity() * core::mem::size_of::<(u16, u32)>();
         bytes += self.exits.capacity() * core::mem::size_of::<Exit>();
-        bytes += self.recovery.capacity() * core::mem::size_of::<UnqualifiedFaultRecovery>();
-        for row in &self.recovery {
-            bytes += row.bindings.capacity() * core::mem::size_of::<RecoveryBinding>();
-        }
-        bytes
+        bytes + self.recovery.capacity()
     }
 
     /// What it costs in a record: its slot and its buffers.
@@ -203,16 +405,22 @@ impl Entry {
             },
             source_bytes: usize::from(self.source_bytes),
             direct_exits,
-            fault_recovery: self
-                .recovery
-                .iter()
-                .map(|row| {
-                    let mut row = row.clone();
-                    row.retirement = self.retirement_at(row.retirement, page)?;
-                    Some(row)
-                })
-                .collect::<Option<_>>()?,
+            fault_recovery: self.recovery_at(page)?,
         })
+    }
+
+    /// Its recovery rows, their retirements at the page whose address is
+    /// `page` (0: page-relative, as stored).
+    pub fn recovery_at(&self, page: u64) -> Option<Vec<UnqualifiedFaultRecovery>> {
+        exact(self.recovery.iter().map(|row| {
+            Some(UnqualifiedFaultRecovery {
+                start: row.start,
+                end: row.end,
+                bindings: row.bindings().collect(),
+                retirement: self.retirement_at(row.pc, row.retired_before, row.phase, page)?,
+                site: row.site,
+            })
+        }))
     }
 
     /// What installing the block at the page whose address is `page` needs
@@ -236,15 +444,13 @@ impl Entry {
         }
         page.checked_add(u64::from(self.offset))?
             .checked_add(u64::from(self.source_bytes))?;
-        if !self
-            .recovery
-            .iter()
-            .all(|row| row.start < row.end && row.end <= self.code.len())
-            || !self
-                .recovery
-                .iter()
-                .all(|row| self.retirement_at(row.retirement, page).is_some())
-        {
+        if !self.recovery.iter().all(|row| {
+            row.start < row.end
+                && row.end <= self.code.len()
+                && self
+                    .retirement_at(row.pc, row.retired_before, row.phase, page)
+                    .is_some()
+        }) {
             return None;
         }
         into.code.clear();
@@ -269,23 +475,28 @@ impl Entry {
         Some(())
     }
 
+    /// The retirement at page-relative `relative_pc` after `retired_before`
+    /// instructions in `phase`, at the page whose address is `page`.
     /// Reconstruct only a source-backed retirement shape. This never mints a
     /// guest-access site or grants memory-effect permission from a portable tag.
-    fn retirement_at(&self, point: RetirementPoint, page: u64) -> Option<RetirementPoint> {
+    fn retirement_at(
+        &self,
+        relative_pc: u64,
+        retired_before: u16,
+        phase: RetirementPhase,
+        page: u64,
+    ) -> Option<RetirementPoint> {
         use stela_compiler::Lifter as _;
-        let relative = point
-            .instruction_pc()
-            .0
-            .checked_sub(u64::from(self.offset))?;
+        let relative = relative_pc.checked_sub(u64::from(self.offset))?;
         if !relative.is_multiple_of(4)
             || relative > u64::from(self.source_bytes)
-            || u64::from(point.retired_before()) != relative / 4
+            || u64::from(retired_before) != relative / 4
         {
             return None;
         }
-        let pc = GuestAddress(page.checked_add(point.instruction_pc().0)?);
-        match point.phase() {
-            RetirementPhase::Before => RetirementPoint::before(pc, point.retired_before()).ok(),
+        let pc = GuestAddress(page.checked_add(relative_pc)?);
+        match phase {
+            RetirementPhase::Before => RetirementPoint::before(pc, retired_before).ok(),
             RetirementPhase::AfterFallthrough => {
                 let at = usize::try_from(relative).ok()?;
                 if at.checked_add(4)? > usize::from(self.source_bytes) {
@@ -293,12 +504,7 @@ impl Entry {
                 }
                 let word = u32::from_le_bytes(self.input.get(at..at + 4)?.try_into().ok()?);
                 let instruction = stela_compiler::aarch64::Decoder.lift(pc, word).ok()?;
-                RetirementPoint::from_instruction(
-                    &instruction,
-                    point.retired_before(),
-                    point.phase(),
-                )
-                .ok()
+                RetirementPoint::from_instruction(&instruction, retired_before, phase).ok()
             }
         }
     }
@@ -348,13 +554,15 @@ impl Entry {
             && self.exits.iter().all(|exit| {
                 in_code(exit.offset, 0) && ExitKind::try_from(u64::from(exit.kind)).is_ok()
             })
-            && self.recovery.iter().all(|range| {
-                range.start < range.end
-                    && range.end <= code
-                    && self.retirement_at(range.retirement, 0).is_some()
-                    && (range.site == RecoverySiteKind::NativeInternal
-                        || range.retirement.phase() == RetirementPhase::Before)
-                    && range.bindings.iter().all(RecoveryBinding::is_valid)
+            && self.recovery.iter().all(|row| {
+                row.start < row.end
+                    && row.end <= code
+                    && self
+                        .retirement_at(row.pc, row.retired_before, row.phase, 0)
+                        .is_some()
+                    && (row.site == RecoverySiteKind::NativeInternal
+                        || row.phase == RetirementPhase::Before)
+                    && row.bindings().all(|binding| binding.is_valid())
             })
     }
 }
@@ -479,8 +687,8 @@ impl Record {
                 + entry.relocations.len() * RELOCATION_BYTES
                 + entry.source_map.len() * SOURCE_MAP_BYTES
                 + entry.exits.len() * EXIT_BYTES;
-            for row in &entry.recovery {
-                encoded_bytes += RECOVERY_ROW_BYTES + row.bindings.len() * RECOVERY_BINDING_BYTES;
+            for row in entry.recovery.iter() {
+                encoded_bytes += RECOVERY_ROW_BYTES + row.bindings.0 * RECOVERY_BINDING_BYTES;
             }
         }
         let mut out = Vec::with_capacity(encoded_bytes);
@@ -516,25 +724,22 @@ impl Record {
                 out.extend(exit.skipped.to_le_bytes());
             }
             out.extend((entry.recovery.len() as u32).to_le_bytes());
-            for range in &entry.recovery {
-                out.extend((range.start as u32).to_le_bytes());
-                out.extend((range.end as u32).to_le_bytes());
-                out.extend(range.retirement.instruction_pc().0.to_le_bytes());
-                out.extend(range.retirement.retired_before().to_le_bytes());
-                out.push(match range.retirement.phase() {
+            for row in entry.recovery.iter() {
+                out.extend((row.start as u32).to_le_bytes());
+                out.extend((row.end as u32).to_le_bytes());
+                out.extend(row.pc.to_le_bytes());
+                out.extend(row.retired_before.to_le_bytes());
+                out.push(match row.phase {
                     RetirementPhase::Before => 0,
                     RetirementPhase::AfterFallthrough => 1,
                 });
-                out.push(range.site as u8);
-                out.extend((range.bindings.len() as u32).to_le_bytes());
-                for binding in &range.bindings {
+                out.push(row.site as u8);
+                out.extend((row.bindings.0 as u32).to_le_bytes());
+                for binding in row.bindings() {
                     out.push(binding.guest);
-                    let (kind, value) = match binding.source {
-                        RecoverySource::HostRegister(host) => (0, u16::from(host)),
-                        RecoverySource::NativeSpill(offset) => (1, offset.bytes()),
-                    };
+                    let (kind, value) = binding_word(binding.source);
                     out.push(kind);
-                    out.extend(value.to_le_bytes());
+                    out.extend((value as u16).to_le_bytes());
                 }
             }
             out.extend(&entry.code);
@@ -699,7 +904,10 @@ impl<'a> Reader<'a> {
                 skipped: self.u16()?,
             })
         })?;
-        let recovery = decode_items(self.count(RECOVERY_ROW_BYTES)?, || {
+        let rows = self.count(RECOVERY_ROW_BYTES)?;
+        let mut packed = Vec::new();
+        let mut bindings = Vec::new();
+        for _ in 0..rows {
             let start = self.u32()? as usize;
             let end = self.u32()? as usize;
             let pc = GuestAddress(self.u64()?);
@@ -710,25 +918,18 @@ impl<'a> Reader<'a> {
                 _ => return Err(FormatError::Entry),
             };
             let site = RecoverySiteKind::try_from(self.u8()?).map_err(|_| FormatError::Entry)?;
-            let bindings = decode_items(self.count(RECOVERY_BINDING_BYTES)?, || {
+            bindings.clear();
+            for _ in 0..self.count(RECOVERY_BINDING_BYTES)? {
                 let guest = self.u8()?;
                 let kind = self.u8()?;
                 let value = self.u16()?;
-                let source = match kind {
-                    0 => RecoverySource::HostRegister(
-                        u8::try_from(value).map_err(|_| FormatError::Entry)?,
-                    ),
-                    1 => RecoverySource::NativeSpill(
-                        SpillOffset::new(value).map_err(|_| FormatError::Entry)?,
-                    ),
-                    _ => return Err(FormatError::Entry),
-                };
-                Ok(RecoveryBinding { guest, source })
-            })?;
+                let source = binding_of(kind, u32::from(value)).ok_or(FormatError::Entry)?;
+                bindings.push(RecoveryBinding { guest, source });
+            }
             // Build a structurally valid source-backed shape using an
             // entry view below; no raw After constructor is exposed.
             let before = RetirementPoint::before(pc, count).map_err(|_| FormatError::Entry)?;
-            let retirement = match phase {
+            match phase {
                 RetirementPhase::Before => before,
                 RetirementPhase::AfterFallthrough => {
                     use stela_compiler::Lifter as _;
@@ -754,14 +955,16 @@ impl<'a> Reader<'a> {
                         .map_err(|_| FormatError::Entry)?
                 }
             };
-            Ok(UnqualifiedFaultRecovery {
+            Rows::push(
+                &mut packed,
                 start,
                 end,
-                bindings,
-                retirement,
+                (pc.0, count, phase),
                 site,
-            })
-        })?;
+                &bindings,
+            );
+        }
+        let recovery = Rows::build(rows, |out| out.extend_from_slice(&packed));
         let code = self.take(code_bytes)?.to_vec();
         Ok(Entry {
             context,
@@ -954,16 +1157,25 @@ impl Entry {
                     skipped: exit.skipped,
                 })
             }))?,
-            recovery: exact(block.fault_recovery.iter().map(|row| {
-                let mut row = UnqualifiedFaultRecovery::from(row);
-                row.retirement = row
-                    .retirement
-                    .relocated(GuestAddress(
-                        row.retirement.instruction_pc().0.checked_sub(page)?,
-                    ))
-                    .ok()?;
-                Some(row)
-            }))?,
+            recovery: {
+                let mut out = Vec::new();
+                for row in &block.fault_recovery {
+                    let point = row.retirement;
+                    Rows::push(
+                        &mut out,
+                        row.start,
+                        row.end,
+                        (
+                            point.instruction_pc().0.checked_sub(page)?,
+                            point.retired_before(),
+                            point.phase(),
+                        ),
+                        row.site.kind(),
+                        &row.bindings,
+                    );
+                }
+                Rows::build(block.fault_recovery.len(), |head| head.extend(out))
+            },
         };
         entry.consistent().then_some(entry)
     }

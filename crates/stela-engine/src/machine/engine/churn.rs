@@ -87,6 +87,22 @@ impl ChurnCounts {
             overwritten: less(self.overwritten, was.overwritten),
         }
     }
+
+    /// Add `other`'s counts: another index shard's.
+    pub fn add(&mut self, other: &Self) {
+        self.installs += other.installs;
+        self.new += other.new;
+        for (count, more) in self.again.iter_mut().zip(other.again) {
+            *count += more;
+        }
+        self.same_bytes += other.same_bytes;
+        for (count, more) in self.ages.iter_mut().zip(other.ages) {
+            *count += more;
+        }
+        self.aliases += other.aliases;
+        self.variants += other.variants;
+        self.overwritten += other.overwritten;
+    }
 }
 
 pub(super) struct Churn {

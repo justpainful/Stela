@@ -4,7 +4,7 @@ use super::super::{
 use super::*;
 use crate::translations;
 use crate::translations::Record;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 /// A store in memory: records by key, the blocks offered to it, and
 /// the blocks it has prepared by key, PC and context.
@@ -13,6 +13,8 @@ pub(crate) struct MemoryStore {
     pub(crate) records: BTreeMap<Digest, Arc<Record>>,
     /// Record lookups made.
     pub(crate) lookups: usize,
+    /// Keys whose records it is reading: their lookups wait.
+    pub(crate) awaited: BTreeSet<Digest>,
     pub(crate) offers: Vec<Offer>,
     pub(crate) prepared: BTreeMap<(Digest, u64, Digest), Arc<SharedTranslation>>,
     pub(crate) refilled: Vec<(Digest, Entry)>,
@@ -24,6 +26,13 @@ impl Translations for MemoryStore {
         self.records
             .get(key)
             .map(|record| Arc::new(StoredRecord::of(record)))
+    }
+    fn lookup(&mut self, key: &Digest) -> Looked {
+        if self.awaited.contains(key) {
+            self.lookups += 1;
+            return Looked::Awaited;
+        }
+        self.record(key).map_or(Looked::Absent, Looked::Found)
     }
     fn prepared(
         &mut self,
@@ -523,6 +532,59 @@ fn a_page_read_again_whose_record_was_absent_is_not_looked_up_again() {
     machine.host.ram[100] ^= 1;
     assert!(machine.fetch_block(page(0) + 8, false).is_ok());
     assert_eq!(lookups(&machine.host.store), before + 1);
+}
+
+/// A page whose record the store was still reading at its lookup (a
+/// pack read on demand) is not taken as absent: the next fetch in it looks
+/// again and installs from the record once it is read, and a PE that reads
+/// the page again looks it up rather than knowing it absent (run
+/// 20261119-183349: such pages compiled every later block, and the pack
+/// served 1.75 M installs against 12.8 M read whole).
+#[test]
+fn a_page_whose_record_was_being_read_is_looked_up_again_and_served_from_it() {
+    // adr x0, #8; add x0, x0, #1; svc #0, twice in the page.
+    let words = [
+        0x1000_0040,
+        0x9100_0400,
+        0xd400_0001,
+        0x1000_0040,
+        0x9100_0400,
+        0xd400_0001,
+    ];
+    let mut first = machine(&words);
+    first.host.store = Some(MemoryStore::default());
+    assert!(first.fetch_block(BASE, false).is_ok());
+    assert!(first.fetch_block(BASE + 12, false).is_ok());
+    let offers = core::mem::take(&mut first.host.store.as_mut().unwrap().offers);
+    let key = offers[0].key;
+    let mut record = Record::new(translations::translator_id(), key);
+    for offer in &offers {
+        record.insert(offer.entry().unwrap());
+    }
+    let record = Arc::new(record);
+    let reading = || {
+        let mut store = MemoryStore::default();
+        store.records.insert(key, Arc::clone(&record));
+        store.awaited.insert(key);
+        let mut machine = machine(&words);
+        machine.host.store = Some(store);
+        assert!(machine.fetch_block(BASE, false).is_ok());
+        assert_eq!(machine.statistics.stored, 0, "compiled while it is read");
+        assert_eq!(machine.statistics.awaited_pages, 1);
+        machine.host.store.as_mut().unwrap().awaited.clear();
+        machine
+    };
+    // The page kept: its next fetch looks again.
+    let mut kept = reading();
+    assert!(kept.fetch_block(BASE + 12, false).is_ok());
+    assert_eq!(kept.statistics.stored, 1);
+    assert_eq!(kept.statistics.awaited_lookups, 1);
+    // The page let go and read again: its known key is not absent.
+    let mut again = reading();
+    again.forget_stored_page(BASE);
+    assert!(again.fetch_block(BASE + 12, false).is_ok());
+    assert_eq!(again.statistics.known_absent, 0);
+    assert_eq!(again.statistics.stored, 1);
 }
 
 #[test]

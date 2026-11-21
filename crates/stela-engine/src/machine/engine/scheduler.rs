@@ -487,6 +487,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if transitioned {
             self.adopt_native_state();
         }
+        if self.mirrors.table_switch.switches != 0 {
+            self.settle_native_switches();
+        }
         // An exception return native code made ends the interrupt handler
         // the engine saw taken, as one the engine handles does.
         if transitions[transition::EXCEPTION_RETURN] != 0
@@ -839,18 +842,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let code = Arc::clone(&self.code);
         // Another PE may link or detach it meanwhile: found again under the
-        // lock, for a block still installed.
-        let mut cache = code.cache_at(board::LockSite::Link);
+        // lock of its page's shard, for a block still installed.
+        let physical = code.blocks[index].physical;
+        let mut cache = code.page_at(physical, board::LockSite::Link);
         self.link_held(&code, &mut cache, index, next_pc, word)
     }
 
-    /// [`Self::link`]'s work under the board's lock, `cache` its hold of
-    /// `code`: the exit of block `index` to `next_pc` with `word`, found
-    /// again, linked if both blocks are indexed.
+    /// [`Self::link`]'s work under the lock of the index shard of block
+    /// `index`'s page, `cache` its hold of `code`: the exit of the block to
+    /// `next_pc` with `word`, found again, linked if both blocks are
+    /// indexed. An exit to another page links through a cell, under the
+    /// block table's lock too.
     pub(super) fn link_held(
         &mut self,
         code: &board::Code,
-        cache: &mut board::Cache,
+        cache: &mut board::Shard,
         index: usize,
         next_pc: u64,
         word: ExitWord,
@@ -890,12 +896,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // compiled never takes again. The fetch of the target that
             // follows translates its page and links the exit
             // ([`Self::link_direct_exit`]).
-            if self.translated_entry(cache, next_pc).is_none() {
+            let mut table = code.cache_at(board::LockSite::Link);
+            if self.translated_entry(&table, next_pc).is_none() {
                 self.direct_exit = Some((index, record.incarnation(), next_pc, word));
                 return false;
             }
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(cache, point, next_pc, retired, word, 0, false) {
+            if self.link_through_cell(&mut table, point, next_pc, retired, word, 0, false) {
                 record.settle(position);
                 return true;
             }

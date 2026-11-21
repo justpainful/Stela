@@ -127,19 +127,29 @@ fn flush() {
     }
 }
 
+/// The single-address INVPCIDs past which one flush of every context is
+/// cheaper: a few pages in each of the roots' hundreds of PCIDs.
+const ONE_ADDRESS_BUDGET: u64 = 1024;
+
 /// Drop the pages of `ranges` from this processor's TLB in every PCID a
 /// root loads in (`host::CONTEXTS`); everything when that takes a CR4
-/// toggle. The leaves are not global, and no paging-structure entry above
-/// them changes, as the window and the aperture keep their tables.
+/// toggle or more than [`ONE_ADDRESS_BUDGET`] INVPCIDs. The leaves are not
+/// global, and no paging-structure entry above them changes, as the window
+/// and the aperture keep their tables.
 fn flush_ranges(ranges: impl Iterator<Item = Range<u64>>) {
     let tagged = cr4() & CR4_PCIDE != 0;
     if tagged && !invpcid() {
         return flush();
     }
+    let mut budget = ONE_ADDRESS_BUDGET;
     for range in ranges {
         let mut page = range.start & !(PAGE - 1);
         while page < range.end {
             if tagged {
+                let Some(left) = budget.checked_sub(crate::engine::host::CONTEXTS) else {
+                    return flush();
+                };
+                budget = left;
                 for context in 0..crate::engine::host::CONTEXTS {
                     let descriptor = [context, page];
                     // SAFETY: a valid single-address INVPCID; TLB

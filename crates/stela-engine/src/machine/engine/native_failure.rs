@@ -167,20 +167,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
             Some(owner) if fault.offset >= owner.code_bytes() => {
                 Err(NativeFailureReason::CodeExtent)
             }
-            Some(owner) => Ok(owner.stored_key()),
+            Some(owner) => Ok((owner.stored_key(), owner.stored_input_bytes())),
         };
-        let key = match checked {
-            Ok(key) => key,
+        let (key, input_bytes) = match checked {
+            Ok(found) => found,
             Err(reason) => return Err(self.fail_native(index, fault, reason)),
         };
-        // The stored record is read outside the rows' lock.
+        // The stored record is read outside the rows' lock; a record the
+        // store let go is not read at a fault: the entry's bytes in guest
+        // memory compile its rows again.
         let record = key.and_then(|key| self.stored_record(physical, &key));
+        let mut memory = alloc::vec::Vec::new();
+        if record.is_none()
+            && let Some(bytes) = input_bytes
+        {
+            memory.resize(bytes, 0);
+            if !self.host.read_ram(physical, &mut memory) {
+                memory.clear();
+            }
+        }
         let qualified = {
             let recovery = self.code.blocks.recovery();
             let mut owner = recovery.get_mut(&index);
             match owner.as_deref_mut() {
                 Some(owner) => owner
-                    .qualify(entry_pc, record.as_deref())
+                    .qualify(
+                        entry_pc,
+                        record.as_deref(),
+                        (!memory.is_empty()).then_some(&memory[..]),
+                    )
                     .map(|rows| rows.rows_at_reusing(fault.offset, &mut self.recovery_scratch)),
                 None => Err(NativeFailureReason::UnknownCode),
             }
@@ -205,7 +220,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     fault.error_code & !0b111 == 0
                         && !matches!(fault.cause, FaultCause::InvalidOpcode)
                 }
-                13 => fault.error_code == 0 && matches!(fault.cause, FaultCause::NonCanonical),
+                // #GP, or #SS where RSP or RBP is the base: a non-canonical
+                // address.
+                12 | 13 => fault.error_code == 0 && matches!(fault.cause, FaultCause::NonCanonical),
                 _ => false,
             },
             (NativeFaultOrigin::Exception, RecoverySiteKind::GuestCheck) => {

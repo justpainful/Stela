@@ -220,6 +220,16 @@ impl Preparation {
             .qualify_recovery(template)
     }
 
+    /// The block at `pc` compiled from its admitted `input` alone, as a
+    /// record's entry of it was: what qualifies a stored block's rows when
+    /// its record is not in memory.
+    pub(super) fn recompile(&self, input: &[u8], pc: u64) -> Option<CompiledBlock> {
+        CompilationPlan::new(input, GuestAddress(pc), &self.options())
+            .ok()?
+            .compile()
+            .ok()
+    }
+
     /// What the engine compiles this preparation's blocks for.
     fn options(&self) -> stela_compiler::Options {
         stela_compiler::Options::new(PROFILE, self.target)

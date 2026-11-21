@@ -199,6 +199,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             });
         if evicted.is_some() {
             self.statistics.itlb_drops[2] += 1;
+            self.mirrors.table_switch.forget();
             // A transition record may name the context that went.
             self.mirrors.transitions.contexts_moved();
         }

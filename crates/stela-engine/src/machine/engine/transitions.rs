@@ -392,10 +392,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         .to_spsr(0);
         let view = view.unwrap_or(NativeView {
-            cr3: 0,
-            root_at: 0,
+            sets: 0,
             root: 0,
-            stale_at: 0,
+            class: 0,
             view_at: 0,
             view: 0,
             ac: 0,
@@ -456,11 +455,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             spsr_fixed: if entering { fixed } else { 0 },
             check_mask,
             check,
-            chain: u64::from(same || view.cr3 != 0),
-            cr3: view.cr3,
-            root_at: view.root_at,
+            chain: u64::from(same || view.sets != 0),
+            sets: view.sets,
             root: view.root,
-            stale_at: view.stale_at,
+            class: view.class,
             view_at: view.view_at,
             view: view.view,
             ac: view.ac,
@@ -757,6 +755,9 @@ pub(super) mod tests {
         if counts != [0; KINDS] {
             machine.adopt_native_state();
         }
+        if machine.mirrors.table_switch.switches != 0 {
+            machine.settle_native_switches();
+        }
         machine.cpu.pstate.daif = machine.cpu.state.daif as u8;
         machine.cpu.pstate.sp = machine.mirrors.selected != 0;
         machine.mirrors.leave(&mut machine.cpu.pstate);
@@ -961,6 +962,242 @@ pub(super) mod tests {
         let exit = run_native(&mut native, &leave.code);
         assert_eq!(exit, (ENTER + 0x40, ExitKind::System as u64));
         assert_eq!(observed(&native), after_write);
+    }
+
+    /// Native GENTER and GEXIT at EL2 move the host to the guarded view and
+    /// back in whichever root set of the record's class the PE switched
+    /// to since the records were made, loading the CR3 the engine path's
+    /// regime loads, with PAN set and clear; each view's PCID flushes on
+    /// its first load and keeps its entries after. A set of another class
+    /// stays the engine's, as do EL1's transitions to GL1, which make no
+    /// record.
+    #[test]
+    fn native_guarded_transitions_follow_the_root_set_as_the_engine_path() {
+        use super::super::tests::FakeSets;
+        use stela_compiler::x86_64::table_switch::{Cr3, KEEP_ENTRIES};
+        // msr ttbr0_el1, x3, which reaches TTBR0_EL2 under E2H.
+        const MSR_TTBR0: u32 = 0xd518_2003;
+        const FIRST: u64 = 1 << 48 | 0x8000;
+        const OTHER: u64 = 2 << 48 | 0xc000;
+        const GUARDED: usize = 3;
+        let pc = BASE + 0x100;
+        let with_sets = || {
+            let mut machine = gxf2();
+            machine.host.sets = Some(FakeSets::new());
+            machine.cpu.state.x[3] = FIRST;
+            machine.system_instruction(MSR_TTBR0).unwrap();
+            machine.sync_regime();
+            machine
+        };
+        let places = |machine: &Machine<FakeHost, NoDevices>| transition::Places {
+            cr3: Cr3::Word(&machine.host.sets.as_ref().unwrap().cr3 as *const u64 as u64),
+            ..TRANSITIONS
+        };
+        let sets = |machine: &Machine<FakeHost, NoDevices>| {
+            let sets = machine.host.sets.as_ref().unwrap();
+            // The view native code loaded, which the host follows.
+            let view = match sets.view_word {
+                0 => sets.view as u64,
+                word => word & 0xff,
+            };
+            (sets.current, sets.cr3, view)
+        };
+        let syndrome = Cpu::guarded_enter_syndrome(3) as u32;
+        for pan in [false, true] {
+            let (mut engine, mut native) = (with_sets(), with_sets());
+            // Records made in the set of FIRST, then both switch to OTHER's
+            // through the engine path.
+            for machine in [&mut engine, &mut native] {
+                prepare(machine, pc);
+                machine.cpu.pstate.pan = pan;
+                for _ in 0..2 {
+                    machine.system_instruction(GENTER_WORD).unwrap();
+                    machine.finish_transition(1);
+                    machine.system_instruction(GEXIT).unwrap();
+                    machine.finish_transition(1);
+                    machine.cpu.pc = pc;
+                }
+                let record = machine.mirrors.transitions.records[2][GUARDED_ENTER];
+                assert_eq!(record.generation, machine.mirrors.transitions.generation);
+                assert_ne!(record.sets, 0, "the record moves the host's view");
+                assert_eq!(record.root, GUARDED as u64);
+                machine.cpu.state.x[3] = OTHER;
+                machine.system_instruction(MSR_TTBR0).unwrap();
+                assert_eq!(machine.host.sets.as_ref().unwrap().current, 1);
+                prepare(machine, pc);
+                machine.cpu.pstate.pan = pan;
+            }
+            native.mirrors.lines_until = u64::MAX;
+            let (enter_places, leave_places) = (places(&native), places(&native));
+            let enter =
+                transition::guarded_enter_thunk(GuestAddress(pc), syndrome, &enter_places, 0);
+            let leave =
+                transition::guarded_exit_thunk(GuestAddress(ENTER + 0x40), &leave_places, 0);
+            let back = if pan { 2 } else { 1 };
+            for round in 0..2 {
+                assert_eq!(
+                    observed(&engine),
+                    observed(&native),
+                    "PAN {pan} round {round}"
+                );
+                engine.system_instruction(GENTER_WORD).unwrap();
+                let exit = run_native(&mut native, &enter.code);
+                assert_eq!(
+                    exit,
+                    (ENTER, ExitKind::Return as u64),
+                    "PAN {pan} round {round}"
+                );
+                assert_eq!(observed(&engine), observed(&native));
+                let (set, cr3, word) = sets(&native);
+                assert_eq!(set, 1);
+                assert_eq!(cr3 & !KEEP_ENTRIES, sets(&engine).1);
+                assert_eq!(cr3 & !KEEP_ENTRIES, FakeSets::cr3_of(1, GUARDED));
+                assert_eq!(cr3 & KEEP_ENTRIES != 0, round == 1, "flushed on first load");
+                assert_eq!(word, GUARDED as u64);
+                for machine in [&mut engine, &mut native] {
+                    machine.cpu.pc = ENTER + 0x40;
+                }
+                engine.system_instruction(GEXIT).unwrap();
+                let exit = run_native(&mut native, &leave.code);
+                assert_eq!(exit, (pc + 4, ExitKind::Return as u64));
+                assert_eq!(observed(&engine), observed(&native));
+                let (_, cr3, word) = sets(&native);
+                assert_eq!(cr3 & !KEEP_ENTRIES, sets(&engine).1);
+                assert_eq!(cr3 & !KEEP_ENTRIES, FakeSets::cr3_of(1, back));
+                assert_eq!(cr3 & KEEP_ENTRIES != 0, round == 1);
+                assert_eq!(word, back as u64);
+                let stale = &native.host.sets.as_ref().unwrap().sets.stale;
+                assert_eq!((stale[8 + GUARDED], stale[8 + back]), (0, 0));
+                for machine in [&mut engine, &mut native] {
+                    machine.cpu.pc = pc;
+                }
+            }
+            assert_eq!(native.statistics.native_transitions, [0, 0, 2, 2]);
+            assert_eq!(native.host.sets.as_ref().unwrap().sets.flushes, 2);
+            // A set of another class: the engine's.
+            native.host.sets.as_mut().unwrap().sets.classes[1] = 2;
+            let before = observed(&native);
+            let exit = run_native(&mut native, &enter.code);
+            assert_eq!(exit, (pc, ExitKind::System as u64));
+            assert_eq!(observed(&native), before);
+            engine.system_instruction(GENTER_WORD).unwrap();
+            native.system_instruction(GENTER_WORD).unwrap();
+            assert_eq!(observed(&engine), observed(&native));
+        }
+        // EL1: GENTER to GL1 makes no record, and its thunk exits.
+        let mut machine = machine_on(Chip::AppleM2, &[]);
+        machine.host.sets = Some(FakeSets::new());
+        machine.cpu.pstate = Pstate::reset(1);
+        machine.cpu.apple.sprr_config |= mmu::SPRR_CONFIG_EN;
+        machine.cpu.apple.gxf_config[0] |= crate::machine::cpu::GXF_CONFIG_EN;
+        machine.cpu.apple.guarded[0].enter = ENTER;
+        machine.derived_changed();
+        machine.sync_regime();
+        let el1 = machine.mirror_state();
+        for _ in 0..2 {
+            machine.cpu.pc = pc;
+            machine.system_instruction(GENTER_WORD).unwrap();
+            machine.finish_transition(1);
+            assert!(machine.cpu.pstate.guarded && machine.cpu.pstate.el == 1);
+            machine.system_instruction(GEXIT).unwrap();
+            machine.finish_transition(1);
+        }
+        let table = &machine.mirrors.transitions;
+        assert_ne!(
+            table.records[el1][GUARDED_ENTER].generation,
+            table.generation
+        );
+        machine.cpu.pc = pc;
+        let thunk =
+            transition::guarded_enter_thunk(GuestAddress(pc), syndrome, &places(&machine), 0);
+        assert_eq!(
+            run_native(&mut machine, &thunk.code),
+            (pc, ExitKind::System as u64)
+        );
+    }
+
+    /// GENTER and GEXIT in a root set the records were not made in, as M7
+    /// ran every one after a process switch: the engine path and the
+    /// native thunks (CR3 a word), each pair. Run with `--release --lib
+    /// guarded_set_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual: opt-in"]
+    fn guarded_set_benchmark() {
+        use super::super::tests::FakeSets;
+        use core::ffi::c_void;
+        use stela_compiler::x86_64::table_switch::Cr3;
+        unsafe extern "C" {
+            fn mmap(a: *mut c_void, b: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut c_void;
+            fn mprotect(a: *mut c_void, b: usize, p: i32) -> i32;
+        }
+        const MSR_TTBR0: u32 = 0xd518_2003;
+        const ROUNDS: u64 = 200_000;
+        let pc = BASE + 0x100;
+        // Records name the frame they were made on: made in place.
+        let (mut engine, mut native) = (gxf2(), gxf2());
+        for machine in [&mut engine, &mut native] {
+            machine.host.sets = Some(FakeSets::new());
+            machine.cpu.state.x[3] = 1 << 48 | 0x8000;
+            machine.system_instruction(MSR_TTBR0).unwrap();
+            prepare(machine, pc);
+            for _ in 0..2 {
+                machine.system_instruction(GENTER_WORD).unwrap();
+                machine.finish_transition(1);
+                machine.system_instruction(GEXIT).unwrap();
+                machine.finish_transition(1);
+                machine.cpu.pc = pc;
+            }
+            machine.cpu.state.x[3] = 2 << 48 | 0xc000;
+            machine.system_instruction(MSR_TTBR0).unwrap();
+            prepare(machine, pc);
+        }
+        let native = &mut native;
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            engine.cpu.pc = pc;
+            engine.system_instruction(GENTER_WORD).unwrap();
+            engine.finish_transition(1);
+            engine.system_instruction(GEXIT).unwrap();
+            engine.finish_transition(1);
+        }
+        let engine_ns = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+        native.mirrors.lines_until = u64::MAX;
+        let places = transition::Places {
+            cr3: Cr3::Word(&native.host.sets.as_ref().unwrap().cr3 as *const u64 as u64),
+            ..TRANSITIONS
+        };
+        let syndrome = Cpu::guarded_enter_syndrome(3) as u32;
+        let map = |code: &[u8]| {
+            let code = stela_compiler::x86_64::pinned::entered(code);
+            // SAFETY: private anonymous memory, RX after the copy, never
+            // unmapped: the test's process ends with it.
+            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> [u64; 2] = unsafe {
+                let page = mmap(core::ptr::null_mut(), 8192, 3, 2 | 0x20, -1, 0);
+                assert_ne!(page as usize, usize::MAX);
+                core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
+                assert_eq!(mprotect(page, 8192, 5), 0);
+                core::mem::transmute(page)
+            };
+            entry
+        };
+        let enter = transition::guarded_enter_thunk(GuestAddress(pc), syndrome, &places, 0);
+        let leave = transition::guarded_exit_thunk(GuestAddress(ENTER + 0x40), &places, 0);
+        let (enter, leave) = (map(&enter.code), map(&leave.code));
+        enter_native(native);
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            // SAFETY: the thunks' code, on the machine's frame.
+            let [at, kind] = unsafe { enter(&mut native.cpu.state) };
+            assert_eq!((at, kind), (ENTER, ExitKind::Return as u64));
+            // SAFETY: as above.
+            let [at, _] = unsafe { leave(&mut native.cpu.state) };
+            assert_eq!(at, pc + 4);
+        }
+        let native_ns = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+        println!(
+            "GENTER and GEXIT in another set: engine path {engine_ns:.1} ns, \
+             native thunks {native_ns:.1} ns a pair"
+        );
     }
 
     /// A write of SPRR's field registers (`S3_6_C15_C3_0`), which SPTM
