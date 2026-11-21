@@ -911,6 +911,18 @@ impl<'a> Layout<'a> {
             .iter()
             .filter(|(_, piece)| matches!(piece, Piece::New(_)))
             .count();
+        Self::counted(prefix, records, length, pieces, fresh)
+    }
+
+    /// [`Layout::of`] whose `fresh` records encoded for it take `pieces`
+    /// heap bytes.
+    fn counted(
+        prefix: Vec<u8>,
+        records: Vec<(u64, Piece<'a>)>,
+        length: u64,
+        pieces: usize,
+        fresh: usize,
+    ) -> Self {
         let owned = prefix.capacity() + records.capacity() * size_of::<(u64, Piece<'a>)>() + pieces;
         Self {
             prefix,
@@ -1148,26 +1160,60 @@ impl UsedKeys {
 /// segment a step at a time: each step encodes or indexes a bounded number
 /// of records.
 pub struct Delta {
-    records: alloc::collections::btree_map::IntoIter<Digest, Record>,
+    /// The batches of entries taken, oldest first, each in key order: a
+    /// page several hold is one record, merged as it is encoded.
+    batches: Vec<core::iter::Peekable<alloc::collections::btree_map::IntoIter<Digest, Record>>>,
     /// A merge of no segments, given the encoded records in key order.
     merge: Merge<'static>,
 }
 
 impl Delta {
     pub fn new(translator: Digest, records: BTreeMap<Digest, Record>) -> Self {
+        Self::of(translator, alloc::vec![records])
+    }
+
+    /// The segment of `batches`, oldest first: a page several hold has one
+    /// record, the older batch's entries first ([`Record::merge`]), as
+    /// though each batch had been added to the one before.
+    pub fn of(translator: Digest, batches: Vec<BTreeMap<Digest, Record>>) -> Self {
         let mut merge = Merge::new(translator, Vec::new(), Vec::new(), u64::MAX);
-        merge.records.reserve_exact(records.len());
+        merge
+            .records
+            .reserve_exact(batches.iter().map(BTreeMap::len).sum());
         Self {
-            records: records.into_iter(),
+            batches: batches
+                .into_iter()
+                .map(|batch| batch.into_iter().peekable())
+                .collect(),
             merge,
         }
+    }
+
+    /// The next page's record, of every batch that holds it.
+    fn next(&mut self) -> Option<(Digest, Record)> {
+        let key = self
+            .batches
+            .iter_mut()
+            .filter_map(|batch| batch.peek().map(|(key, _)| *key))
+            .min()?;
+        let mut merged: Option<Record> = None;
+        for batch in &mut self.batches {
+            let Some((_, record)) = batch.next_if(|(next, _)| *next == key) else {
+                continue;
+            };
+            match &mut merged {
+                Some(merged) => merged.merge(record),
+                None => merged = Some(record),
+            }
+        }
+        merged.map(|record| (key, record))
     }
 
     /// Carry out up to `work` more units (a record encoded or indexed):
     /// whether the segment is laid out.
     pub fn step(&mut self, work: usize) -> bool {
         for done in 0..work {
-            let Some((key, record)) = self.records.next() else {
+            let Some((key, record)) = self.next() else {
                 return self.merge.step(work - done);
             };
             self.merge.push(key, Piece::New(record.encode()));
@@ -1226,13 +1272,46 @@ pub struct Merge<'a> {
 
 /// The age of a record a merge leaves out to stay within its bound.
 const DROPPED: u8 = u8::MAX;
+/// The records taken a merge lets go of in one unit, once laid out.
+const CLEARED_RECORDS: usize = 1024;
 /// The ranks a merge keeps records by ([`Merge::rank`]).
 const RANKS: usize = MAX_UNUSED_BOOTS as usize + 2;
 
+/// Records of the rank that does not fit whole, the most used first, ties
+/// in key order: its uses, the most uses its segments counted, and where
+/// it is among those taken.
+type ByUse = alloc::collections::BinaryHeap<(u32, u8, core::cmp::Reverse<usize>)>;
+
 /// Where a [`Merge`] is.
 enum Phase<'a> {
+    /// Gathering the prefixes of the keys the running boot used so far
+    /// ([`Merge::protect_used`]), each in order, before any key is taken.
+    Protecting {
+        keys: Vec<Digest>,
+        gathered: alloc::collections::BTreeSet<u64>,
+        sorted: Vec<u64>,
+    },
     /// Taking page keys from the segments.
     Taking,
+    /// Ranking by use, from record `at`, the records of the rank that does
+    /// not fit whole (`oldest`) after `count` records of `bytes` that do.
+    Ranking {
+        oldest: usize,
+        at: usize,
+        count: usize,
+        bytes: u64,
+        order: ByUse,
+    },
+    /// Picking those, the most used first, while they fit: `kept` records
+    /// of `kept_bytes` so far.
+    Picking {
+        oldest: usize,
+        count: usize,
+        bytes: u64,
+        kept: usize,
+        kept_bytes: u64,
+        order: ByUse,
+    },
     /// Choosing, of the age that does not fit whole (`oldest`), the records
     /// that do, in key order; `count` and `bytes` are those kept so far.
     Choosing {
@@ -1242,7 +1321,8 @@ enum Phase<'a> {
         bytes: u64,
     },
     /// Writing the index of the `count` records kept, with the checksum of
-    /// its first `hashed` bytes, and moving them to the layout.
+    /// its first `hashed` bytes, and moving them to the layout: the heap
+    /// bytes of those encoded anew, `fresh` of them.
     Indexing {
         at: usize,
         prefix: Vec<u8>,
@@ -1250,7 +1330,12 @@ enum Phase<'a> {
         hashed: usize,
         offset: u64,
         placed: Vec<(u64, Piece<'a>)>,
+        owned: usize,
+        fresh: usize,
     },
+    /// Letting go of what the layout no longer needs, a piece at a time:
+    /// the segments merged, the boot's uses and the records taken.
+    Clearing(Layout<'a>),
     Done(Layout<'a>),
 }
 
@@ -1318,6 +1403,20 @@ impl<'a> Merge<'a> {
         self
     }
 
+    /// [`Merge::protect`] the keys the running boot used so far, `keys` in
+    /// any order and more than once, as their list would name them
+    /// ([`UsedKeys::encode`]): gathered a step at a time before the merge
+    /// takes any key, as a boot's hundred thousand would take a step's
+    /// time many times over.
+    pub fn protect_used(mut self, keys: Vec<Digest>) -> Self {
+        self.phase = Phase::Protecting {
+            keys,
+            gathered: alloc::collections::BTreeSet::new(),
+            sorted: Vec::new(),
+        };
+        self
+    }
+
     /// Of the rank that does not fit whole, keep the records the running
     /// boot used most (`uses`, by page key), not the first in key order:
     /// a merge that ran while a boot had used part of its pack left out
@@ -1327,38 +1426,26 @@ impl<'a> Merge<'a> {
         self
     }
 
-    /// Which records of rank `oldest` fit after `count` records of `bytes`
-    /// kept whole: the most used first, ties in key order.
-    fn choose(&self, oldest: Option<usize>, mut count: usize, mut bytes: u64) -> Vec<bool> {
+    /// The phase after the keys are taken: ranking by use the records of
+    /// the rank that does not fit whole, if one does not.
+    fn taken(&mut self) -> Phase<'a> {
+        let (oldest, count, bytes) = self.whole_ages();
         let Some(oldest) = oldest else {
-            return Vec::new();
+            return Phase::Choosing {
+                oldest,
+                at: 0,
+                count,
+                bytes,
+            };
         };
-        let mut order: Vec<(u32, u8, usize)> = self
-            .records
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, rank))| usize::from(*rank) == oldest)
-            .map(|(at, (key, _, _))| {
-                (
-                    self.uses.get(key).copied().unwrap_or(0),
-                    self.counted[at],
-                    at,
-                )
-            })
-            .collect();
-        order.sort_by_key(|&(uses, counted, at)| {
-            (core::cmp::Reverse(uses), core::cmp::Reverse(counted), at)
-        });
-        let mut chosen = alloc::vec![false; self.records.len()];
-        for (_, _, at) in order {
-            let more = self.records[at].1.bytes().len() as u64;
-            if count < MAX_RECORDS && layout_bytes(count + 1, bytes + more) <= self.bound {
-                chosen[at] = true;
-                count += 1;
-                bytes += more;
-            }
+        self.chosen = alloc::vec![false; self.records.len()];
+        Phase::Ranking {
+            oldest,
+            at: 0,
+            count,
+            bytes,
+            order: ByUse::new(),
         }
-        chosen
     }
 
     /// Add a record of age 0 after those taken, its key past theirs.
@@ -1485,21 +1572,101 @@ impl<'a> Merge<'a> {
         (None, count, bytes)
     }
 
-    /// Carry out up to `work` more units (a page key taken, a record chosen
-    /// or indexed): whether the segment is laid out.
+    /// Carry out up to `work` more units (a used key gathered, a page key
+    /// taken, a record ranked, chosen or indexed, or a piece let go):
+    /// whether the segment is laid out.
     pub fn step(&mut self, work: usize) -> bool {
+        self.step_using(work, &mut |_| 0)
+    }
+
+    /// [`Merge::step`], the running boot's uses of a key not in its uses
+    /// ([`Merge::by_use`]) asked of `uses` as the merge reaches its record.
+    pub fn step_using(&mut self, work: usize, uses: &mut dyn FnMut(&Digest) -> u32) -> bool {
+        // A key's uses: those given, else those asked.
+        let mut used = |given: &BTreeMap<Digest, u32>, key: &Digest| {
+            given.get(key).copied().unwrap_or_else(|| uses(key))
+        };
         for _ in 0..work {
             match &mut self.phase {
+                Phase::Protecting {
+                    keys,
+                    gathered,
+                    sorted,
+                } => {
+                    if let Some(key) = keys.pop() {
+                        gathered.insert(prefix(&key));
+                        // Past what a list names, every record counts as
+                        // used, as the boot's list will say.
+                        if gathered.len() > MAX_USED_KEYS {
+                            self.protect = Some(UsedKeys {
+                                every: true,
+                                prefixes: Vec::new(),
+                            });
+                            self.phase = Phase::Taking;
+                        }
+                    } else if let Some(first) = gathered.pop_first() {
+                        sorted.push(first);
+                    } else {
+                        self.protect = Some(UsedKeys {
+                            every: false,
+                            prefixes: core::mem::take(sorted),
+                        });
+                        self.phase = Phase::Taking;
+                    }
+                }
                 Phase::Taking => {
                     if !self.take() {
-                        let (oldest, count, bytes) = self.whole_ages();
-                        self.chosen = self.choose(oldest, count, bytes);
-                        self.phase = Phase::Choosing {
-                            oldest,
-                            at: 0,
-                            count,
-                            bytes,
+                        self.phase = self.taken();
+                    }
+                }
+                Phase::Ranking {
+                    oldest,
+                    at,
+                    count,
+                    bytes,
+                    order,
+                } => {
+                    let Some((key, _, rank)) = self.records.get(*at) else {
+                        self.phase = Phase::Picking {
+                            oldest: *oldest,
+                            count: *count,
+                            bytes: *bytes,
+                            kept: *count,
+                            kept_bytes: *bytes,
+                            order: core::mem::take(order),
                         };
+                        continue;
+                    };
+                    if usize::from(*rank) == *oldest {
+                        let uses = used(&self.uses, key);
+                        order.push((uses, self.counted[*at], core::cmp::Reverse(*at)));
+                    }
+                    *at += 1;
+                }
+                Phase::Picking {
+                    oldest,
+                    count,
+                    bytes,
+                    kept,
+                    kept_bytes,
+                    order,
+                } => {
+                    let Some((_, _, core::cmp::Reverse(at))) = order.pop() else {
+                        self.phase = Phase::Choosing {
+                            oldest: Some(*oldest),
+                            at: 0,
+                            count: *count,
+                            bytes: *bytes,
+                        };
+                        continue;
+                    };
+                    let more = self.records[at].1.bytes().len() as u64;
+                    if *kept < MAX_RECORDS
+                        && layout_bytes(*kept + 1, *kept_bytes + more) <= self.bound
+                    {
+                        self.chosen[at] = true;
+                        *kept += 1;
+                        *kept_bytes += more;
                     }
                 }
                 Phase::Choosing {
@@ -1522,6 +1689,8 @@ impl<'a> Merge<'a> {
                             hashed: 0,
                             offset: prefix_length(count) as u64,
                             placed: Vec::with_capacity(count),
+                            owned: 0,
+                            fresh: 0,
                         };
                         continue;
                     };
@@ -1553,16 +1722,25 @@ impl<'a> Merge<'a> {
                     hashed,
                     offset,
                     placed,
+                    owned,
+                    fresh,
                 } => {
                     let Some((key, piece, age)) = self.records.get_mut(*at) else {
                         hasher.update(&prefix[*hashed..]);
                         let checksum = core::mem::replace(hasher, Sha256::new()).finalize();
                         let mut prefix = core::mem::take(prefix);
                         prefix.extend(checksum);
-                        self.phase =
-                            Phase::Done(Layout::of(prefix, core::mem::take(placed), *offset));
-                        self.records = Vec::new();
-                        return true;
+                        let layout = Layout::counted(
+                            prefix,
+                            core::mem::take(placed),
+                            *offset,
+                            *owned,
+                            *fresh,
+                        );
+                        self.chosen = Vec::new();
+                        self.counted = Vec::new();
+                        self.phase = Phase::Clearing(layout);
+                        continue;
                     };
                     let index = *at;
                     *at += 1;
@@ -1573,7 +1751,7 @@ impl<'a> Merge<'a> {
                     let length = piece.bytes().len() as u64;
                     // The most uses a boot made of it: this boot's, or an
                     // earlier one's.
-                    let boot = self.uses.get(key).copied().unwrap_or(0);
+                    let boot = used(&self.uses, key);
                     let uses = u64::from(self.counted[index].max(boot.min(255) as u8));
                     // The rank less the step for records the running boot
                     // did not use ([`Merge::rank`]).
@@ -1593,8 +1771,33 @@ impl<'a> Merge<'a> {
                         hasher.update(&prefix[*hashed..]);
                         *hashed = prefix.len();
                     }
-                    placed.push((*offset, core::mem::replace(piece, Piece::Kept(&[]))));
+                    let piece = core::mem::replace(piece, Piece::Kept(&[]));
+                    if let Piece::New(bytes) = &piece {
+                        *owned += bytes.capacity();
+                        *fresh += 1;
+                    }
+                    placed.push((*offset, piece));
                     *offset += length;
+                }
+                Phase::Clearing(_) => {
+                    // A segment merged, a use of the boot's, or a run of the
+                    // records taken, each moved out already.
+                    if self.segments.pop().is_some() || self.uses.pop_first().is_some() {
+                        continue;
+                    }
+                    if !self.records.is_empty() {
+                        let left = self.records.len().saturating_sub(CLEARED_RECORDS);
+                        self.records.truncate(left);
+                        continue;
+                    }
+                    self.records = Vec::new();
+                    let Phase::Clearing(layout) =
+                        core::mem::replace(&mut self.phase, Phase::Taking)
+                    else {
+                        unreachable!("a merge letting go");
+                    };
+                    self.phase = Phase::Done(layout);
+                    return true;
                 }
                 Phase::Done(_) => return true,
             }
@@ -3236,7 +3439,9 @@ mod tests {
             while !delta.step(1) {
                 steps += 1;
             }
-            assert!(steps <= 3 * 30 + 2, "{steps}");
+            // A unit to encode, choose and index each record, one each to
+            // end those, and two to let the records' list go.
+            assert!(steps <= 3 * 30 + 4, "{steps}");
             let layout = delta.finish().unwrap();
             let bytes: &'static [u8] = Vec::leak(layout.to_vec());
             packed.push(Segment::from(Pack::parse(bytes, &translator).unwrap()));
@@ -3265,7 +3470,9 @@ mod tests {
         while !merge.step(1) {
             steps += 1;
         }
-        assert!(steps <= 3 * keys.len() + 2, "{steps}");
+        // Past its bound, a unit to take, rank, pick, choose and index each
+        // record, and to let each segment go.
+        assert!(steps <= 5 * keys.len() + 12, "{steps}");
         let stepped = merge.finish();
         assert_eq!(stepped.layout.to_vec(), whole.layout.to_vec());
         assert_eq!(stepped.evicted, whole.evicted);

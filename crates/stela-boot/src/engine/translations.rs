@@ -1369,19 +1369,18 @@ impl Entries for Parts {
             .sum::<usize>() as u64
     }
 
-    fn uses(&mut self) -> BTreeMap<Digest, u32> {
-        let mut uses = BTreeMap::<Digest, u32>::new();
-        for lock in &STORES {
-            lock.with(|store| {
-                if let Some(store) = store {
-                    for (key, count) in store.uses() {
-                        let held = uses.entry(*key).or_default();
-                        *held = held.saturating_add(*count);
-                    }
-                }
-            });
-        }
-        uses
+    fn uses_of(&mut self, key: &Digest) -> u32 {
+        STORES
+            .iter()
+            .map(|lock| {
+                lock.with(|store| {
+                    store
+                        .as_ref()
+                        .and_then(|store| store.uses().get(key).copied())
+                        .unwrap_or(0)
+                })
+            })
+            .fold(0, u32::saturating_add)
     }
 
     fn shed(&mut self, shed: bool) {
