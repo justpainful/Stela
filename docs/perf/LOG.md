@@ -211,6 +211,13 @@ Looked at and left: PMU mirrors per entry (~67 host instructions a run),
 the interrupt check (~100), the lower-half global page's second ITLB
 probe (~70), `grace.pass`'s locked add (a required full barrier).
 
+| `c3d325f` | a branch exit that missed its target fetches at once (skips schedule and device step) unless its budget ran out | br 4 PEs 151-167 -> 138-146 ns |
+| `f870d59` | no write-back of an empty transition note per run | serial host instructions -1.3 % |
+
+Engine round trip now, cloud Xeon: br serial 116-130 ns (164 at the
+session's start), 4 PEs 138-146 ns (220); host instructions per serial
+run about 2570 (3470).
+
 ## Owner checkpoints
 
 The owner asks for the difference since their last question. Each line is
