@@ -3,15 +3,17 @@
 //! Under PSTATE.DIT ([`super::super::plain_ordering`]) they are a plain load,
 //! update and store ([`plain`]).
 use super::{
-    ADDRESS, QWORD_BYTES, commit_rax, input_rax, input_rcx, locked_compare_exchange, read_rax, size,
+    ADDRESS, BYTE_BYTES, QWORD_BYTES, commit_rax, input_rax, input_rcx, locked_compare_exchange,
+    read_rax, size, store_rcx,
 };
+use crate::TargetCpu;
 use crate::aarch64::{
     Register,
-    atomic::{Kind, Operand, Rmw},
+    atomic::{Kind, Operand, Order, Rmw},
 };
 use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Size, Unary, resolve};
 
-pub(super) fn emit(code: &mut Code, operand: &Operand, plain_access: bool) {
+pub(super) fn emit(code: &mut Code, operand: &Operand, target: TargetCpu, plain_access: bool) {
     let Kind::ReadModifyWrite {
         operation,
         source,
@@ -22,6 +24,24 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, plain_access: bool) {
     };
     if plain_access {
         plain(code, operand.bytes, operation, source, destination);
+        return;
+    }
+    if operation == Rmw::Swap
+        && destination == Register::Zero
+        && (target.supports(TargetCpu::LineAtomic) || operand.bytes == BYTE_BYTES)
+    {
+        // A swap whose old value goes to ZR is a single-copy atomic store:
+        // nothing reads what it read, and with ZR it does not acquire
+        // ([`crate::aarch64::atomic::Order::acquires`]). Inside its granule
+        // it is inside a cache line, where an Intel store is single-copy
+        // atomic, so it is a plain store; SWPL and SWPAL release, as STLR
+        // does, through the frame's mark (`super::super::ordered`).
+        input_rcx(code, operand.bytes, source);
+        if matches!(operand.order, Order::Release | Order::AcquireRelease) {
+            super::super::ordered::marked_release(code, operand.bytes);
+        } else {
+            store_rcx(code, operand.bytes);
+        }
         return;
     }
     if matches!(operation, Rmw::Swap | Rmw::Add) {
@@ -236,5 +256,48 @@ mod tests {
             Register::Zero,
         );
         assert!(code.ends_with(&[0x44, 0x89, 0x02]));
+    }
+
+    /// A swap into ZR is a store on an Intel host, marked as a
+    /// store-release's when it releases; one that returns the old value, or
+    /// elsewhere one wider than a byte, is XCHG.
+    #[test]
+    fn a_swap_into_zr_is_a_store() {
+        use crate::aarch64::atomic::Order;
+        // mov dword [rdx],ecx, then mov byte [rdi+920],1.
+        const STORE: &[u8] = &[0x89, 0x0a];
+        const MARK: &[u8] = &[0xc6, 0x87, 0x98, 0x03, 0, 0, 1];
+        let intel = TargetCpu::X86_64_V3.with_line_atomic();
+        let amd = TargetCpu::X86_64_V3;
+        for target in [intel, amd] {
+            for order in [
+                Order::Relaxed,
+                Order::Acquire,
+                Order::Release,
+                Order::AcquireRelease,
+            ] {
+                for destination in [Register::Zero, Register::X(2)] {
+                    let operand = Operand {
+                        bytes: DWORD_BYTES,
+                        base: Register::X(3),
+                        order,
+                        kind: Kind::ReadModifyWrite {
+                            operation: Rmw::Swap,
+                            source: Register::X(1),
+                            destination,
+                        },
+                    };
+                    let mut code = Code::new();
+                    emit(&mut code, &operand, target, false);
+                    let stored = target == intel && destination == Register::Zero;
+                    let releases = matches!(order, Order::Release | Order::AcquireRelease);
+                    let expected = [STORE, if releases { MARK } else { &[] }].concat();
+                    assert_eq!(code.ends_with(&expected), stored, "{order:?}");
+                    // xchg [rdx],eax.
+                    let exchanged = code.windows(2).any(|window| window == [0x87, 0x02]);
+                    assert_eq!(exchanged, !stored, "{order:?} {destination:?}");
+                }
+            }
+        }
     }
 }

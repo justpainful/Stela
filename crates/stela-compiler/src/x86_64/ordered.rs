@@ -251,8 +251,8 @@ fn pending_release() -> Mem {
 
 /// A store-release as a plain store, which x86 keeps in order after earlier
 /// accesses, marking the frame so the next load-acquire drains it first
-/// ([`drain_release`]).
-fn marked_release(code: &mut Code, bytes: u8) {
+/// ([`drain_release`]). RCX holds the data and RDX the checked address.
+pub(super) fn marked_release(code: &mut Code, bytes: u8) {
     store_rcx(code, bytes);
     code.asm().mov_byte_imm(pending_release(), 1);
 }
