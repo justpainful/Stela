@@ -82,12 +82,33 @@ daily-driver. Conflicts:
 - Indirect branches `b9e131f` and system exits (`103cccd`, `69e09b7`) onto
   the merged branch, with full compiler and engine suites.
 
+### Measured (cloud Xeon, same machine, before and after)
+
+NVMe transfer bench (`nvme::owned::tests::transfer_cost`, release, best of
+4 over 64 MiB, per MiB of 1 MiB guest transfers):
+
+| Host command size | Commands | Write us | Read us |
+|---|---|---|---|
+| 128 KiB (base `0bc7857`) | 8 | 960 | 930 |
+| 256 KiB | 4 | 1007 | 967 |
+| 512 KiB | 2 | 1086 | 1001 |
+| 1 MiB (`5329e69`) | 1 | 1161 | 1076 |
+
+The model has no device latency and no step waits, so this shows only the
+host copy and bookkeeping: 21 % slower at 1 MiB. `5329e69` is reverted
+(`df0ea17`); the size returns as a boot option for an owner A/B.
+
+Merge `a5d87ab` tests: engine 1975, soc 1629, storage 314, audio 405,
+boot-core 1127 passed; compiler 1591 passed, 7 failed (the same FP16
+seven as the base).
+
 ## Owner checkpoints
 
 The owner asks for the difference since their last question. Each line is
 the state they were last told about.
 
-- 2026-11-21 13:05 (asked 1): base `0bc7857`, now `42dce19`. No measured
-  performance difference yet: the changes are in the disk path and need an
-  owner boot. Expected: 8x fewer host NVMe commands for 1 MiB guest
-  transfers (MDTS >= 8); no polling for the whole boot when interrupts work.
+- 2026-11-21 (asked 1): base `0bc7857`, now `5dc79ec`. Measured: NVMe 1 MiB
+  commands 21 % slower per MiB on the host (reverted). Guest instructions
+  per second: unchanged by this session (no translator or engine change
+  beyond upstream's merge); the owner baseline stays session 3, 4.98 G/s
+  peak, 2.42 G/s median.
