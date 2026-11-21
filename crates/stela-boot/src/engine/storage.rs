@@ -673,8 +673,10 @@ struct Service {
     /// a busy core takes the disk's signal only at its next interrupt window.
     looked: Cell<staged_disk::LookGate>,
     /// Whether a disk that signals has been heard: one that completes many
-    /// commands without one is polled, and said so once.
+    /// commands without one is polled until it is heard again.
     heard: staged_disk::SignalWatch,
+    /// The changes [`Service::heard`] made, for its reports.
+    verdicts: u64,
     /// Host commands that failed, which the guest sees only as its
     /// controller's error status.
     failures: u64,
@@ -781,13 +783,29 @@ impl Service {
 
     /// A command completed: a disk said to signal that has sent no signal
     /// over [`staged_disk::SILENT_COMPLETIONS`] completions is looked at
-    /// as one that sends none, and reported once.
+    /// as one that sends none, until its completions follow signals again
+    /// ([`staged_disk::SignalWatch`]); each change is reported, the first
+    /// few and then each power-of-two count.
     fn heard(&mut self) {
-        if self.signals() && self.heard.completed(super::host::device_signals()) {
-            self.signals.set(Some(false));
+        if !self.heard.silent() && !self.signals() {
+            return;
+        }
+        let Some(verdict) = self.heard.completed(super::host::device_signals()) else {
+            return;
+        };
+        let (signals, what) = match verdict {
+            staged_disk::Verdict::Silent => (false, "no completion interrupt, polling"),
+            staged_disk::Verdict::HeardAgain => {
+                (true, "completion interrupt heard again, waiting for it")
+            }
+        };
+        self.signals.set(Some(signals));
+        self.verdicts += 1;
+        if self.verdicts <= 8 || self.verdicts.is_power_of_two() {
             output::arguments(format_args!(
-                "HOST DISK serial={} no completion interrupt, polling\n",
-                stela_contracts::masked::Tail(&self.inner.identity().serial)
+                "HOST DISK serial={} {what} (change {})\n",
+                stela_contracts::masked::Tail(&self.inner.identity().serial),
+                self.verdicts
             ));
         }
     }
@@ -1179,6 +1197,7 @@ impl stela_drivers::probe::Observer for Observer {
             signals: Cell::new(None),
             looked: Cell::new(staged_disk::LookGate::default()),
             heard: staged_disk::SignalWatch::default(),
+            verdicts: 0,
             failures: 0,
             started: Vec::new(),
         });
@@ -1970,6 +1989,7 @@ pub unsafe fn open(
             signals: Cell::new(None),
             looked: Cell::new(staged_disk::LookGate::default()),
             heard: staged_disk::SignalWatch::default(),
+            verdicts: 0,
             failures: 0,
             started: Vec::new(),
         })
@@ -2391,6 +2411,7 @@ pub unsafe fn open(
                 signals: Cell::new(None),
                 looked: Cell::new(staged_disk::LookGate::default()),
                 heard: staged_disk::SignalWatch::default(),
+                verdicts: 0,
                 failures: 0,
                 started: Vec::new(),
             }) as Box<dyn BlockDevice>
