@@ -81,3 +81,13 @@ daily-driver. Conflicts:
   processor (`OWED_DOORBELL`).
 - Indirect branches `b9e131f` and system exits (`103cccd`, `69e09b7`) onto
   the merged branch, with full compiler and engine suites.
+
+## Owner checkpoints
+
+The owner asks for the difference since their last question. Each line is
+the state they were last told about.
+
+- 2026-11-21 13:05 (asked 1): base `0bc7857`, now `42dce19`. No measured
+  performance difference yet: the changes are in the disk path and need an
+  owner boot. Expected: 8x fewer host NVMe commands for 1 MiB guest
+  transfers (MDTS >= 8); no polling for the whole boot when interrupts work.
