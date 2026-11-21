@@ -15,7 +15,7 @@
 //! Native code reads a memo whatever the tag words: an empty one shared by
 //! every service until a service needs its own.
 use crate::pauth;
-use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec};
 use core::mem::offset_of;
 use stela_compiler::{Anchor, Place, block::PointerAuthenticationKey, x86_64::pointer};
 
