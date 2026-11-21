@@ -102,6 +102,39 @@ Merge `a5d87ab` tests: engine 1975, soc 1629, storage 314, audio 405,
 boot-core 1127 passed; compiler 1591 passed, 7 failed (the same FP16
 seven as the base).
 
+## 2026-11-21, session 1 continued: translation (M2)
+
+Machine: the same cloud Xeon. Kernel numbers are compiled for the owner's
+tier (AVX2, no AVX-512: `owner_target` in `kernel_costs`).
+
+### Baseline (`kernel_costs`, ns per guest instruction, self-looping blocks)
+
+global_counter 0.160, integer_alu 0.155 to 0.19 (noisy), global_read
+0.185, bytes_ldrb_strb 0.214, list_chase 0.270, memcpy_unrolled 0.275,
+memcpy_ldp_stp 0.355, stack_frame 0.392, neon_fmla 0.55 (5531 bytes).
+A tight loop runs 2 to 6 G guest instructions/s per PE; the owner's boots
+average about 0.3 G/s per PE, so the time is between blocks.
+
+### Landed
+
+| Commit | What | Before | After |
+|---|---|---|---|
+| `010b686` (from `b9e131f`) | predicted tail miss probes the jump cache | miss over 4 targets 12.54 ns, 64: 14.76, 1024: 18.17 | 8.36 (-33 %), 9.70 (-34 %), 11.47 (-37 %) |
+| `fac17a2` (from `69e09b7`) | PAC key input lists are rings | open at a thread switch, 64 processes 2110 ns, 1024: 2075 | 235 (-89 %), 234 (-89 %) |
+
+Tests: compiler 1591 passed (7 FP16 failures as before), engine 1975
+passed. Clippy host and UEFI clean.
+
+### Tried and dropped (measured)
+
+- No NZCV store on a self-loop's back edge: -5 to -26 % per kernel as an
+  upper bound, but not bit-exact: a fault in the next iteration before its
+  flag setter, or the budget exit every 249 instructions, needs the word.
+  Only loops whose head is pure arithmetic could take it.
+- Reading RAX where the next instruction read the held register's frame
+  slot: integer_alu median 0.177 -> 0.186 ns, others within 1 %. Memory
+  renaming already forwards these; reverted.
+
 ## Owner checkpoints
 
 The owner asks for the difference since their last question. Each line is
@@ -112,3 +145,8 @@ the state they were last told about.
   per second: unchanged by this session (no translator or engine change
   beyond upstream's merge); the owner baseline stays session 3, 4.98 G/s
   peak, 2.42 G/s median.
+- 2026-11-21 (asked 2): now `a410791`. Since checkpoint 1: indirect
+  branch misses 33 to 37 % faster, PAC key switches 89 % faster at 64
+  processes and more. The owner's last measured rate is session 3's
+  (2.42 G/s median, 4.98 G/s peak); the next boot's `GUEST PERFORMANCE`
+  line is the new figure.
