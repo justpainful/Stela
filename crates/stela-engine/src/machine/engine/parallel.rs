@@ -1172,6 +1172,12 @@ impl Hub {
         true
     }
 
+    /// [`Self::hand_off_service`], unless the service is due already: a PE
+    /// woken for it has yet to take it, and takes this work too.
+    pub(super) fn hand_off_unclaimed_service(&self, caller: usize) -> bool {
+        !self.service.load(Ordering::SeqCst) && self.hand_off_service(caller)
+    }
+
     /// A device left bytes for the host to feed or drain: the host's service
     /// is due. The first PE that sleeps waiting for an interrupt wakes to
     /// serve it ([`Inbox::serves`]), which its idle core can without holding

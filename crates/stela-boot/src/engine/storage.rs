@@ -1325,14 +1325,22 @@ pub(super) fn ring_owed_steps_at(id: u64) {
     }
 }
 
-/// Wake the owed steps' processor: through the line it waits on with
-/// MWAIT, else its doorbell interrupt.
+/// Wake a processor for the owed steps: once the PEs run, one whose guest
+/// sleeps waiting for an interrupt, whose idle service steps the disks at
+/// once (`gpu::call_idle_core`); else the owed steps' processor, through
+/// the line it waits on with MWAIT, else its doorbell interrupt. That one
+/// is the boot processor, which mostly runs guest code and takes the
+/// doorbell only between its slices: owed steps waited 420 us on average
+/// there.
 fn ring_owed() {
     let destination = OWED_DOORBELL.load(Ordering::Relaxed);
     if destination == u32::MAX {
         return;
     }
     OWED_TIMES[0].fetch_add(1, Ordering::Relaxed);
+    if super::gpu::call_idle_core() {
+        return;
+    }
     if !crate::native_idle::doorbell(destination).is_some_and(|doorbell| doorbell.ring()) {
         super::host::ring(destination);
     }
@@ -1426,9 +1434,15 @@ pub(super) fn serve_staged(whole: bool) -> bool {
     let mut finished = false;
     let started = super::host::fresh_counter();
     let budget = super::host::COUNTER_HZ / 1_000_000 * STEP_MICROS;
+    // A waiting PE's steps take what a release left due ([`released`]), as
+    // when a release handed that PE the work: due again only if a step gave
+    // up, so later releases hand on no step already taken.
+    let due = whole && STEP_DUE.swap(false, Ordering::AcqRel);
+    let mut gave_up = false;
     for worker in staged_workers() {
         while worker.work() {
             let step = step(worker);
+            gave_up |= step.is_none();
             finished |= step.as_ref().is_some_and(|step| step.finished != 0);
             if !whole || super::host::interrupted() {
                 break;
@@ -1446,6 +1460,9 @@ pub(super) fn serve_staged(whole: bool) -> bool {
                 break;
             }
         }
+    }
+    if due && gave_up {
+        STEP_DUE.store(true, Ordering::Release);
     }
     finished
 }

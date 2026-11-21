@@ -445,10 +445,12 @@ impl<D: Devices> Drop for Held<'_, D> {
         }
         // Host work completed outside the lock: the home machine takes its
         // next transfer at once, which publishes the real deadline again.
-        // A PE inside its run loop leaves that work, which can wait on a
-        // host device, to the next release by a PE outside it or to the
-        // host's own service: meanwhile it would read no mail, and every
-        // maintenance broadcast would wait for it. A PE outside it for a
+        // A PE inside its run loop never does that work, which can wait on a
+        // host device: meanwhile it would read no mail, and every
+        // maintenance broadcast would wait for it. It hands the work to a
+        // PE that sleeps waiting for an interrupt, or leaves it to the next
+        // release by a PE outside its loop or to the host's own service. A
+        // PE outside it for a
         // guest exit (a storage doorbell's) hands the work to a PE that
         // sleeps waiting for an interrupt, whose idle core does it at its
         // host service, and goes on with its guest; with none asleep, or
@@ -466,6 +468,17 @@ impl<D: Devices> Drop for Held<'_, D> {
                 self.step_here(call, || hub.kick.released());
                 self.board.stepped[call].fetch_add(1, Ordering::Relaxed);
             }
+        } else if hub.kick.release_due()
+            && !hub.kick.release_inline()
+            && hub.hand_off_unclaimed_service(self.pe)
+        {
+            // A PE inside its run loop, as the home machine at its DMA
+            // deadline whose look asked a staged disk for a result, hands
+            // the work to a PE that sleeps waiting for an interrupt, as a
+            // completion signal is: otherwise it waits for the next release
+            // outside a run loop. Once until that PE takes it.
+            acted = true;
+            self.board.handed[call].fetch_add(1, Ordering::Relaxed);
         }
         // A host interrupt this core held pending while its guest ran (a
         // host disk's completion signal) goes to a PE that sleeps waiting
