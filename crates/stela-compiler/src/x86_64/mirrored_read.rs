@@ -15,17 +15,47 @@
 //! before it, and the engine completes the MRS as it completes the exit of a
 //! block ending at it. Nothing else changes: the read touches no guest
 //! memory, flags or other registers. RAX and host flags are clobbered.
-use super::asm::{Alu, Code, Cond, Gpr, Mem, Patch, Rm, Size};
-use crate::{Anchor, GuestAddress, Place, aarch64::Register, block::ExitKind};
+//!
+//! A register whose thunk reads more than the cell's value names where its
+//! read comes from ([`Source`]): DAIF's, while native code writes the masks
+//! itself, from the masks in the frame (`register_read::mask_read_thunk`).
+use super::asm::{Alu, Code, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size};
+use crate::{Anchor, GuestAddress, GuestState, Place, aarch64::Register, block::ExitKind};
 
 /// Rt in an MRS word.
 const RT: u32 = 31;
 /// The cells' fields, as [`super::register_read`] thunks read them.
 const READABLE: i32 = core::mem::offset_of!(super::register_read::Cell, readable) as i32;
 const VALUE: i32 = core::mem::offset_of!(super::register_read::Cell, value) as i32;
+/// PSTATE.{D,A,I,F} in the frame, and their place in DAIF: bits 9:6.
+const MASKS: i32 = core::mem::offset_of!(GuestState, daif) as i32;
+const MASK_SHIFT: u8 = 6;
 
-/// One register: the MRS of it (Rt is ignored) and the offset of its cell
-/// from [`Anchor::Cells`].
+/// What an open cell's read completes with.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum Source {
+    /// The cell's `value` (`register_read::thunk`).
+    #[default]
+    Value,
+    /// PSTATE's D, A, I and F masks in the frame ([`GuestState::daif`]),
+    /// at DAIF's bits 9:6 (`register_read::mask_read_thunk`).
+    Masks,
+}
+
+/// One register: the MRS of it (Rt is ignored), the offset of its cell
+/// from [`Anchor::Cells`] and what its read completes with.
 #[derive(
     Debug,
     Clone,
@@ -42,10 +72,12 @@ const VALUE: i32 = core::mem::offset_of!(super::register_read::Cell, value) as i
 pub struct Read {
     pub word: u32,
     pub cell: u32,
+    #[serde(default)]
+    pub source: Source,
 }
 
 /// At most this many registers complete inside blocks.
-pub const READS: usize = 4;
+pub const READS: usize = 5;
 
 /// The registers whose MRS a block completes inside itself.
 #[derive(
@@ -71,14 +103,19 @@ impl Reads {
         reads: [None; READS],
     };
 
-    /// The offset of the cell of the register MRS `word` reads, if blocks
-    /// complete it.
-    pub fn cell(&self, word: u32) -> Option<u32> {
+    /// The register MRS `word` reads, if blocks complete it.
+    pub fn read(&self, word: u32) -> Option<Read> {
         self.reads
             .iter()
             .flatten()
             .find(|read| read.word & !RT == word & !RT)
-            .map(|read| read.cell)
+            .copied()
+    }
+
+    /// The offset of the cell of the register MRS `word` reads, if blocks
+    /// complete it.
+    pub fn cell(&self, word: u32) -> Option<u32> {
+        self.read(word).map(|read| read.cell)
     }
 }
 
@@ -97,7 +134,7 @@ pub(crate) struct Slow {
     closed: Patch,
 }
 
-/// The inline completion of MRS `word` at `pc` from the cell at `cell`:
+/// The inline completion of MRS `word` at `pc` from the cell of `read`:
 ///
 /// ```text
 /// mov rax,[rdi+anchors.cells]; cmp qword [rax+cell],0; je closed
@@ -105,9 +142,10 @@ pub(crate) struct Slow {
 /// ```
 ///
 /// (through RAX when Xt is in the frame; no load for XZR, whose read can
-/// still be UNDEFINED).
-pub(crate) fn emit(code: &mut Code, word: u32, pc: GuestAddress, cell: u32) -> Slow {
-    let cell = i32::try_from(cell).expect("a cell within reach of a displacement");
+/// still be UNDEFINED). The masks' read loads `mov eax,[rdi+daif]; shl
+/// eax,6` instead, which leaves bits 63:10 and 5:0 clear.
+pub(crate) fn emit(code: &mut Code, word: u32, pc: GuestAddress, read: Read) -> Slow {
+    let cell = i32::try_from(read.cell).expect("a cell within reach of a displacement");
     let mut asm = code.asm();
     asm.place(Gpr::Rax, Place::new(Anchor::Cells, 0));
     asm.alu_imm8(
@@ -117,13 +155,32 @@ pub(crate) fn emit(code: &mut Code, word: u32, pc: GuestAddress, cell: u32) -> S
         0,
     );
     let closed = asm.jcc(Cond::E);
-    let value = Mem::base(Gpr::Rax, cell + VALUE);
-    match asm.guest(destination(word)) {
-        None => {}
-        Some(Rm::Reg(host)) => asm.mov_load(Size::Qword, host, value),
-        Some(storage) => {
-            asm.mov_load(Size::Qword, Gpr::Rax, value);
-            asm.mov_store(Size::Qword, storage, Gpr::Rax);
+    let xt = asm.guest(destination(word));
+    match read.source {
+        Source::Value => {
+            let value = Mem::base(Gpr::Rax, cell + VALUE);
+            match xt {
+                None => {}
+                Some(Rm::Reg(host)) => asm.mov_load(Size::Qword, host, value),
+                Some(storage) => {
+                    asm.mov_load(Size::Qword, Gpr::Rax, value);
+                    asm.mov_store(Size::Qword, storage, Gpr::Rax);
+                }
+            }
+        }
+        Source::Masks => {
+            // A 32-bit write clears the host register's upper half.
+            let host = match xt {
+                Some(Rm::Reg(host)) => host,
+                _ => Gpr::Rax,
+            };
+            if xt.is_some() {
+                asm.mov_load(Size::Dword, host, Mem::base_disp32(Gpr::Rdi, MASKS));
+                asm.shift_imm(ShiftOp::Shl, Size::Dword, host, MASK_SHIFT);
+            }
+            if let Some(storage @ Rm::Mem(_)) = xt {
+                asm.mov_store(Size::Qword, storage, Gpr::Rax);
+            }
         }
     }
     Slow { pc, closed }

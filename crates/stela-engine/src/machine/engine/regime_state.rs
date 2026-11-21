@@ -252,7 +252,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             cache_clean: system::native_cache_clean(&self.cpu),
             exclusive: self.parallel.is_some(),
             pointer: Some(super::pointer::cells(self.target)),
-            mirrored: inline_mirrored_reads(),
+            mirrored: inline_mirrored_reads(self.parallel.is_some()),
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some(),
@@ -349,12 +349,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
 /// The [`MIRRORED`] registers whose MRS blocks complete inside themselves
 /// (`x86_64::mirrored_read`): those whose thunk reads the cell's value
-/// alone (`register_read::thunk`), with the kernel's thread pointer first.
-/// The guarded, count, counter and DAIF mirrors keep their thunks.
-fn inline_mirrored_reads() -> stela_compiler::x86_64::mirrored_read::Reads {
-    use registers::encodings::{CURRENT_EL, MPIDR_EL1, TPIDR_EL1, TPIDR_GL2};
-    use stela_compiler::x86_64::mirrored_read::{Read, Reads};
-    let read = |encoding| {
+/// alone (`register_read::thunk`), with the kernel's thread pointer first,
+/// and DAIF, which a kernel reads around each change of the masks, from
+/// what its thunk reads: the frame's masks where native code writes them
+/// (`exclusive`, `register_read::mask_read_thunk`), else the cell's value.
+/// The guarded, count and counter mirrors keep their thunks, and so do the
+/// value mirrors a kernel reads seldom (TPIDR_EL2, GXF_STATUS_EL1 and
+/// SPRR_PERM_EL0): each entry lengthens every comparison of the variants
+/// blocks are compiled for.
+fn inline_mirrored_reads(exclusive: bool) -> stela_compiler::x86_64::mirrored_read::Reads {
+    use registers::encodings::{CURRENT_EL, DAIF, MPIDR_EL1, TPIDR_EL1, TPIDR_GL2};
+    use stela_compiler::x86_64::mirrored_read::{Read, Reads, Source};
+    let read = |encoding, source| {
         let index = MIRRORED
             .iter()
             .position(|&mirrored| mirrored == encoding)
@@ -363,21 +369,28 @@ fn inline_mirrored_reads() -> stela_compiler::x86_64::mirrored_read::Reads {
             !GUARDED_MIRRORS.contains(&index)
                 && !COUNT_MIRRORS.contains(&index)
                 && !COUNTER_MIRRORS.contains(&index)
-                && index != DAIF_MIRROR
+                && (index == DAIF_MIRROR) == (encoding == DAIF)
         );
         let cell = cell_place(index);
         debug_assert_eq!(cell.anchor, stela_compiler::Anchor::Cells);
         Some(Read {
             word: read_word(encoding),
             cell: u32::try_from(cell.offset).expect("a cell offset"),
+            source,
         })
+    };
+    let masks = if exclusive {
+        Source::Masks
+    } else {
+        Source::Value
     };
     Reads {
         reads: [
-            read(TPIDR_EL1),
-            read(TPIDR_GL2),
-            read(MPIDR_EL1),
-            read(CURRENT_EL),
+            read(TPIDR_EL1, Source::Value),
+            read(TPIDR_GL2, Source::Value),
+            read(MPIDR_EL1, Source::Value),
+            read(CURRENT_EL, Source::Value),
+            read(DAIF, masks),
         ],
     }
 }

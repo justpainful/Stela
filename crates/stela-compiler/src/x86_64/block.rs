@@ -1406,11 +1406,11 @@ fn emit_selected(
                 continue;
             }
             if let Operation::MirroredRead { word } = instruction.operation {
-                let cell = native
+                let read = native
                     .mirrored
-                    .cell(word)
+                    .read(word)
                     .expect("blocks hold mirrored reads only given their cells");
-                mirrored_paths.push(super::mirrored_read::emit(code, word, instruction.pc, cell));
+                mirrored_paths.push(super::mirrored_read::emit(code, word, instruction.pc, read));
                 // Xt alone changes; its masked base, if any, is gone.
                 bases.after(instruction, None);
                 emitted_alone = true;
