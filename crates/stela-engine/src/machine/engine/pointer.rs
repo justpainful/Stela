@@ -1259,6 +1259,48 @@ mod tests {
         }
     }
 
+    /// What opening the service costs at a thread switch whose four key
+    /// halves each reach the engine, as they do while their write cells are
+    /// closed: the IB and DB keys of one of `threads` processes in turn,
+    /// written half by half, the kernel's keys staying. Run by hand in a
+    /// release build; prints nanoseconds per open once the lists are full.
+    #[test]
+    #[ignore = "manual: opt-in"]
+    fn open_timing() {
+        extern crate std;
+        const SWITCHES: u64 = 1 << 15;
+        /// Open `service` at each half of `process`'s IB and DB keys.
+        fn switch(service: &mut PointerService, input: &mut PointerInputs, process: u64) {
+            let key = |which: u64| [process << 8 | which, !process ^ which];
+            let (ib, db) = (key(1), key(3));
+            for (index, half, value) in [(1, 0, ib[0]), (1, 1, ib[1]), (3, 0, db[0]), (3, 1, db[1])]
+            {
+                let mut pair = input.keys[index].unwrap_or_default();
+                pair[half] = value;
+                input.keys[index] = Some(pair);
+                service.open(*input);
+            }
+        }
+        let tcr = 25 | 25 << 16 | 1 << 37;
+        for threads in [16, 64, 1024] {
+            let mut service = Box::new(PointerService::new());
+            let mut input = inputs(pauth::Version::Faulting, tcr);
+            // Fill the lists first.
+            for process in 0..2 * POINTER_INPUTS_SEEN as u64 {
+                switch(&mut service, &mut input, process % threads);
+            }
+            let started = std::time::Instant::now();
+            for turn in 0..SWITCHES {
+                switch(&mut service, &mut input, turn * 7 % threads);
+            }
+            let ns = started.elapsed().as_nanos() as f64 / (4 * SWITCHES) as f64;
+            std::println!(
+                "OPEN threads={threads} ns_per_open={ns:.0} generations={}",
+                service.generations
+            );
+        }
+    }
+
     /// The instructions `run` executes, counted under the trap flag.
     #[cfg(target_os = "linux")]
     pub(super) fn steps(run: impl FnOnce()) -> usize {
