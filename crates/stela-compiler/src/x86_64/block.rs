@@ -348,6 +348,7 @@ impl SelfLoop {
                 Operation::PointerAuthentication(_)
                     | Operation::MirroredRead { .. }
                     | Operation::Amx(_)
+                    | Operation::NativeExclusive { .. }
             )
         });
         (native.self_loops
@@ -727,6 +728,8 @@ fn emit_selected(
     let mut mirrored_paths = vec![];
     // And those of the AMX moves (`amx_transfer`).
     let mut amx_paths = vec![];
+    // And those of the exclusive stores (`native_exclusive`).
+    let mut exclusive_paths = vec![];
     // A self-loop's jumps to its exits from both copies of its body, its
     // body twice for the masked bases' lookahead, and the masked bases its
     // back edges carry ([`masked_base::Tracker::carriers`]).
@@ -1428,6 +1431,21 @@ fn emit_selected(
                 cursor += 1;
                 continue;
             }
+            if let Operation::NativeExclusive { word } = instruction.operation {
+                let transfer = super::native_exclusive::of_word(word)
+                    .expect("blocks hold exclusives of one register only");
+                exclusive_paths.extend(super::native_exclusive::emit_inline(
+                    code,
+                    transfer,
+                    instruction.pc,
+                    checks_at(cursor),
+                ));
+                // Xt or Ws changes, and RAX, RCX, RDX and the flags.
+                bases.after(instruction, None);
+                emitted_alone = true;
+                cursor += 1;
+                continue;
+            }
             if let Operation::ZeroBlock { rt } = instruction.operation {
                 let bytes = native
                     .zero_block
@@ -1674,6 +1692,7 @@ fn emit_selected(
     if !pointer_paths.is_empty()
         || !mirrored_paths.is_empty()
         || !amx_paths.is_empty()
+        || !exclusive_paths.is_empty()
         || !flag_exits.is_empty()
     {
         let over = code.asm().jmp();
@@ -1698,6 +1717,9 @@ fn emit_selected(
         }
         for path in amx_paths {
             super::amx_transfer::place(code, path);
+        }
+        for path in exclusive_paths {
+            super::native_exclusive::place(code, path);
         }
         code.asm().bind(over);
     }

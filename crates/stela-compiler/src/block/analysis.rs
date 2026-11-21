@@ -536,6 +536,16 @@ impl Words {
                         operation: Operation::ZeroBlock { rt },
                     }));
                 }
+                // A parallel PE's LDXR and STXR of one register complete
+                // inside the block (`x86_64::native_exclusive`), so a loop
+                // of them is one block, not three.
+                if native.exclusive && crate::x86_64::native_exclusive::operand(&decoded).is_some()
+                {
+                    return Ok(Decoded::Push(Instruction {
+                        pc,
+                        operation: Operation::NativeExclusive { word },
+                    }));
+                }
                 // The shared lane executes these through the existing typed
                 // all-writer memory service, not the single-agent CPU monitor.
                 let checked = checked_memory

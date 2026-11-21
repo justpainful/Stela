@@ -243,6 +243,13 @@ pub enum Operation {
     ZeroBlock {
         rt: u8,
     },
+    /// LDXR or STXR of one register `word`, acquire and release forms
+    /// included, that a system-mode block of PEs on host cores of their own
+    /// completes inside itself (`x86_64::native_exclusive`); a store the
+    /// frame's monitor does not cover leaves the block at it.
+    NativeExclusive {
+        word: u32,
+    },
     Exclusive(exclusive::Operand),
     FloatingPoint(FloatingPointOperation),
     FloatingPointRegister(fp_register::Operand),
