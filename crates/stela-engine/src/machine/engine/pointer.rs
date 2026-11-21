@@ -15,7 +15,7 @@
 //! Native code reads a memo whatever the tag words: an empty one shared by
 //! every service until a service needs its own.
 use crate::pauth;
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
 use core::mem::offset_of;
 use stela_compiler::{Anchor, Place, block::PointerAuthenticationKey, x86_64::pointer};
 
@@ -120,13 +120,16 @@ pub(super) struct PointerService {
     /// generations, and so the tag words the engine reopens, are equal.
     pub(super) generation: u64,
     /// The whole inputs most recently seen, each with its key generations
-    /// and its generation, most recent first.
-    seen_inputs: Vec<(PointerInputs, [u64; pointer::TAG_WORDS], u64)>,
+    /// and its generation, most recent first. A ring: a new entry goes on
+    /// the front, and the oldest off the back, moving no other, and one
+    /// found comes to the front moving those on its nearer side, where a
+    /// full list's every change moved most of its 46 KiB twice.
+    seen_inputs: VecDeque<(PointerInputs, [u64; pointer::TAG_WORDS], u64)>,
     /// The generations of the most recent distinct key inputs, most recent
     /// first, so entries stay valid across a return to an earlier key (EL0
     /// and EL1 keys, guarded levels, PE switches) and across changes of the
-    /// other keys.
-    seen: Vec<(KeyInputs, u64)>,
+    /// other keys. A ring, as `seen_inputs` is.
+    seen: VecDeque<(KeyInputs, u64)>,
     /// The last generation handed out; an evicted one is never reused.
     generations: u64,
     /// Each key's tag word for native code: zero until a PAC exit finds the
@@ -202,8 +205,8 @@ impl PointerService {
             inputs: None,
             key_generations: [0; pointer::TAG_WORDS],
             generation: 0,
-            seen_inputs: Vec::new(),
-            seen: Vec::new(),
+            seen_inputs: VecDeque::new(),
+            seen: VecDeque::new(),
             generations: 0,
             tags: [0; pointer::TAG_WORDS],
             strips: [pointer::strip::Cell::default(); 2],
@@ -322,6 +325,7 @@ impl PointerService {
     /// Open the service with the current `inputs`.
     pub(super) fn open(&mut self, inputs: PointerInputs) {
         if self.inputs != Some(inputs) {
+            let before = self.generations;
             for (index, key) in inputs.keys.into_iter().enumerate() {
                 self.key_generations[index] = self.generation_of(KeyInputs {
                     index: index as u8,
@@ -331,18 +335,25 @@ impl PointerService {
                 });
             }
             let keys = self.key_generations;
-            self.generation = match self
-                .seen_inputs
-                .iter()
-                .position(|&(known, generations, _)| known == inputs && generations == keys)
-            {
-                Some(index) => self.seen_inputs.remove(index).2,
+            // A key generation given just now is in no entry, as none is
+            // given twice: those inputs are new without a look. Else the
+            // generations first: most entries differ in their first words,
+            // where the inputs' first are the keys all share.
+            let found = (self.generations == before)
+                .then(|| {
+                    self.seen_inputs
+                        .iter()
+                        .position(|&(known, generations, _)| generations == keys && known == inputs)
+                })
+                .flatten();
+            self.generation = match found.and_then(|index| self.seen_inputs.remove(index)) {
+                Some((_, _, generation)) => generation,
                 None => {
                     self.generations += 1;
                     self.generations
                 }
             };
-            self.seen_inputs.insert(0, (inputs, keys, self.generation));
+            self.seen_inputs.push_front((inputs, keys, self.generation));
             self.seen_inputs.truncate(POINTER_INPUTS_SEEN);
             self.inputs = Some(inputs);
         }
@@ -564,8 +575,9 @@ impl PointerService {
     /// inputs, else a new one. A result depends only on its key's inputs
     /// and its operands, so an entry of a reused generation is still exact.
     fn generation_of(&mut self, inputs: KeyInputs) -> u64 {
-        let generation = match self.seen.iter().position(|&(known, _)| known == inputs) {
-            Some(index) => self.seen.remove(index).1,
+        let found = self.seen.iter().position(|&(known, _)| known == inputs);
+        let generation = match found.and_then(|index| self.seen.remove(index)) {
+            Some((_, generation)) => generation,
             None => {
                 self.generations += 1;
                 if let Some(census) = &mut self.census {
@@ -574,7 +586,7 @@ impl PointerService {
                 self.generations
             }
         };
-        self.seen.insert(0, (inputs, generation));
+        self.seen.push_front((inputs, generation));
         self.seen.truncate(POINTER_INPUTS_SEEN);
         generation
     }
