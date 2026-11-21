@@ -679,6 +679,12 @@ impl<T> core::ops::Deref for Padded<T> {
     }
 }
 
+/// The exits of which one has its missed transfer classified
+/// (`Statistics::lookup_misses`, `branch_misses`), counting for all of
+/// them: each classification takes an ITLB and a table lookup or two the
+/// run needs for nothing else, and the reports' shares stand.
+const MISS_SAMPLE: u64 = 8;
+
 /// The recent contexts one half finds without comparing controls: enough
 /// for the ELs and GXF states a kernel's exceptions alternate between.
 const RECENT: usize = 4;
@@ -814,6 +820,12 @@ pub struct Machine<H: Host, D: Devices> {
     /// named since the last promotion step ([`scheduler`]'s
     /// `promote_hot_exits`), and how often recent steps read each exit's.
     promotion_runs: u32,
+    /// Exits since the last one whose missed transfer was classified for
+    /// `Statistics::lookup_misses` and `branch_misses`, and the exits each
+    /// classified one counts for ([`MISS_SAMPLE`] but in tests that count
+    /// every exit).
+    miss_turn: u64,
+    miss_sample: u64,
     cell_samples: Vec<u64>,
     sampled_exits: BTreeMap<u64, u8>,
     /// The paired frames a native run may keep
@@ -1405,6 +1417,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
             promotion_runs: 0,
+            miss_turn: 0,
+            miss_sample: MISS_SAMPLE,
             cell_samples: Vec::new(),
             sampled_exits: BTreeMap::new(),
             frame_bound: chain::DEFAULT_FRAME_BOUND,

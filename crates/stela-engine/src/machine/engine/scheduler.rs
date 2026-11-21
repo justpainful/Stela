@@ -608,9 +608,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if let Some(count) = self.statistics.exit_kinds.get_mut(kind as usize) {
                     *count += 1;
                 }
-                let probed = self.lookup_miss(last, next_pc, kind, exhausted);
+                // Why a transfer was missed is classified at one exit in
+                // `miss_sample`, which counts for them all.
+                self.miss_turn += 1;
+                let classify = self.miss_turn >= self.miss_sample;
+                if classify {
+                    self.miss_turn = 0;
+                }
+                let probed = if classify {
+                    self.lookup_miss(last, next_pc, kind, exhausted)
+                } else {
+                    None
+                };
                 if let Some(miss) = probed {
-                    self.statistics.lookup_misses[miss] += 1;
+                    self.statistics.lookup_misses[miss] += self.miss_sample;
                 }
                 let mut slot = kind as usize;
                 if kind == ExitKind::System as u64 && self.step_timing.is_some() {
@@ -642,11 +653,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     }
                 }
                 if exited.is_ok()
+                    && classify
                     && let Some(miss) = self.branch_miss(last, next_pc, kind, spent, probed)
                 {
+                    let weight = self.miss_sample;
                     let counts = &mut self.statistics.branch_misses[kind as usize];
-                    counts[miss as usize] += 1;
-                    counts[BranchMiss::COUNT] += u64::from(transitioned);
+                    counts[miss as usize] += weight;
+                    counts[BranchMiss::COUNT] += u64::from(transitioned) * weight;
                 }
                 if exited.is_ok() {
                     let btype = self.cpu.pstate.btype;

@@ -3749,6 +3749,8 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
     words[1024] = ADD;
     words[1025] = RET;
     let mut machine = machine(&words);
+    // Every exit's missed transfer is classified and counted once.
+    machine.miss_sample = 1;
     let base = machine.cpu.pc;
     let far = base + 0x1000;
     let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
