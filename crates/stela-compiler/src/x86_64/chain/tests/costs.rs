@@ -399,6 +399,9 @@ enum Ring {
     /// lookup tail and the jump probe: this PE's jump cache, or the table
     /// probe.
     Lookup,
+    /// [`Ring::Lookup`] whose tail checks the jump cache itself, as every
+    /// lookup tail did before the jump probe ([`inline_lookup_tail`]).
+    InlineLookup,
     /// An indirect exit through a predicted tail of its one target, whose
     /// direct exit is linked through a stamped tail.
     Predicted,
@@ -410,6 +413,14 @@ enum Ring {
     /// [`Ring::PolyPredicted`] with the second target predicted too, as
     /// the engine makes a site's first miss its second target.
     PolyPredicted2,
+    /// A small switch's BR: sites that each take one of four targets at
+    /// random (the next block and the three after it), two of them
+    /// predicted as [`Ring::PolyPredicted2`]'s, the others the second
+    /// predicted tail's miss, which calls the jump probe.
+    Switch,
+    /// [`Ring::Switch`] whose miss calls the table probe, as every such
+    /// miss did before the jump probe.
+    SwitchTable,
 }
 
 /// Bytes of each block's tails: a predicted tail and a stamped tail. Not
@@ -435,16 +446,21 @@ const RING_BLOCKS: usize = 1 << 16;
 fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
     const TRANSFERS: u64 = 1 << 22;
     const RUN: u64 = 1 << 12;
-    let tails = RING_BLOCKS + blocks * RING_BLOCK;
+    // A switch's block picks among four targets: twice the bytes.
+    let block_bytes = match ring {
+        Ring::Switch | Ring::SwitchTable => 2 * RING_BLOCK,
+        _ => RING_BLOCK,
+    };
+    let tails = RING_BLOCKS + blocks * block_bytes;
     let stride = match ring {
-        Ring::PolyPredicted2 => 2 * RING_TAIL,
+        Ring::PolyPredicted2 | Ring::Switch | Ring::SwitchTable => 2 * RING_TAIL,
         _ => RING_TAIL,
     };
     let bytes = (tails + blocks * stride).next_multiple_of(4096);
     let region = mapped_bytes(bytes);
     put(&region, 0, &vec![0xcc; bytes]);
     let base = region.0 as u64;
-    let block_at = |block: usize| base + (RING_BLOCKS + block * RING_BLOCK) as u64;
+    let block_at = |block: usize| base + (RING_BLOCKS + block * block_bytes) as u64;
     let tail_at = |block: usize| base + (tails + block * stride) as u64;
     // The return the exhausted budget takes.
     let mut out = vec![0xb8, 1, 0, 0, 0, 0xba, 2, 0, 0, 0];
@@ -529,26 +545,51 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                 };
                 (jump, Some(code.to_vec()))
             }
+            Ring::InlineLookup => {
+                let probe = base + (PROBES + PROBE_ENTRY) as u64;
+                let code = inline_lookup_tail(tail, ExitKind::Indirect.into(), RAN, probe);
+                (indirect_jump(at, pc, tail), Some(code))
+            }
             Ring::Predicted | Ring::PolyPredicted => {
-                let code = predicted(&mut world, base, tail, held, site, None);
+                let code = predicted(&mut world, base, tail, held, site, None, JUMP_PROBE_ENTRY);
                 let jump = match ring {
                     Ring::Predicted => indirect_jump(at, pc, tail),
                     _ => either_jump(at, pc, target_pc(next[to]), tail),
                 };
                 (jump, Some(code))
             }
-            Ring::PolyPredicted2 => {
+            Ring::PolyPredicted2 | Ring::Switch | Ring::SwitchTable => {
+                let probe = match ring {
+                    Ring::SwitchTable => PROBE_ENTRY,
+                    _ => JUMP_PROBE_ENTRY,
+                };
                 let other = target_pc(next[to]);
                 let second = tail + RING_TAIL as u64;
-                let mut code = predicted(&mut world, base, tail, held, site, Some(second));
+                let mut code = predicted(&mut world, base, tail, held, site, Some(second), probe);
                 let held = world.table.find(world.table.slot(other, KEY), other, KEY);
                 code.resize(RING_TAIL, 0xcc);
-                code.extend(predicted(&mut world, base, second, held, site + 8, None));
-                (either_jump(at, pc, other, tail), Some(code))
+                code.extend(predicted(
+                    &mut world,
+                    base,
+                    second,
+                    held,
+                    site + 8,
+                    None,
+                    probe,
+                ));
+                let jump = match ring {
+                    Ring::PolyPredicted2 => either_jump(at, pc, other, tail),
+                    _ => {
+                        let third = next[next[to]];
+                        let targets = [to, next[to], third, next[third]].map(target_pc);
+                        any_jump(at, targets, tail)
+                    }
+                };
+                (jump, Some(code))
             }
         };
-        assert!(code.len() <= RING_BLOCK);
-        put(&region, RING_BLOCKS + block * RING_BLOCK, &code);
+        assert!(code.len() <= block_bytes);
+        put(&region, RING_BLOCKS + block * block_bytes, &code);
         if let Some(tail_code) = tail_code {
             put(&region, tails + block * stride, &tail_code);
         }
@@ -590,8 +631,8 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
 
 /// A predicted tail at `tail` of `held`'s PC, and at [`RING_STAMPED`] after
 /// it the stamped tail its direct exit is linked to through the stamped
-/// cell of `site`: its miss calls the table probe, or for an open tail
-/// jumps to `miss`.
+/// cell of `site`: its miss calls the probe at `entry` of the dispatcher
+/// (the engine's the jump probe), or for an open tail jumps to `miss`.
 fn predicted(
     world: &mut World,
     base: u64,
@@ -599,10 +640,10 @@ fn predicted(
     held: LookupEntry,
     site: u64,
     miss: Option<u64>,
+    entry: usize,
 ) -> Vec<u8> {
     let (pc, word) = (held.pc, ExitKind::Indirect);
-    // Its miss calls the jump probe, as the engine links it.
-    let probe = base + (PROBES + JUMP_PROBE_ENTRY) as u64;
+    let probe = base + (PROBES + entry) as u64;
     let mut code = match miss {
         None => predicted_tail(tail, GuestAddress(pc), word, RAN, probe).unwrap(),
         Some(_) => open_predicted_tail(tail, GuestAddress(pc), word).unwrap(),
@@ -660,6 +701,61 @@ fn either_jump(at: u64, first: u64, second: u64, tail: u64) -> Vec<u8> {
     code
 }
 
+/// The lookup tail at `at` of a branch that sets BTYPE 0 as every one was
+/// before the jump probe: the jump cache's check in the tail, its hit
+/// entered by the tail's own `jmp [entry]`, and any other through the
+/// plain tail's call of the table probe at `probe`; 224 bytes with its pad.
+fn inline_lookup_tail(at: u64, word: ExitWord, ran: u32, probe: u64) -> Vec<u8> {
+    let mut code = Code::new();
+    let mut asm = code.asm();
+    asm.place(Rcx, CONTROL);
+    let mut misses = Vec::new();
+    let entry = jump_cache_check(&mut asm, 0, &mut misses);
+    misses.push(stop_check(&mut asm, Interruption::Quiet, true));
+    count(&mut asm, transfer_change(ran).unwrap());
+    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
+    asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
+    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    asm.jmp_rm(entry(JUMP_CODE));
+    for miss in misses {
+        asm.bind(miss);
+    }
+    super::super::tail(&mut code, at, word, ran, probe).unwrap();
+    let mut bytes = code.into_bytes();
+    assert!(bytes.len() <= 224);
+    bytes.resize(224, 0xcc);
+    bytes
+}
+
+/// A block at `at` whose indirect branch takes one of `targets` at random,
+/// by bits 20 and 21 of a xorshift of RSI, its exit's point linked to
+/// `tail`: a switch's BR.
+fn any_jump(at: u64, targets: [u64; 4], tail: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+    for (shift, op) in [(13u8, 4u8), (7, 5), (17, 4)] {
+        // mov rax, rsi; shl/shr rax, shift; xor rsi, rax
+        code.extend([0x48, 0x89, 0xf0, 0x48, 0xc1, 0xe0 | op << 3 & 0x38, shift]);
+        code.extend([0x48, 0x31, 0xc6]);
+    }
+    // movabs rax, t0; movabs r8, t1; bt esi, 20; cmovc rax, r8
+    code.extend([0x48, 0xb8]);
+    code.extend(targets[0].to_le_bytes());
+    code.extend([0x49, 0xb8]);
+    code.extend(targets[1].to_le_bytes());
+    code.extend([0x0f, 0xba, 0xe6, 20, 0x49, 0x0f, 0x42, 0xc0]);
+    // movabs r8, t2; movabs r9, t3; cmovc r8, r9 (bit 20 still in CF)
+    code.extend([0x49, 0xb8]);
+    code.extend(targets[2].to_le_bytes());
+    code.extend([0x49, 0xb9]);
+    code.extend(targets[3].to_le_bytes());
+    code.extend([0x4d, 0x0f, 0x42, 0xc1]);
+    // bt esi, 21; cmovc rax, r8
+    code.extend([0x0f, 0xba, 0xe6, 21, 0x49, 0x0f, 0x42, 0xc0]);
+    let end = at + code.len() as u64;
+    code.extend(jump(end, tail).unwrap());
+    code
+}
+
 #[test]
 #[ignore = "manual: opt-in"]
 fn spread_transfer_costs() {
@@ -679,6 +775,37 @@ fn spread_transfer_costs() {
             let (ticks, counts) = spread_cost(ring, blocks);
             std::println!(
                 "{blocks} blocks, {ring:?}: {ticks:.1} TSC ticks per transfer, stamp counts {counts:.2?}"
+            );
+        }
+    }
+}
+
+/// The jump probe against what it replaced, side by side: lookup tails
+/// that check the jump cache themselves ([`Ring::InlineLookup`]) or call
+/// the jump probe ([`Ring::Lookup`]), and a small switch's misses through
+/// the table probe ([`Ring::SwitchTable`]) or the jump probe
+/// ([`Ring::Switch`]). Each pair is measured in turn three times and the
+/// best of each kept, as the host's other load moves between runs.
+#[test]
+#[ignore = "manual: opt-in"]
+fn jump_probe_spread_costs() {
+    for blocks in [64, 256, 1024, 4096, 16384] {
+        for pair in [
+            [Ring::InlineLookup, Ring::Lookup],
+            [Ring::SwitchTable, Ring::Switch],
+        ] {
+            let mut best = [f64::MAX; 2];
+            for _ in 0..3 {
+                for (at, ring) in pair.into_iter().enumerate() {
+                    best[at] = best[at].min(spread_cost(ring, blocks).0);
+                }
+            }
+            std::println!(
+                "{blocks} blocks: {:?} {:.1}, {:?} {:.1} TSC ticks per transfer",
+                pair[0],
+                best[0],
+                pair[1],
+                best[1]
             );
         }
     }
