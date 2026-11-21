@@ -675,6 +675,9 @@ pub struct Counts {
     /// Why SVC, ERET, GENTER and GEXIT took the engine path, in kind order
     /// ([`super::Statistics::transition_misses`]).
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; 4],
+    /// Why its TTBR0 changes took the engine path
+    /// ([`super::Statistics::switch_misses`]).
+    pub switch_misses: [u64; super::table_switches::miss::REASONS],
     /// Why its runs ended at branch-kind exits, in kind order
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
@@ -1336,7 +1339,7 @@ impl Hub {
     /// there to note them ([`Self::compiling`]): an IC IVAU of one must
     /// reach every PE that may run them.
     pub(super) fn note_code(&self, code: &super::board::Code) {
-        for frame in code.cache_at(super::board::LockSite::Other).index.frames() {
+        for frame in code.every_page(super::board::LockSite::Other).frames() {
             self.compiling(frame);
         }
     }
@@ -2558,6 +2561,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
+    /// Where native code publishes this PE's translating word and finds
+    /// its mail pending (`x86_64::table_switch::Table`), and the word a
+    /// regime's controls `controls` publish; zeros without a hub.
+    pub(super) fn switch_words(&self, controls: &mmu::Controls) -> (u64, u64, u64) {
+        let Some(hub) = &self.parallel else {
+            return (0, 0, 0);
+        };
+        let inbox = &hub.inboxes[self.current];
+        (
+            inbox.translating.as_ptr() as u64,
+            inbox.pending.as_ptr() as u64,
+            u64::from(context_word(controls.regime, mmu::current_asid(controls))),
+        )
+    }
+
     /// See [`GlobalSpan::widen`]: whether the leaf holding `address` widened
     /// this PE's span.
     pub(super) fn widen_lower_globals(&self, address: u64, size: u64) -> bool {
@@ -2795,6 +2813,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 statistics.engine_transitions[stela_compiler::x86_64::transition::EXCEPTION_RETURN],
             ],
             transition_misses: statistics.transition_misses,
+            switch_misses: statistics.switch_misses,
             branch_misses: statistics.branch_misses,
             stamped: {
                 let mut stamped = [0; chain::STAMP_COUNTS + 11];

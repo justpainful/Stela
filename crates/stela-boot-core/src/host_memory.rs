@@ -246,6 +246,56 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     Err(Shortfall { free, needed }.refusal())
 }
 
+/// The code window per runner past which a larger one cuts reinstalls
+/// steeply no more (the ring replay at 8 PEs: 816 MiB reinstalls 15 % of
+/// what 640 MiB does): a window under it takes a pack's room first.
+pub const KNEE_PER_RUNNER: u64 = 102 * MIB;
+/// The code window per runner up to which the window shares a pack's room
+/// with the guest (the replay at 8 PEs: 1999, 1021 and 449 reinstalls per
+/// heartbeat at 816, 1200 and 1616 MiB); past it the room is the guest's.
+pub const SHARED_PER_RUNNER: u64 = 202 * MIB;
+
+/// [`sizes`] on a host where the translation pack left `room` of its
+/// budget ([`pack_budget`]) unused, as a pack read on demand does: it holds
+/// its index and the records lookups ask for, not every record. The other
+/// parts are what they were while the pack held its budget, and the room
+/// goes to the code window (with its block records, [`HEAP_PER_WINDOW`] a
+/// window byte) and the guest ([`give_room`]).
+pub fn sizes_with_room(free: u64, cores: usize, runners: usize, room: u64) -> Result<Sizes> {
+    match sizes(free.saturating_sub(room), cores, runners) {
+        Ok(sizes) => Ok(give_room(sizes, room, runners)),
+        Err(_) => sizes(free, cores, runners),
+    }
+}
+
+/// `sizes` with `room` beside them: the window takes it up to the knee
+/// ([`KNEE_PER_RUNNER`] per runner), then half of what is left up to
+/// [`SHARED_PER_RUNNER`] per runner, within [`MAX_WINDOW`], in whole
+/// [`CODE_ALIGNMENT`]s; the guest takes the rest.
+fn give_room(sizes: Sizes, room: u64, runners: usize) -> Sizes {
+    let runners = runners.max(1) as u64;
+    let window = sizes.code.window;
+    let per_byte = 1 + HEAP_PER_WINDOW;
+    let knee = (KNEE_PER_RUNNER * runners).min(MAX_WINDOW);
+    let shared = (SHARED_PER_RUNNER * runners).min(MAX_WINDOW);
+    let first = knee.saturating_sub(window).min(room / per_byte);
+    let rest = room - first * per_byte;
+    let second = shared
+        .saturating_sub(window + first)
+        .min(rest / 2 / per_byte);
+    let grown = (first + second) / CODE_ALIGNMENT * CODE_ALIGNMENT;
+    Sizes {
+        heap: sizes.heap + HEAP_PER_WINDOW * grown,
+        code: CodeReservation {
+            bytes: sizes.code.bytes + grown,
+            window: window + grown,
+            ..sizes.code
+        },
+        guest: sizes.guest + room - grown * per_byte,
+        ..sizes
+    }
+}
+
 /// One budget for compiled code, the window's first: the window, its
 /// block records ([`HEAP_PER_WINDOW`]) and the code kept beside it in the
 /// heap (a [`CODE_SHARE`]th of the heap for blocks and stored forms, a

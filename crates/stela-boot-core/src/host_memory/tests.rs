@@ -639,3 +639,56 @@ fn small_hosts_move_their_kept_code_into_the_window() {
         );
     }
 }
+
+/// A pack read on demand, its merges too, holds its indexes alone; the
+/// room it leaves goes to the window up to the knee, then half to the
+/// window up to [`SHARED_PER_RUNNER`] and half to the guest, then all to
+/// the guest.
+#[test]
+fn a_pack_read_on_demand_splits_its_room_between_the_window_and_the_guest() {
+    // The indexes of a whole footprint's pack: 175 thousand records.
+    const INDEX: u64 = 9 * MIB;
+    for gib in [8, 12, 16, 32] {
+        let free = free(gib);
+        let budget = pack_budget(free, 8, 8);
+        let before = sizes(free - budget - PACK_MARGIN, 8, 8).unwrap();
+        let held = INDEX;
+        let room = budget - held;
+        let after = sizes_with_room(free - held - PACK_MARGIN, 8, 8, room).unwrap();
+        std::println!(
+            "ROOM {gib} GiB: room {}M window {}M -> {}M guest {}M -> {}M",
+            room / MIB,
+            before.code.window / MIB,
+            after.code.window / MIB,
+            before.guest / MIB,
+            after.guest / MIB
+        );
+        let knee = 8 * KNEE_PER_RUNNER;
+        let top = 8 * SHARED_PER_RUNNER;
+        let grown = after.code.window - before.code.window;
+        assert_eq!(grown % CODE_ALIGNMENT, 0);
+        assert!(after.code.window <= before.code.window.max(top));
+        // Up to the knee the window takes the room; past it, half.
+        let to_knee = knee.saturating_sub(before.code.window);
+        let most = match room / 2 {
+            half if half <= to_knee => half,
+            half => to_knee + (half - to_knee) / 2,
+        };
+        assert!(grown <= most, "{gib} GiB");
+        assert!(
+            grown + CODE_ALIGNMENT > most.min(top.saturating_sub(before.code.window)),
+            "{gib} GiB"
+        );
+        // The guest gets the rest, never less than it had.
+        assert_eq!(after.guest, before.guest + room - 2 * grown);
+        assert!(after.guest >= before.guest);
+        assert_eq!(after.heap, before.heap + grown);
+        assert_eq!((after.pool, after.kept), (before.pool, before.kept));
+    }
+    // No room, no change.
+    let free = free(12);
+    assert_eq!(
+        sizes_with_room(free, 8, 8, 0).unwrap(),
+        sizes(free, 8, 8).unwrap()
+    );
+}

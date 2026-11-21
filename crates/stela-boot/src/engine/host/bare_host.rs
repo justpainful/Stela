@@ -422,79 +422,75 @@ impl Host for BareHost<'_> {
     fn set_regime(&mut self, regime: &Regime) {
         let state = state();
         state.follow_native();
-        let mut changed_roots = None;
-        if let Some(current) = state.regime
-            && current.controls != regime.controls
-        {
-            let (from, to) = (current.controls, regime.controls);
-            // What the lower half's own inputs, E0PD1 and SPRR's
-            // permission registers leave of the controls: the lower half has
-            // its own reset and the others their bank, and they compose (a
-            // context switch writes TTBR0 and the thread's SPRR_PERM_EL0
-            // together).
-            let (lower_tcr, user_tcr) = match to.regime {
-                mmu::Regime::El10 | mmu::Regime::El20 => (LOWER_TCR, USER_TCR),
-                _ => (0, 0),
-            };
-            let own = lower_tcr | user_tcr;
-            let rest = mmu::Controls {
-                ttbr0: to.ttbr0,
-                tcr: from.tcr & !own | to.tcr & own,
-                // The fields that keep an index writable after the locks
-                // change no access.
-                sprr: mmu::Sprr {
-                    el0: to.sprr.el0,
-                    el1: to.sprr.el1,
-                    fields: to.sprr.fields,
-                    ..from.sprr
-                },
-                ..from
-            };
-            let lower = from.ttbr0 != to.ttbr0 || (from.tcr ^ to.tcr) & lower_tcr != 0;
-            // TTBR0 translates only the lower half, but it can name the
-            // ASID the upper half's non-global entries were made in.
-            let asid = mmu::current_asid(&from) == mmu::current_asid(&to);
-            if rest == to && (!lower || asid || !state.extents[UPPER].private()) {
-                if lower {
-                    let key = |c: &mmu::Controls| (c.ttbr0, c.tcr & lower_tcr);
-                    changed_roots = Some(state.switch_lower(key(&from), key(&to)));
+        let to = regime.controls;
+        // What selects a set: the lower half's own inputs, and E0PD1 and
+        // SPRR's permission registers (the rights). They compose: a
+        // context switch writes TTBR0 and the thread's SPRR_PERM_EL0
+        // together.
+        let (lower_tcr, user_tcr) = match to.regime {
+            mmu::Regime::El10 | mmu::Regime::El20 => (LOWER_TCR, USER_TCR),
+            _ => (0, 0),
+        };
+        let key = |c: &mmu::Controls| (c.ttbr0, c.tcr & lower_tcr);
+        let rights = |c: &mmu::Controls| (c.sprr.el0, c.sprr.el1, c.tcr & user_tcr);
+        let mut switched = false;
+        match state.regime {
+            None => switched = state.select_set(key(&to), rights(&to)),
+            Some(current) if current.controls != to => {
+                let from = current.controls;
+                let own = lower_tcr | user_tcr;
+                let rest = mmu::Controls {
+                    ttbr0: to.ttbr0,
+                    tcr: from.tcr & !own | to.tcr & own,
+                    // The fields that keep an index writable after the locks
+                    // change no access.
+                    sprr: mmu::Sprr {
+                        el0: to.sprr.el0,
+                        el1: to.sprr.el1,
+                        fields: to.sprr.fields,
+                        ..from.sprr
+                    },
+                    ..from
+                };
+                let lower = from.ttbr0 != to.ttbr0 || (from.tcr ^ to.tcr) & lower_tcr != 0;
+                // TTBR0 translates only the lower half, but it can name the
+                // ASID the upper half's non-global entries were made in.
+                let asid = mmu::current_asid(&from) == mmu::current_asid(&to);
+                if rest == to && (!lower || asid || !state.extents[UPPER].private()) {
+                    switched = state.select_set(key(&to), rights(&to));
+                } else {
+                    let ttbr0 = mmu::Controls {
+                        ttbr0: to.ttbr0,
+                        ..from
+                    };
+                    let sprr = mmu::Controls {
+                        sprr: to.sprr,
+                        ..from
+                    };
+                    let cause = if sprr == to {
+                        Cause::Sprr
+                    } else if ttbr0 == to {
+                        Cause::Table
+                    } else {
+                        Cause::Controls
+                    };
+                    if matches!(cause, Cause::Controls) && state.legacy_translations_dirty {
+                        let fields = differing(&from, &to);
+                        for (count, differs) in state.control_fields.iter_mut().zip(fields) {
+                            *count += u64::from(differs);
+                        }
+                        state.last_controls = Some((from, to));
+                    }
+                    state.reset_shadow(cause);
+                    // Every set is empty: the new controls' becomes current.
+                    switched = state.select_set(key(&to), rights(&to));
                 }
-                let rights = |c: &mmu::Controls| (c.sprr.el0, c.sprr.el1, c.tcr & user_tcr);
-                let (from, to) = (rights(&from), rights(&to));
-                let bank = from != to;
-                if bank {
-                    state.switch_bank(from, to);
-                    changed_roots = Some([true; ROOTS]);
-                }
-                // The helper's software TLB keys neither TTBR0 nor the bank.
-                if lower || bank {
+                // The helper's software TLB keys neither TTBR0 nor the rights.
+                if switched {
                     state.tlb.clear();
                 }
-            } else {
-                let ttbr0 = mmu::Controls {
-                    ttbr0: to.ttbr0,
-                    ..from
-                };
-                let sprr = mmu::Controls {
-                    sprr: to.sprr,
-                    ..from
-                };
-                let cause = if sprr == to {
-                    Cause::Sprr
-                } else if ttbr0 == to {
-                    Cause::Table
-                } else {
-                    Cause::Controls
-                };
-                if matches!(cause, Cause::Controls) && state.legacy_translations_dirty {
-                    let fields = differing(&from, &to);
-                    for (count, differs) in state.control_fields.iter_mut().zip(fields) {
-                        *count += u64::from(differs);
-                    }
-                    state.last_controls = Some((from, to));
-                }
-                state.reset_shadow(cause);
             }
+            Some(_) => {}
         }
         // The tag-checked roots hold one pattern of checked halves.
         if regime.tag_checked() && regime.tag_checks != state.tag_checks {
@@ -510,18 +506,49 @@ impl Host for BareHost<'_> {
         let switch_view = root != state.root_of(state.current);
         state.current = view;
         state.view_switches += u64::from(switch_view);
-        // Lower-half and bank changes, and a switch of the active view,
-        // can coincide. Load the final view after applying all of them.
-        let mut load = switch_view;
-        if let Some(changed) = changed_roots {
-            for (stale, changed) in state.contexts.stale.iter_mut().zip(changed) {
-                *stale |= changed;
-            }
-            load |= changed[root];
-        }
-        if load {
+        // A change of set and of view can coincide: load the final view of
+        // the final set.
+        if switch_view || switched {
             state.load_view(view);
         }
+        state.update_open();
+    }
+
+    fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
+        let sets = &state().native_sets as *const table_switch::Sets as u64;
+        Some((sets, table_switch::Cr3::Register))
+    }
+
+    fn native_set(&mut self, controls: &mmu::Controls) -> Option<(u64, u64)> {
+        let state = state();
+        state.follow_native();
+        let current = state.regime?.controls;
+        if (mmu::Controls {
+            ttbr0: current.ttbr0,
+            ..*controls
+        }) != current
+        {
+            return None;
+        }
+        let (lower_tcr, user_tcr) = match current.regime {
+            mmu::Regime::El10 | mmu::Regime::El20 => (LOWER_TCR, USER_TCR),
+            _ => (0, 0),
+        };
+        let key = (controls.ttbr0, controls.tcr & lower_tcr);
+        let rights = (
+            controls.sprr.el0,
+            controls.sprr.el1,
+            controls.tcr & user_tcr,
+        );
+        let set = state
+            .sets
+            .iter()
+            .position(|set| set.key == Some((key, rights)))?;
+        Some((set as u64, state.native_sets.generations[set]))
+    }
+
+    fn isolates_predictions(&self) -> bool {
+        super::super::speculation::isolates()
     }
 
     fn isolate_predictions(&mut self) {
@@ -536,10 +563,11 @@ impl Host for BareHost<'_> {
         state().contexts.pan_flag
     }
 
-    /// A view of one regime's controls, watchpoints and tag checks whose
-    /// root exists: CR3 in its PCID with the no-flush bit while the context
-    /// holds nothing stale (the record checks the flag), plain CR3 (which
-    /// flushes) without PCIDE; RFLAGS.AC for PAN where SMAP stands for it.
+    /// A view of one regime's controls, watchpoints and tag checks: the
+    /// current set's root of it, in any set of the current one's class,
+    /// whose views mean the same but for TTBR0 (the thunk checks the class
+    /// and loads the view's PCID, flushing a stale one); RFLAGS.AC for PAN
+    /// where SMAP stands for it.
     fn native_view(&mut self, from: &Regime, to: &Regime) -> Option<NativeView> {
         use stela_compiler::x86_64::transition::{AC_CLEAR, AC_KEEP, AC_SET};
         let state = state();
@@ -547,20 +575,15 @@ impl Host for BareHost<'_> {
             || from.watch != to.watch
             || from.tag_checks != to.tag_checks
             || state.regime != Some(*to)
+            || state.native_sets.current != state.roots[0]
         {
             return None;
         }
-        let view = view_of(to);
-        let root = state.root_of(view);
-        let base = *state.roots.get(root)?;
-        if base == 0 {
+        let class = state.native_sets.classes[state.set];
+        if class == 0 {
             return None;
         }
-        let cr3 = if state.contexts.tagged {
-            base | view_context(root) | crate::engine::storage::KEEP_ENTRIES
-        } else {
-            base
-        };
+        let view = view_of(to);
         let ac = if !state.contexts.pan_flag {
             AC_KEEP
         } else if view % VIEWS == PAN_VIEW {
@@ -569,10 +592,9 @@ impl Host for BareHost<'_> {
             AC_SET
         };
         Some(NativeView {
-            cr3,
-            root_at: &state.roots[root] as *const u64 as u64,
-            root: base,
-            stale_at: &state.contexts.stale[root] as *const bool as u64,
+            sets: &state.native_sets as *const table_switch::Sets as u64,
+            root: state.root_of(view) as u64,
+            class,
             view_at: &state.native_view as *const u64 as u64,
             view: native_view_word(view, to.requester),
             ac,
@@ -586,39 +608,29 @@ impl Host for BareHost<'_> {
     fn invalidate_reach(&mut self, reach: Reach, everywhere: Everywhere) {
         let entered = rdtsc();
         let state = state();
-        // A TLBI of everything that empties the shadow below drops the
-        // kept halves with the lower half's frames: no table of theirs
+        state.follow_native();
+        // A TLBI of everything that empties the shadow below drops every
+        // set's lower half with the lower half's frames: no table of theirs
         // needs walking first.
         let emptied = reach == Reach::All
             && matches!(everywhere, Everywhere::All)
             && state.legacy_translations_dirty;
-        if !state.kept.is_empty() && !emptied {
+        if !emptied {
             let bounds = state.half_range(LOWER);
-            let entry_bits = 12 + 9 * layout::top_level();
-            let pool = &state.pool;
-            // Kept halves share the current controls' TCR outside the lower
-            // half's fields; without a regime the ASIDs are unknown.
+            // Sets share the current controls' TCR outside the lower half's
+            // fields; without a regime the ASIDs are unknown.
             let tcr = state
                 .regime
                 .map_or(mmu::shadow::UNKNOWN_ASIDS, |regime| regime.controls.tcr);
-            let dropped = match everywhere {
-                Everywhere::NonGlobal(asid) => state.kept.drop_asid(asid, tcr),
-                _ => state.kept.invalidate(
-                    everywhere,
-                    tcr,
-                    bounds,
-                    entry_bits,
-                    |entry, first, last| tables::unmap_under(pool, entry, first, last),
-                ),
-            };
-            state.kept_dropped += dropped as u64;
-            state.reclaim_kept();
+            state.invalidate_other_sets(everywhere, tcr, bounds);
         }
         if reach == Reach::All {
-            return match everywhere {
+            match everywhere {
                 Everywhere::NonGlobal(_) => state.drop_non_global(),
                 _ => state.reset_shadow(Cause::Maintained),
-            };
+            }
+            state.update_open();
+            return;
         }
         state.tlb.clear();
         // Most maintenance addresses reach a single extent, without a
@@ -632,9 +644,9 @@ impl Host for BareHost<'_> {
             if !state.extents[half].visit_ranges(reach, bounds, |first, last| {
                 pages = pages.saturating_add(((last >> 12) - (first >> 12)) + 1);
                 if first_range.is_none() {
-                    first_range = Some((first, last));
+                    first_range = Some((first, last, half));
                 } else {
-                    extra_ranges.push((first, last));
+                    extra_ranges.push((first, last, half));
                 }
             }) {
                 state.clear(half);
@@ -646,20 +658,49 @@ impl Host for BareHost<'_> {
         let precise = !whole && pages <= INVLPG_PAGES;
         let current = state.root_of(state.current);
         let mut reload_current = false;
-        for (first, last) in first_range.into_iter().chain(extra_ranges) {
+        let mut upper_removed = false;
+        // The upper pages removed where precise, which other sets' views
+        // drop by address.
+        let mut upper_pages: Vec<u64> = Vec::new();
+        // The upper tables of other rights than the current set's: one set
+        // of each holds them.
+        let mut others: Vec<usize> = Vec::new();
+        let any_upper = first_range
+            .iter()
+            .chain(&extra_ranges)
+            .any(|range| range.2 == UPPER);
+        if !whole && any_upper {
+            let rights = state.sets[state.set].key.map(|(_, rights)| rights);
+            for set in 0..SETS {
+                let Some((_, held)) = state.sets[set].key else {
+                    continue;
+                };
+                if Some(held) != rights
+                    && !others
+                        .iter()
+                        .any(|&other| state.sets[other].key.is_some_and(|(_, r)| r == held))
+                {
+                    others.push(set);
+                }
+            }
+        }
+        for (first, last, half) in first_range.into_iter().chain(extra_ranges) {
             let base = first & !(PAGE - 1);
-            state.unmap_walks += (state.roots.len() * (1 + state.banks.len())) as u64;
+            let bit = |address: u64| if precise { (address - base) / PAGE } else { 0 };
+            let mut range_removed = 0u16;
+            state.unmap_walks += ROOTS as u64;
             for (view, root) in state.roots.into_iter().enumerate() {
                 let mut removed = 0u16;
                 tables::unmap(&state.pool, root, first, last, |address| {
-                    let bit = if precise { (address - base) / PAGE } else { 0 };
-                    removed |= 1 << bit;
+                    removed |= 1 << bit(address);
                 });
                 if whole || removed == 0 {
                     continue;
                 }
+                range_removed |= removed;
+                let index = state.set * ROOTS + view;
                 if !precise {
-                    state.contexts.stale[view] = true;
+                    state.native_sets.stale[index] = 1;
                     reload_current |= view == current;
                     continue;
                 }
@@ -669,14 +710,35 @@ impl Host for BareHost<'_> {
                     if view == current {
                         invlpg(page);
                     } else {
-                        state.contexts.forget_inactive(page, view);
+                        state.forget_inactive(page, index);
                     }
                 }
             }
-            // A bank has no PCID while it is inactive. Switching to it
-            // flushes the views before they can use its entries again.
-            for root in state.banks.iter().flat_map(|bank| bank.roots) {
-                tables::unmap(&state.pool, root, first, last, |_| {});
+            if half == UPPER {
+                for &set in &others {
+                    state.unmap_walks += ROOTS as u64;
+                    for view in 0..ROOTS {
+                        let root = state.root(set, view);
+                        tables::unmap(&state.pool, root, first, last, |address| {
+                            range_removed |= 1 << bit(address);
+                        });
+                    }
+                }
+                if !whole && range_removed != 0 {
+                    upper_removed = true;
+                    while range_removed != 0 {
+                        upper_pages.push(base + u64::from(range_removed.trailing_zeros()) * PAGE);
+                        range_removed &= range_removed - 1;
+                    }
+                }
+            }
+        }
+        // Every other set shares an upper half its views may have cached.
+        if upper_removed {
+            if precise {
+                state.forget_other_sets(&upper_pages);
+            } else {
+                state.stale_other_sets();
             }
         }
         if whole {
@@ -689,6 +751,7 @@ impl Host for BareHost<'_> {
         } else {
             state.scoped += 1;
         }
+        state.update_open();
         state.scoped_ticks += rdtsc().wrapping_sub(entered);
     }
 

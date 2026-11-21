@@ -104,6 +104,14 @@
     "reason": "host instruction trace of real blocks named by DENSITY_IN; run on request"
   },
   {
+    "package": "stela-engine",
+    "test": "real_regions_end_where_their_linked_blocks_do",
+    "source": "crates/stela-engine/tests/regions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "runs sampled regions of the images REAL_IMAGES names against their linked blocks; run on request in a release build"
+  },
+  {
     "package": "stela-compiler",
     "test": "allocator_bound_census",
     "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
@@ -5160,6 +5168,78 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of shadow fills over random faults; run in release on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "stored_entry_bytes",
+    "source": "crates/stela-engine/src/machine/engine/fetch_costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host memory of stored entries and their packed recovery rows over a code image; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "lock_path_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/lock_path.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host bench of code lock waits of eight PEs over real code by fetch kind and lock site; run in release on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "reinstall_cost",
+    "source": "crates/stela-engine/src/machine/engine/tests/reinstall_cost.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a kept form's reinstall against a compile; run in release on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "table_switch_benchmark",
+    "source": "crates/stela-engine/src/machine/engine/tests/table_base.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a TTBR0 switch through the engine and through its native thunk; run in release on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "guarded_set_benchmark",
+    "source": "crates/stela-engine/src/machine/engine/transitions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of GENTER and GEXIT pairs in another root set, engine path and native thunks; run in release on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "demand_read_pack_replay",
+    "source": "crates/stela-engine/src/translations/replay.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "replay table of a pack read on demand by disk, reader and pack contents; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "demand_read_layout_replay",
+    "source": "crates/stela-engine/src/translations/replay.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "replay table of a pack read on demand in key and first-use layouts; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "demand_read_limit_replay",
+    "source": "crates/stela-engine/src/translations/replay.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "replay table of a pack's limit bounded by RAM or by its file; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "merge_from_the_file_step_costs",
+    "source": "crates/stela-engine/src/translations/writer/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the longest step of a merge from the file; run in release on request"
   },
   {
     "package": "stela-soc",

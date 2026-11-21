@@ -7,7 +7,10 @@
 //! most without walking the ordered map, which sweeps keep their place in.
 //!
 //! The index changes under the board's code lock; a [`Finder`] beside it
-//! answers a fetch without that lock.
+//! answers a fetch without that lock. A board keeps [`SHARDS`] indexes, each
+//! of the pages [`shard_of`] gives it under a lock of its own, which share
+//! one finder: each finder bucket belongs to one shard, so each list has
+//! one writer.
 use super::{Block, FETCH_PAGE, VariantId, board::Records};
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::ops::Index;
@@ -18,8 +21,19 @@ const _: () = assert!(FETCH_PAGE <= 1 << u16::BITS);
 /// Where [`BlockIndex::sweep`] goes on: past this entry of this page.
 pub(super) type Cursor = (u64, usize);
 
-/// The pages [`BlockIndex::front`] holds, a power of two.
-const FRONT: usize = 1 << 12;
+/// The pages [`BlockIndex::front`] holds, a power of two: a shard's share
+/// of 4096.
+const FRONT: usize = 1 << 8;
+/// The bits of a page's shard ([`shard_of`]).
+pub(super) const SHARD_BITS: u32 = 6;
+/// The indexes a board's pages are spread over, each under its own lock.
+pub(super) const SHARDS: usize = 1 << SHARD_BITS;
+
+/// The shard of the page holding `physical`: a hash of its frame, so the
+/// pages one binary's code spans spread over all of them.
+pub(super) fn shard_of(physical: u64) -> usize {
+    ((physical / FETCH_PAGE).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SHARD_BITS)) as usize
+}
 /// A frame no page has: pages are aligned.
 const NO_FRAME: u64 = 1;
 /// The entries a forgotten page's list keeps room for.
@@ -79,7 +93,8 @@ impl BlockIndex {
         Self::with_finder(Arc::new(Finder::new(1 << 16)))
     }
 
-    /// An empty index that keeps `finder` in step with it.
+    /// An empty index that keeps `finder` in step with it: one shard's
+    /// ([`shard_of`]) of a board's.
     pub(super) fn with_finder(finder: Arc<Finder>) -> Self {
         Self {
             finder,
@@ -207,7 +222,7 @@ impl BlockIndex {
                     self.entries.len() as u32 - 1
                 });
                 self.pages.insert(frame, page);
-                self.finder.pages.store(self.pages.len(), Ordering::Relaxed);
+                self.finder.pages.fetch_add(1, Ordering::Relaxed);
                 page as usize
             }
         };
@@ -294,7 +309,7 @@ impl BlockIndex {
         let Some(page) = self.pages.remove(&frame) else {
             return false;
         };
-        self.finder.pages.store(self.pages.len(), Ordering::Relaxed);
+        self.finder.pages.fetch_sub(1, Ordering::Relaxed);
         let entries = &mut self.entries[page as usize];
         for entry in entries.iter() {
             self.finder.unlink(entry.slot);
@@ -309,8 +324,17 @@ impl BlockIndex {
         true
     }
 
+    /// Forget every page: their blocks leave the finder's lists, which the
+    /// other shards' blocks stay in.
     pub(super) fn clear(&mut self) {
-        self.finder.clear();
+        for &page in self.pages.values() {
+            for entry in &self.entries[page as usize] {
+                self.finder.unlink(entry.slot);
+            }
+        }
+        self.finder
+            .pages
+            .fetch_sub(self.pages.len(), Ordering::Relaxed);
         self.pages.clear();
         self.entries.clear();
         self.free.clear();
@@ -390,11 +414,11 @@ pub(super) struct Finder {
 
 impl Finder {
     /// Buckets for up to `slots` block slots: one per 16 slots, at least
-    /// 2^10 and at most 2^20 (4 MiB).
+    /// 2^10 a shard (256 KiB) and at most 2^20 (4 MiB).
     pub(super) fn new(slots: u32) -> Self {
         let buckets = (slots as usize / 16)
             .next_power_of_two()
-            .clamp(1 << 10, 1 << 20);
+            .clamp(SHARDS << 10, 1 << 20);
         let zeroed = vec![0u32; buckets].into_boxed_slice();
         // SAFETY: AtomicU32 has the size, alignment and bit validity of u32.
         let heads = unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [AtomicU32]) };
@@ -407,8 +431,15 @@ impl Finder {
         }
     }
 
+    /// The buckets of each shard ([`SHARDS`] of them share the heads).
+    fn shard_buckets(&self) -> usize {
+        self.heads.len() / SHARDS
+    }
+
+    /// The bucket of a block: one of its page's shard's.
     fn bucket_of(&self, physical: u64, pc: u64) -> usize {
-        (key_hash(physical, pc) >> 32) as usize & (self.heads.len() - 1)
+        let buckets = self.shard_buckets();
+        shard_of(physical) * buckets + ((key_hash(physical, pc) >> 32) as usize & (buckets - 1))
     }
 
     /// The pages the index holds.
@@ -488,23 +519,6 @@ impl Finder {
             }
             at = next;
         }
-    }
-
-    /// Empty every list.
-    fn clear(&self) {
-        for head in &self.heads {
-            let mut link = head.swap(0, Ordering::Release);
-            while let Some(slot) = link.checked_sub(1) {
-                if let Some(listed) = self.listed.get(slot) {
-                    listed.store(0, Ordering::Relaxed);
-                }
-                link = self
-                    .next
-                    .get(slot)
-                    .map_or(0, |next| next.load(Ordering::Relaxed));
-            }
-        }
-        self.pages.store(0, Ordering::Relaxed);
     }
 }
 

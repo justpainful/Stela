@@ -110,7 +110,7 @@ impl Polluter {
 /// (`FETCH_PROFILE` names the file: one hex address a line, less the
 /// binary's load address).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod sampler {
+pub(super) mod sampler {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     const SAMPLES: usize = 1 << 20;
     static TAKEN: AtomicUsize = AtomicUsize::new(0);
@@ -454,6 +454,81 @@ fn pack_record_compression() {
             per(inflate),
         );
     }
+}
+
+/// What a stored entry of real code holds in memory: every block of the
+/// first `FETCH_IMAGE` file (from `FETCH_OFFSET`, `FETCH_BYTES`, default 8
+/// MiB) compiled and stored, the mean bytes an entry retains, its recovery
+/// rows' packed bytes and what the rows' own vectors took before
+/// ([`crate::translations::Rows`]).
+#[test]
+#[ignore = "manual: opt-in"]
+fn stored_entry_bytes() {
+    use stela_compiler::block::{RecoveryBinding, UnqualifiedFaultRecovery};
+    let number = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let path = std::env::var("FETCH_IMAGE").expect("FETCH_IMAGE");
+    let path = path.split(',').next().unwrap_or_default();
+    let (offset, bytes) = (
+        number("FETCH_OFFSET", 1 << 20),
+        number("FETCH_BYTES", 8 << 20),
+    );
+    let file = std::fs::read(path).expect("the code image");
+    let image = &file[offset.min(file.len())..(offset + bytes).min(file.len())];
+    let preparation = Arc::new(system_preparation());
+    let options = system_options();
+    let base = 0x1_8040_0000u64;
+    let mut staging = [0u8; super::MAX_BLOCK_BYTES as usize];
+    let (mut entries, mut retained, mut packed, mut unpacked, mut rows) = (0u64, 0, 0, 0, 0);
+    let mut at = 0usize;
+    while at + 4 <= image.len() {
+        let pc = base + at as u64;
+        let page = pc & !(FETCH_PAGE - 1);
+        let page_end = (at as u64 | (FETCH_PAGE - 1)) + 1;
+        let end = (page_end as usize).min(image.len()).min(at + window(pc));
+        let length = end - at;
+        staging[..length].copy_from_slice(&image[at..end]);
+        preparation.admit(&mut staging[..length]);
+        let Ok((analysis, Ok(plan))) =
+            block::analyze_and_plan(&staging[..length], GuestAddress(pc), &options)
+        else {
+            at += 4;
+            continue;
+        };
+        let Ok(compiled) = plan.compile() else {
+            at += 4;
+            continue;
+        };
+        let step = compiled.source_bytes.max(4);
+        let input = analysis.source_bytes;
+        let emission = Emission::new(staging[..input].to_vec(), compiled, preparation.clone());
+        let context = preparation.context(page);
+        if let Some(entry) = Entry::stored(&emission.block, &emission.input, page, pc, context) {
+            entries += 1;
+            retained += entry.retained_bytes() as u64;
+            packed += entry.recovery.capacity() as u64;
+            rows += entry.recovery.len() as u64;
+            unpacked += (entry.recovery.len() * size_of::<UnqualifiedFaultRecovery>()) as u64;
+            for row in entry.recovery.iter() {
+                unpacked += (row.bindings().len() * size_of::<RecoveryBinding>()) as u64;
+            }
+        }
+        at += step;
+    }
+    let per = |bytes: u64| bytes as f64 / entries.max(1) as f64;
+    std::println!(
+        "entries={entries} rows_per_entry={:.1} retained_per_entry={:.0} \
+         recovery_packed={:.0} recovery_as_vectors={:.0} retained_as_vectors={:.0}",
+        per(rows),
+        per(retained),
+        per(packed),
+        per(unpacked),
+        per(retained - packed + unpacked + 8 * entries),
+    );
 }
 
 /// The first window's bytes: the engine's, or `FETCH_FIRST` instructions'.

@@ -391,14 +391,22 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
     state.pool.half = half;
     // A failed allocation can already have installed intermediate tables.
     state.legacy_translations_dirty = true;
+    // The root's entry, which an upper half's fill that makes it gives
+    // every set of the same rights.
+    let root_entry = tables::index(virtual_page, layout::top_level());
+    let entry_at = State::root_entry(root, root_entry);
+    // SAFETY: an entry of the current set's permanent root.
+    let mut before = unsafe { entry_at.read() };
     let mut mapped = tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights);
-    // The lower half's frames are exhausted: give up kept halves for
-    // theirs, the least recently kept first, before emptying the half.
+    // The lower half's frames are exhausted: give up other sets' lower
+    // halves for theirs, the least recently used first, before emptying
+    // every set's.
     while mapped.is_err()
         && half == LOWER
-        && let Some(oldest) = state.kept.evict_oldest()
+        && let Some(oldest) = state.oldest_lower()
     {
-        state.free_kept(oldest);
+        state.kept_dropped += 1;
+        state.drop_lower(oldest);
         state.pool.half = half;
         mapped = tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights);
     }
@@ -414,6 +422,7 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
             }
             state.pool.half = half;
             state.legacy_translations_dirty = true;
+            before = 0;
             match tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights) {
                 Ok(slot) => slot,
                 Err(_) => return Filled::Fatal,
@@ -427,8 +436,13 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
         invlpg(virtual_page);
     }
     if half == LOWER {
-        let entry = tables::index(virtual_page, layout::top_level());
-        state.record_lower(root, entry);
+        state.record_lower(root_entry);
+    } else if before == 0 {
+        // SAFETY: as above.
+        let after = unsafe { entry_at.read() };
+        if after != 0 {
+            state.share_upper(state.root_of(state.current), root_entry, after);
+        }
     }
     state.extents[half].record(address, translation.size, translation.global);
     let space = match (half, state.regime.as_ref()) {
@@ -518,6 +532,8 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
             }
         }
     }
+    // A non-global upper leaf ties the upper half to the ASID.
+    state.update_open();
     let done = rdtsc();
     state.fills += 1;
     state.fill_ticks += done.wrapping_sub(entered);
@@ -622,7 +638,9 @@ fn map_around(
     Some(mapped)
 }
 
-/// #GP or #UD inside native code ends the block; elsewhere it is fatal.
+/// #SS, #GP or #UD inside native code ends the block; elsewhere it is
+/// fatal. #SS and #GP name a non-canonical address: #SS where RSP or RBP
+/// is the access's base.
 pub(crate) fn native_exception(
     frame: &mut Frame,
     saved: &super::super::interrupts::SavedState<'_>,
@@ -631,7 +649,7 @@ pub(crate) fn native_exception(
     if !in_code(state, frame.rip) {
         super::super::interrupts::fatal(frame);
     }
-    let cause = if frame.vector == 13 {
+    let cause = if matches!(frame.vector, 12 | 13) {
         FaultCause::NonCanonical
     } else {
         FaultCause::InvalidOpcode

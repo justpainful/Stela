@@ -57,6 +57,7 @@ mod pointer_authentication;
 mod regime_state;
 mod scheduler;
 mod system_access;
+mod table_switches;
 mod timing;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
@@ -70,6 +71,8 @@ pub use parallel::{
     SourceObservation, SourcePhase,
 };
 pub use rebase::RebaseCounts;
+/// The reasons [`Statistics::switch_misses`] counts.
+pub const SWITCH_MISS_REASONS: usize = table_switches::miss::REASONS;
 pub use stela_contracts::dma::{DmaError, TransferFault};
 mod pointer;
 mod prepare;
@@ -155,13 +158,15 @@ use stela_compiler::{
     },
     x86_64::{
         MemoryChecks, NativeSystem, cache_clean, chain, native_exclusive,
-        pointer as x86_64_pointer, register_read, transition, zero_block,
+        pointer as x86_64_pointer, register_read, table_switch, transition, zero_block,
     },
 };
 pub use stela_contracts::bus::Transition;
 pub use stela_contracts::dma::Memory;
 pub use stela_contracts::gate::{CallerFault, CallerMemory, GateCall, GateOutcome};
-pub use stored::{EntryChecks, Offer, SharedTranslation, StoreEvent, Translations, entry_checks};
+pub use stored::{
+    EntryChecks, Looked, Offer, SharedTranslation, StoreEvent, Translations, entry_checks,
+};
 pub use system::FP_TRAPS_WRITABLE;
 use {
     super::cpu::Cpu, super::cpu::Exception, super::cpu::HCR_AMO, super::cpu::HCR_API,

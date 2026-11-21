@@ -130,6 +130,12 @@ pub struct Partition {
 /// What an executor that runs no PE keeps of the shadow pool.
 const PARKED_POOL: u64 = 4 * 1024 * 1024;
 
+/// The frames a shadow pool keeps for its roots: the host root and every
+/// root set's views (`stela_compiler::x86_64::table_switch`).
+pub const SHADOW_PERMANENT_FRAMES: u64 = (1 + stela_compiler::x86_64::table_switch::SETS
+    * stela_compiler::x86_64::table_switch::SET_ROOTS)
+    as u64;
+
 /// Each executor's own code: a few hundred leaves and native-run
 /// artifacts of at most a block each, in four parts of 512 KiB. Blocks go
 /// to the board's window.
@@ -261,7 +267,7 @@ pub fn partition(
         return Err(refuse!("native executor resources too small"));
     };
     let parked = (cores - runners) as u64;
-    // Each shadow pool needs 64 permanent root frames and at least one
+    // Each shadow pool needs its permanent root frames and at least one
     // frame in each half.
     let pool_share = pool.saturating_sub(parked * PARKED_POOL) / runners as u64 / PAGE * PAGE;
     let (pool_bytes, pool_offset) = match slot.checked_sub(runners) {
@@ -271,7 +277,7 @@ pub fn partition(
             runners as u64 * pool_share + behind as u64 * PARKED_POOL,
         ),
     };
-    if pool_bytes < 66 * PAGE {
+    if pool_bytes < (SHADOW_PERMANENT_FRAMES + 2) * PAGE {
         return Err(refuse!("native executor resources too small"));
     }
     Ok(Partition {
@@ -360,7 +366,8 @@ mod tests {
                     let code = code_reservation(free, cores, runners).unwrap();
                     assert!(code.bytes <= CODE_WINDOW_BYTES);
                     assert!(code.bytes.is_multiple_of(2 * MIB));
-                    let pool = 64 * MIB + parked_reserve(cores, runners).1;
+                    // Room for every runner's permanent roots at the most cores.
+                    let pool = MAX_CORES as u64 * 2 * MIB + parked_reserve(cores, runners).1;
                     let mut end = 0;
                     for slot in 0..cores {
                         let part = partition(cores, runners, slot, code.bytes, pool).unwrap();
@@ -463,7 +470,7 @@ mod tests {
         {
             let (_, pool_reserve) = parked_reserve(cores, runners);
             let code = cores as u64 * PRIVATE_CODE + 64 * MIB;
-            let pool = 64 * 1024 * 1024 + PAGE - 1 + pool_reserve;
+            let pool = MAX_CORES as u64 * 2 * MIB + PAGE - 1 + pool_reserve;
             let mut previous_pool = 0;
             for slot in 0..cores {
                 let part = partition(cores, runners, slot, code, pool).unwrap();
@@ -520,8 +527,8 @@ mod tests {
             assert!(partition(cores, runners, slot, code, 1024 * PAGE).is_err());
         }
         assert!(partition(2, 2, 0, code - 1, 1024 * PAGE).is_err());
-        assert!(partition(2, 2, 0, code, 132 * PAGE - 1).is_err());
-        assert!(partition(2, 2, 0, code, 132 * PAGE).is_ok());
-        assert!(partition(2, 1, 0, code, 132 * PAGE).is_err());
+        assert!(partition(2, 2, 0, code, 2 * (SHADOW_PERMANENT_FRAMES + 2) * PAGE - 1).is_err());
+        assert!(partition(2, 2, 0, code, 2 * (SHADOW_PERMANENT_FRAMES + 2) * PAGE).is_ok());
+        assert!(partition(2, 1, 0, code, 2 * (SHADOW_PERMANENT_FRAMES + 2) * PAGE).is_err());
     }
 }

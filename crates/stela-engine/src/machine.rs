@@ -32,10 +32,10 @@ pub use cpu::{Cpu, Exception};
 pub(crate) use engine::test_preparation;
 pub use engine::{
     ConsumedPair, Description, DeviceError, DeviceRegister, Devices, EntryChecks, Event,
-    FaultCause, Host, InstallError, Machine, NativeCode, NativeExit, NativeFault,
+    FaultCause, Host, InstallError, Looked, Machine, NativeCode, NativeExit, NativeFault,
     NativeFaultOrigin, NativeView, NoDevices, Offer, PeState, PeerState, Preparation, Prepared,
-    Refused, Regime, Requirement, RequirementKind, Reset, StaleCode, StaleOrigin, Statistics, Stop,
-    Transition, Translations, entry_checks, window,
+    Refused, Regime, Requirement, RequirementKind, Reset, SWITCH_MISS_REASONS, StaleCode,
+    StaleOrigin, Statistics, Stop, Transition, Translations, entry_checks, window,
 };
 pub use registers::{CpuProfile, Lines};
 #[cfg(test)]

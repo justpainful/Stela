@@ -33,7 +33,7 @@ struct Store {
     bytes: u64,
     total: u64,
     batch: usize,
-    uses: BTreeMap<Digest, u32>,
+    uses: BTreeMap<Digest, Use>,
     shedding: bool,
     shed: u64,
 }
@@ -61,7 +61,7 @@ impl Entries for Store {
     fn added_bytes(&mut self) -> u64 {
         self.bytes
     }
-    fn uses(&mut self) -> BTreeMap<Digest, u32> {
+    fn uses(&mut self) -> BTreeMap<Digest, Use> {
         self.uses.clone()
     }
 }
@@ -78,20 +78,22 @@ impl Store {
         record.insert(entry(offset, page as u8, entry_bytes));
         self.bytes += record.retained_bytes() as u64;
         self.added.insert(key, record);
-        *self.uses.entry(key).or_default() += 1;
+        self.uses
+            .entry(key)
+            .and_modify(|uses| uses.count += 1)
+            .or_insert_with(Use::first);
         self.total += 1;
     }
 }
 
 /// A session's size: the pages it compiles, in batches that press; each
 /// entry's code bytes; one page in `again` compiled again a batch later
-/// (its record merged anew), none for 0; the arena, file and limit.
+/// (its record merged anew), none for 0; the file and limit.
 pub(super) struct Session {
     pub records: u32,
     pub batch: u32,
     pub entry_bytes: usize,
     pub again: u32,
-    pub arena: usize,
     pub file: u64,
     pub limit: u64,
 }
@@ -108,7 +110,6 @@ pub(super) struct Steps {
     pub stats: Stats,
     pub segments: u64,
     pub merged: u64,
-    pub arena_full: bool,
     pub shed: u64,
 }
 
@@ -118,7 +119,7 @@ impl Steps {
         let micros = |nanos: u64| nanos / 1000;
         std::println!(
             "STEPS {name}: steps={} longest_us={} over_1ms={} over_5ms={} over_20ms={} busy_ms={} \
-             segments={} merged={} arena_full={} shed={}",
+             segments={} merged={} shed={}",
             self.steps,
             micros(self.longest),
             self.over[0],
@@ -127,7 +128,6 @@ impl Steps {
             self.busy / 1_000_000,
             self.segments,
             self.merged,
-            self.arena_full,
             self.shed,
         );
         let parts: Vec<String> = Part::ALL
@@ -153,16 +153,15 @@ impl Steps {
 /// end of the writer's work.
 pub(super) fn run(session: &Session) -> Steps {
     let translator = translator_id();
-    let mut arena = vec![0u8; session.arena];
     let file = File {
         translator,
         limit: session.limit,
+        records: u64::MAX,
         file_bytes: session.file,
         committed: None,
         segments: Vec::new(),
         used: Vec::new(),
         partial: false,
-        arena: Arena::new(&mut arena),
     };
     let started = Instant::now();
     let mut clock = move || started.elapsed().as_nanos() as u64;
@@ -203,9 +202,13 @@ pub(super) fn run(session: &Session) -> Steps {
         let idle = writer.idle();
         let from = clock();
         let events = writer
-            .step(&mut clock, from + DEADLINE, &mut store, &mut |execution| {
-                Some(execution.advance(&mut Discard, PIECE_BYTES))
-            })
+            .step(
+                &mut clock,
+                from + DEADLINE,
+                &mut store,
+                &mut |execution| Some(execution.advance(&mut Discard, PIECE_BYTES)),
+                &mut |_| {},
+            )
             .unwrap();
         let took = clock() - from;
         if !idle || !writer.idle() || !events.is_empty() {
@@ -220,7 +223,6 @@ pub(super) fn run(session: &Session) -> Steps {
             match event {
                 Event::Segment { .. } => steps.segments += 1,
                 Event::Merged { .. } => steps.merged += 1,
-                Event::ArenaFull { .. } => steps.arena_full = true,
                 _ => {}
             }
         }
@@ -238,10 +240,9 @@ pub(super) fn run(session: &Session) -> Steps {
 
 /// A long session's steps: run 20261120's boot wrote 519 435 records in 80
 /// segments of 3 to 24 thousand records (about 8 KiB each), merged in full
-/// up to 20 thousand records and 354 MB, in an arena of 670 MB it compacted
-/// 12 times. Here 500 thousand records of 2 KiB in segments of 15 thousand,
-/// and 60 thousand of 8 KiB, each in an arena that fills and a file whose
-/// full merges leave records out: what each step took against its 1 ms
+/// up to 20 thousand records and 354 MB. Here 500 thousand records of 2 KiB
+/// in segments of 15 thousand, and 60 thousand of 8 KiB, each in a file
+/// whose full merges leave records out: what each step took against its 1 ms
 /// deadline, and its parts. A release build on a quiet host gives the
 /// boot's figures.
 #[test]
@@ -252,7 +253,6 @@ fn step_costs_of_a_long_session() {
         batch: 15_000,
         entry_bytes: 2 << 10,
         again: 8,
-        arena: 256 << 20,
         file: DATA_START + (2 << 30),
         limit: 2 << 30,
     };
@@ -262,7 +262,6 @@ fn step_costs_of_a_long_session() {
         batch: 15_000,
         entry_bytes: 8 << 10,
         again: 4,
-        arena: 256 << 20,
         file: DATA_START + (1 << 30),
         limit: 2 << 30,
     };

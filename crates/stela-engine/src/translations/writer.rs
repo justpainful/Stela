@@ -21,32 +21,32 @@
 //! boots: once a boot when the file holds [`MERGE_AT`] of either (after the
 //! boot's first segment came due, and while translation does not press),
 //! when the segments fill half the file, when a new segment finds no room,
-//! or when the slots run short. A merge reads segments from memory: those
-//! the boot read and those it laid out, whose records it moves instead of
-//! copying. Every merged segment lies beside the file's content, so it
-//! commits once and a cut leaves the content before it whole; a full merge
-//! stays within [`MERGED_SHARE`] of the file, so new segments find room
-//! until the next. A new segment the file has no room for waits for a
-//! merge; one that finds none even after it is too large for the file and
-//! is left out.
+//! or when the slots run short. A merge reads its segments' indexes from
+//! memory and the records it keeps from the file ([`Merge`], through
+//! [`FileReads`] the boot carries out on waiting PEs), so no boot holds its
+//! pack's records whole; a read that fails leaves the file as it was and no
+//! merge runs for the rest of the boot. Every merged segment lies beside the
+//! file's content, so it commits once and a cut leaves the content before
+//! it whole; a full merge stays within [`MERGED_SHARE`] of the file, so new
+//! segments find room until the next. A new segment the file has no room
+//! for waits for a merge; one that finds none even after it is too large for
+//! the file and is left out. The segments the boot's store reads records
+//! from stay unwritten after a merge replaced them, while the file has room
+//! beside them; when it has none, the writer says so ([`Event::Retired`])
+//! and the store reads them no more.
 //!
 //! At a stop, a new segment's write in flight is finished, a merge not yet
 //! committed is left, and what is left and the boot's used-key list are
 //! written.
 //!
-//! Once a segment is written, its records move out of the heap to an arena
-//! ([`Arena`]) outside it, as the pack the loader read is held, a step's
-//! share ([`SETTLE_BYTES`]) at a time, whatever else it does: merges read
-//! them there, and the heap keeps each laid-out segment's index alone. A
-//! merge moves its inputs' records rather than copying them, and copies a
-//! record several segments hold only when merging changes it; when the
-//! arena fills, it is compacted to the records the segments keep, so it
-//! holds what this boot added, not what merges left behind.
+//! Once a segment is written, memory keeps its index alone: a merge reads
+//! its records from the file like those of the segments the boot read. A
+//! merge copies a record several segments hold only when merging changes
+//! it.
 //!
-//! A pack the next boot reads whole converges on the code boots use: a boot
-//! leaves at most [`LEFT_EIGHTHS`] of the limit (the store sheds new entries
-//! past it), so the next reads all of it and its arena, the limit less the
-//! pack read, holds whatever it adds; and once a boot whose file held
+//! A pack converges on the code boots use: a boot leaves at most
+//! [`LEFT_EIGHTHS`] of the limit (the store sheds new entries past it); and
+//! once a boot whose file held
 //! records of earlier boots, a full merge keeps [`KEPT_EIGHTHS`] of the
 //! limit, the records boots used most recently first, which leaves room for
 //! the code the boot newly compiles. When that room is full too, while the
@@ -66,11 +66,13 @@
 //! every segment it holds go, for the rest of the boot: they stay in the
 //! file, and no merge runs, as one would leave them out.
 use super::pack::{
-    Arena, Delta, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS, Merge,
-    Merged, Pack, SEGMENT_BLOB, Segment, Settled, USED_BLOB, UsedKeys,
+    Delta, FileReads, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS, Merge,
+    Merged, RESIDENT_RECORD_BYTES, SEGMENT_BLOB, Segment, Streamed, USED_BLOB, Use, UsedKeys,
 };
 use super::{Digest, Record};
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    borrow::Cow, boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec,
+};
 use stela_formats::journal::{self, Blob, Change, Commit, DATA_START, Entry, Execution, Step};
 
 /// Segments or used-key lists at which a boot merges them in full, once.
@@ -103,8 +105,6 @@ const LOOKS_PER_SECOND: u64 = 10;
 pub const STEP_WORK: usize = 32;
 /// The most bytes a write step queues.
 pub const PIECE_BYTES: u64 = 512 << 10;
-/// The record bytes a step moves to the arena.
-pub const SETTLE_BYTES: usize = 4 << 20;
 /// Full merges a boot runs when its pack reached its share and the file
 /// holds records of earlier boots: each writes up to [`KEPT_EIGHTHS`] of
 /// the limit, so this bounds what the boot writes for them.
@@ -121,6 +121,21 @@ pub const RESIDENT_SHARE: u64 = 16;
 pub const SHED_SHARE: u64 = 16;
 /// Under this share of room, the writer lets its laid-out segments go.
 pub const RELEASE_SHARE: u64 = 32;
+
+/// The limit of a pack read on demand in a file of `file_bytes`: its data
+/// area less the [`MERGED_SHARE`] a full merge writes beside the content.
+/// Memory holds such a pack's indexes alone, so its size is the file's,
+/// not the RAM's; the RAM bounds its records ([`File::records`]).
+pub fn demand_limit(file_bytes: u64) -> u64 {
+    let data = (file_bytes / journal::ALIGN * journal::ALIGN).saturating_sub(DATA_START);
+    data - data / 8 * MERGED_SHARE
+}
+
+/// The most records a pack may hold whose indexes `bytes` of memory hold
+/// while their records stay in the file ([`RESIDENT_RECORD_BYTES`]).
+pub fn resident_records(bytes: u64) -> u64 {
+    bytes / RESIDENT_RECORD_BYTES
+}
 
 /// The heap the writer's segments and the store's entries share with the
 /// rest of the boot.
@@ -151,7 +166,7 @@ pub trait Entries {
     /// This boot's uses of each page key so far: records handed out and
     /// blocks offered. A full merge keeps the most used of the records it
     /// cannot keep all of.
-    fn uses(&mut self) -> BTreeMap<Digest, u32> {
+    fn uses(&mut self) -> BTreeMap<Digest, Use> {
         BTreeMap::new()
     }
 }
@@ -212,11 +227,13 @@ pub enum Event {
         pack: u64,
         resident: u64,
     },
-    /// The arena, compacted, had no room for the next record, `used` bytes
-    /// of it holding records: the rest of the boot's written records stay
-    /// in the heap, within its share ([`RESIDENT_SHARE`]), as `resident`
-    /// bytes did then. Reported once.
-    ArenaFull { used: u64, resident: u64 },
+    /// A read of the file a merge needed failed: the file keeps what it
+    /// held, and no merge runs for the rest of the boot.
+    Abandoned { full: bool },
+    /// The file had no room beside the segments the boot's store reads
+    /// records from, which a merge replaced: the writer may write there
+    /// now, and the store must read them no more. Reported once.
+    Retired,
     /// The heap's room fell under [`RELEASE_SHARE`]: the writer let its
     /// laid-out segments go (`bytes`), and the records of those not yet
     /// written and of the entries held (`lost`).
@@ -229,19 +246,17 @@ pub enum Event {
 pub enum Part {
     /// Keeping the store's entries and the segments within the heap.
     Govern,
-    /// Moving written records to the arena.
-    Settle,
-    /// Compacting the arena.
-    Compact,
     /// Starting a write, a merge or a new segment.
     Begin,
     /// Taking entries that press while busy.
     Hold,
-    /// A unit of a new segment's layout, or of a merge's.
+    /// A unit of a new segment's layout, or of a merge's, with its reads.
     Delta,
     Merge,
     /// A layout laid out: its write planned.
     Plan,
+    /// A merge's records read from the file for its write's next piece.
+    Fetch,
     /// A piece of a write queued, or its results taken.
     Write,
     /// A write finished: its commit and segment kept.
@@ -249,15 +264,14 @@ pub enum Part {
 }
 
 impl Part {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Govern,
-        Self::Settle,
-        Self::Compact,
         Self::Begin,
         Self::Hold,
         Self::Delta,
         Self::Merge,
         Self::Plan,
+        Self::Fetch,
         Self::Write,
         Self::Commit,
     ];
@@ -266,13 +280,12 @@ impl Part {
     pub fn name(self) -> &'static str {
         match self {
             Self::Govern => "govern",
-            Self::Settle => "settle",
-            Self::Compact => "compact",
             Self::Begin => "begin",
             Self::Hold => "hold",
             Self::Delta => "delta",
             Self::Merge => "merge",
             Self::Plan => "plan",
+            Self::Fetch => "fetch",
             Self::Write => "write",
             Self::Commit => "commit",
         }
@@ -298,9 +311,11 @@ pub struct Stats {
     /// segments held.
     pub sheds: u64,
     pub resident_peak: u64,
-    /// Times the arena was compacted, and the bytes that gave back.
-    pub compactions: u64,
-    pub compacted: u64,
+    /// Reads of the file merges made, their bytes, and merges given up
+    /// because a read failed.
+    pub file_reads: u64,
+    pub file_read_bytes: u64,
+    pub abandoned: u64,
 }
 
 /// What [`Writer::stop`] wrote: the segments in the file after it, the
@@ -336,10 +351,19 @@ enum Task<'a> {
     },
 }
 
-/// What a finished write leaves in memory.
+/// What a finished write leaves in memory: the layout written, and for a
+/// merge the source its records in the file are written through.
 enum Done<'a> {
     Segment(Arc<Layout<'a>>, Trigger),
-    Merge(Arc<Layout<'a>>, Merging),
+    Merge(Arc<Layout<'a>>, Merging, Option<Arc<Streamed<'a>>>),
+}
+
+/// The next piece of a streamed write: its offset and bytes in the blob,
+/// and each read that fills it (where it goes in the piece, and its id).
+struct Fetch {
+    offset: u64,
+    bytes: u64,
+    reads: Vec<(u64, u64)>,
 }
 
 /// A boot's writer of its pack file.
@@ -347,6 +371,9 @@ pub struct Writer<'a> {
     translator: Digest,
     /// The bound a merged segment stays within: what this PC can read.
     limit: u64,
+    /// The most records the pack holds: those whose indexes this PC's
+    /// memory holds.
+    records: u64,
     file_bytes: u64,
     committed: Option<Commit>,
     /// The file's segments as memory holds them, oldest first, and the
@@ -394,12 +421,19 @@ pub struct Writer<'a> {
     refilling: Option<u64>,
     /// The bytes of the segments read: records of earlier boots.
     read_bytes: u64,
-    /// The bytes of the entries a segment being laid out took.
+    /// The bytes and records of the entries a segment being laid out took,
+    /// and the entries taken from the store so far.
     delta_bytes: u64,
-    /// Where written records move, and whether it ran out of room.
-    arena: Arena<'a>,
-    arena_full: bool,
-    arena_reported: bool,
+    delta_records: u64,
+    taken: u64,
+    /// The reads of a streamed write's next piece.
+    reads: FileReads,
+    fetch: Option<Fetch>,
+    /// File ranges the boot's store reads records from that no write may
+    /// take while the file has other room ([`Event::Retired`]), and whether
+    /// the store was told to stop.
+    avoid: Vec<(u64, u64)>,
+    retired: bool,
     failed: bool,
     stats: Stats,
 }
@@ -407,26 +441,45 @@ pub struct Writer<'a> {
 /// A boot's view of its pack file as the loader read it.
 pub struct File<'a> {
     pub translator: Digest,
-    /// The bound a merged segment stays within.
+    /// The bound a merged segment stays within: the RAM's for a pack read
+    /// whole, the file's for one read on demand ([`demand_limit`]).
     pub limit: u64,
+    /// The most records the pack holds ([`resident_records`]).
+    pub records: u64,
     pub file_bytes: u64,
     /// The file's newest commit, any translator's.
     pub committed: Option<Commit>,
-    /// The segments and used-key lists read, oldest first.
-    pub segments: Vec<Pack<'a>>,
+    /// The segments and used-key lists read, oldest first: held whole, or
+    /// by their index when their records stay in the file
+    /// ([`Segment::at`]).
+    pub segments: Vec<Segment<'a>>,
     pub used: Vec<UsedKeys>,
     /// A segment was left out or cut.
     pub partial: bool,
-    /// Where the records of the segments this boot writes move.
-    pub arena: Arena<'a>,
 }
 
 impl<'a> Writer<'a> {
     pub fn new(mut file: File<'a>, hz: u64) -> Self {
         let segments = core::mem::take(&mut file.segments);
+        // The store reads the records of segments left in the file.
+        let filed = segments.iter().any(|segment| !segment.in_memory());
+        let avoid = file
+            .committed
+            .iter()
+            .filter(|commit| filed && commit.key == file.translator.0)
+            .flat_map(|commit| commit.entries.iter())
+            .filter(|entry| entry.kind == SEGMENT_BLOB)
+            .map(|entry| {
+                (
+                    entry.offset,
+                    entry.offset + entry.length.next_multiple_of(journal::ALIGN),
+                )
+            })
+            .collect();
         let mut writer = Self {
             translator: file.translator,
             limit: file.limit,
+            records: file.records,
             file_bytes: file.file_bytes,
             committed: file.committed,
             segments: Vec::new(),
@@ -452,15 +505,18 @@ impl<'a> Writer<'a> {
             pack_full: false,
             refills: FULL_REFILLS,
             refilling: None,
-            read_bytes: segments.iter().map(|pack| pack.bytes() as u64).sum(),
+            read_bytes: segments.iter().map(Segment::bytes).sum(),
             delta_bytes: 0,
-            arena: file.arena,
-            arena_full: false,
-            arena_reported: false,
+            delta_records: 0,
+            taken: 0,
+            reads: FileReads::default(),
+            fetch: None,
+            avoid,
+            retired: false,
             failed: false,
             stats: Stats::default(),
         };
-        writer.segments = segments.into_iter().map(Segment::from).collect();
+        writer.segments = segments;
         writer
     }
 
@@ -476,113 +532,19 @@ impl<'a> Writer<'a> {
         matches!(self.task, Task::Idle)
     }
 
-    /// The heap bytes of the segments laid out this boot that memory holds
-    /// for merges and writes.
+    /// The heap bytes of the segments laid out this boot that memory holds:
+    /// until written, whole; then their indexes.
     pub fn resident(&self) -> u64 {
         let laid = self.segments.iter().filter_map(|segment| match segment {
             Segment::Laid(layout) => Some(layout.owned()),
-            Segment::Packed(_) => None,
+            Segment::Filed {
+                index: Cow::Owned(index),
+                ..
+            } => Some(index.capacity() as u64),
+            Segment::Packed(_) | Segment::Filed { .. } => None,
         });
         let waiting = self.waiting.iter().map(|layout| layout.owned());
         laid.chain(waiting).sum()
-    }
-
-    /// The arena's bytes holding records, and those left.
-    pub fn arena(&self) -> (u64, u64) {
-        (self.arena.used(), self.arena.left())
-    }
-
-    /// Count `part` as taking from `from` to the clock's next reading, and
-    /// answer that reading.
-    fn lap(&mut self, part: Part, from: u64, clock: &mut dyn FnMut() -> u64) -> u64 {
-        let now = clock();
-        let longest = &mut self.stats.parts[part as usize];
-        *longest = (*longest).max(now.saturating_sub(from));
-        now
-    }
-
-    /// Move a step's share of the records of a segment written to the
-    /// arena, until it has no room even compacted: the first time, the
-    /// event that says so. `at` is the clock's last reading, moved on.
-    fn settle(&mut self, clock: &mut dyn FnMut() -> u64, at: &mut u64) -> Option<Event> {
-        let event = self.settle_timed(clock, at);
-        *at = self.lap(Part::Settle, *at, clock);
-        event
-    }
-
-    fn settle_timed(&mut self, clock: &mut dyn FnMut() -> u64, at: &mut u64) -> Option<Event> {
-        // Without an arena (none was set aside) the records stay.
-        let (used, left) = self.arena();
-        if self.arena_full || self.released || used + left == 0 {
-            return None;
-        }
-        // Merges leave the records they merged anew or evicted behind in
-        // the arena: compacted, it holds what the segments keep. The rest
-        // stays in the heap until a merge or write in flight is done, and
-        // the arena is full when compacted it still has no room, until the
-        // next merge commits. Records past it stay in the heap, which its
-        // own shares bound: the arena is the room the pack read leaves, and
-        // a merge of read segments that hold one page each re-encodes that
-        // page there while the read bytes stay for lookups.
-        if self.settle_next() != Some(Settled::Full) {
-            return None;
-        }
-        *at = self.lap(Part::Settle, *at, clock);
-        let compacted = self.compact();
-        *at = self.lap(Part::Compact, *at, clock);
-        if compacted.is_some() && self.settle_next() == Some(Settled::Full) {
-            self.arena_full = true;
-            if !self.arena_reported {
-                self.arena_reported = true;
-                return Some(Event::ArenaFull {
-                    used: self.arena.used(),
-                    resident: self.resident(),
-                });
-            }
-        }
-        None
-    }
-
-    /// Move a step's share of the first segment written with records
-    /// still in the heap: `None` when there is none.
-    fn settle_next(&mut self) -> Option<Settled> {
-        for segment in &mut self.segments {
-            let Segment::Laid(layout) = segment else {
-                continue;
-            };
-            if layout.settled() {
-                continue;
-            }
-            // A write in flight shares its layout: it moves once written.
-            let Some(layout) = Arc::get_mut(layout) else {
-                continue;
-            };
-            return Some(layout.settle(&mut self.arena, SETTLE_BYTES));
-        }
-        None
-    }
-
-    /// Compact the arena to the records the segments keep, unless a merge or
-    /// write in flight holds some of them: the bytes it gave back.
-    fn compact(&mut self) -> Option<u64> {
-        if matches!(self.task, Task::Merge(..) | Task::Write { .. }) {
-            return None;
-        }
-        let mut layouts = Vec::with_capacity(self.segments.len() + self.waiting.len());
-        for segment in &mut self.segments {
-            if let Segment::Laid(layout) = segment {
-                layouts.push(Arc::get_mut(layout)?);
-            }
-        }
-        for layout in &mut self.waiting {
-            layouts.push(Arc::get_mut(layout)?);
-        }
-        // SAFETY: with no merge or write in flight and every layout held
-        // here alone, the segments hold every slice of the arena in use.
-        let given = unsafe { self.arena.compact(&mut layouts) };
-        self.stats.compactions += 1;
-        self.stats.compacted += given;
-        Some(given)
     }
 
     /// Whether the store sheds new entries, and whether the writer let its
@@ -606,12 +568,13 @@ impl<'a> Writer<'a> {
         }
         let left = self.left_bytes();
         let pack = self.pack_bytes(entries);
+        let records = self.pack_records(entries);
         let heap_short = heap.is_some_and(|Heap { total, room }| {
             room < total / SHED_SHARE || resident >= total / RESIDENT_SHARE
         });
         let reason = if heap_short {
             Some(ShedReason::Heap)
-        } else if pack >= left {
+        } else if pack >= left || records >= self.records {
             Some(ShedReason::Pack)
         } else {
             None
@@ -623,13 +586,15 @@ impl<'a> Writer<'a> {
         // it: a merge of the boot's segments that takes it just under its
         // share frees no room, and a refill (`refill_due`) must still run.
         // Run 20261119-052839 shed with its pack at 550 of 566 MB and kept
-        // nothing new for the rest of the boot.
+        // nothing new for the rest of the boot. Its records likewise.
+        let eased = pack < left.saturating_sub(self.limit / 16)
+            && records < self.records.saturating_sub(self.records / 16);
         self.pack_full = match reason {
             Some(ShedReason::Pack) => true,
             Some(ShedReason::Heap) => false,
-            None => self.pack_full && pack >= left.saturating_sub(self.limit / 16),
+            None => self.pack_full && !eased,
         };
-        let keep = reason.is_none() && heap_eased && pack < left.saturating_sub(self.limit / 16);
+        let keep = reason.is_none() && heap_eased && eased;
         if let Some(reason) = reason
             && !self.shedding
         {
@@ -675,6 +640,23 @@ impl<'a> Writer<'a> {
         self.segment_bytes() + waiting + task + self.held_bytes + entries.added_bytes()
     }
 
+    /// The records the pack holds and will hold, counted as
+    /// [`Self::pack_bytes`] counts their bytes (a key in two counts twice).
+    fn pack_records(&self, entries: &mut dyn Entries) -> u64 {
+        let segments: usize = self.segments.iter().map(Segment::records).sum();
+        let waiting: usize = self.waiting.iter().map(|layout| layout.records()).sum();
+        let task = match &self.task {
+            Task::Delta(..) => self.delta_records,
+            Task::Write {
+                done: Done::Segment(layout, _),
+                ..
+            } => layout.records() as u64,
+            _ => 0,
+        };
+        let added = entries.added().saturating_sub(self.taken);
+        (segments + waiting + self.held.len()) as u64 + task + added
+    }
+
     /// Let every segment laid out go, with a merge in progress, the entries
     /// held and those the store holds, and shed new ones for the rest of
     /// the boot. A segment being laid out or written finishes; it is let go
@@ -696,9 +678,8 @@ impl<'a> Writer<'a> {
         if let Task::Merge(..) = self.task {
             self.task = Task::Idle;
         }
-        self.segments
-            .retain(|segment| matches!(segment, Segment::Packed(_)));
-        // Merges read segments from memory: with some let go, none runs.
+        self.segments = Vec::new();
+        // The file keeps the segments: no merge runs without them.
         self.partial = true;
         Event::Released { room, bytes, lost }
     }
@@ -722,13 +703,15 @@ impl<'a> Writer<'a> {
         self.entries(kind).count()
     }
 
-    /// The longest free run beside the file's content.
+    /// The longest free run beside the file's content and the ranges the
+    /// boot's store reads.
     fn free(&self) -> u64 {
-        journal::largest_free(
+        journal::largest_free_avoiding(
             self.committed.as_ref(),
             JOURNAL_DOMAIN,
             self.translator.0,
             self.file_bytes,
+            &self.avoid,
         )
     }
 
@@ -739,6 +722,7 @@ impl<'a> Writer<'a> {
 
     /// Note the keys of entries taken for a segment.
     fn note_added(&mut self, added: &BTreeMap<Digest, Record>) {
+        self.taken += added.len() as u64;
         if self.added_keys.len() <= MAX_USED_KEYS {
             self.added_keys.extend(added.keys().copied());
         }
@@ -885,7 +869,15 @@ impl<'a> Writer<'a> {
             // until the merged segment is whole; within its share of the
             // file, so new segments find room until the next merge.
             let share = self.data_bytes() / 8 * MERGED_SHARE;
-            let bound = self.kept_bytes().min(share).min(self.free());
+            let wanted = self.kept_bytes().min(share);
+            // The ranges the store reads give way rather than cut what the
+            // merge keeps: records it left out would be lost to every later
+            // boot, the store's reads only to this one.
+            if self.free() < wanted && !self.avoid.is_empty() {
+                self.avoid = Vec::new();
+                self.retired = true;
+            }
+            let bound = wanted.min(self.free());
             let protect = UsedKeys::parse(&self.used_list(entries.found_keys()), &self.translator);
             let segments = core::mem::take(&mut self.segments);
             let mut merge = Merge::new(self.translator, segments, self.used.clone(), bound)
@@ -948,6 +940,7 @@ impl<'a> Writer<'a> {
             self.delta_interval = (self.delta_interval * 2).min(self.hz * LAST_DELTA_SECONDS);
         }
         self.stats.delta_records += added.len() as u64;
+        self.delta_records = added.len() as u64;
         self.delta_bytes = added
             .values()
             .map(|record| record.retained_bytes() as u64)
@@ -986,25 +979,39 @@ impl<'a> Writer<'a> {
     }
 
     /// The plan that writes `change`, which commits once beside the file's
-    /// content: `None` when it does not fit so.
-    fn plan(&self, change: Change<'a>) -> Option<Box<Execution<'a>>> {
-        let plan = journal::plan(
-            self.committed.as_ref(),
-            JOURNAL_DOMAIN,
-            self.translator.0,
-            self.file_bytes,
-            change,
-        );
-        let commits = plan
-            .steps
-            .iter()
-            .filter(|step| matches!(step, Step::Commit(_)))
-            .count();
-        (plan.dropped.is_empty() && commits <= 1).then(|| Box::new(Execution::new(plan)))
+    /// content, outside the ranges the boot's store reads while the file
+    /// has room beside them too: `None` when it does not fit so.
+    fn plan(&mut self, change: Change<'a>) -> Option<Box<Execution<'a>>> {
+        let planned = |avoid: &[(u64, u64)]| {
+            let plan = journal::plan_avoiding(
+                self.committed.as_ref(),
+                JOURNAL_DOMAIN,
+                self.translator.0,
+                self.file_bytes,
+                change.clone(),
+                avoid,
+            );
+            let commits = plan
+                .steps
+                .iter()
+                .filter(|step| matches!(step, Step::Commit(_)))
+                .count();
+            (plan.dropped.is_empty() && commits <= 1).then(|| Box::new(Execution::new(plan)))
+        };
+        if let Some(execution) = planned(&self.avoid) {
+            return Some(execution);
+        }
+        let execution = planned(&[])?;
+        // The store's ranges are the room left: it reads them no more.
+        if !self.avoid.is_empty() {
+            self.avoid = Vec::new();
+            self.retired = true;
+        }
+        Some(execution)
     }
 
     /// The task that writes `layout` as a new segment, if it fits.
-    fn write_segment(&self, layout: Arc<Layout<'a>>, trigger: Trigger) -> Option<Task<'a>> {
+    fn write_segment(&mut self, layout: Arc<Layout<'a>>, trigger: Trigger) -> Option<Task<'a>> {
         let change = Change {
             replace: Vec::new(),
             remove: Vec::new(),
@@ -1020,19 +1027,28 @@ impl<'a> Writer<'a> {
         })
     }
 
-    /// A write finished: its commit is the file's newest.
+    /// A write finished: its commit is the file's newest, and memory keeps
+    /// the index of the segment it wrote, its records in the file.
     fn finish(&mut self, execution: Box<Execution<'a>>, done: Done<'a>) -> Event {
         if let Some(last) = execution.last() {
             self.committed = Some(last);
         }
+        let at = execution.offset_of(0).unwrap_or(0);
         drop(execution);
+        let filed = |layout: Arc<Layout<'a>>| Segment::Filed {
+            index: Cow::Owned(match Arc::try_unwrap(layout) {
+                Ok(layout) => layout.into_prefix(),
+                Err(shared) => shared.prefix().to_vec(),
+            }),
+            at,
+        };
         match done {
             Done::Segment(layout, trigger) => {
                 let (records, bytes) = (layout.records(), layout.bytes());
                 self.stats.deltas += 1;
                 self.stats.delta_bytes += bytes;
                 if !self.released {
-                    self.segments.push(Segment::Laid(layout));
+                    self.segments.push(filed(layout));
                 }
                 Event::Segment {
                     records,
@@ -1040,16 +1056,16 @@ impl<'a> Writer<'a> {
                     trigger,
                 }
             }
-            Done::Merge(layout, Merging::Pair(_)) => {
+            Done::Merge(layout, Merging::Pair(_), streamed) => {
+                drop(streamed);
                 self.stats.pairs += 1;
-                // Its inputs' records merged anew are the arena's to take back.
-                self.arena_full = false;
                 if !self.released {
-                    self.segments.push(Segment::Laid(layout));
+                    self.segments.push(filed(layout));
                 }
                 Event::MergeCommitted { full: false }
             }
-            Done::Merge(layout, Merging::Full) => {
+            Done::Merge(layout, Merging::Full, streamed) => {
+                drop(streamed);
                 self.stats.merges += 1;
                 // A refill that freed little finds nothing more to replace.
                 if let Some(before) = self.refilling.take()
@@ -1057,12 +1073,11 @@ impl<'a> Writer<'a> {
                 {
                     self.refills = 0;
                 }
-                self.arena_full = false;
                 self.merged_since_wait = !self.waiting.is_empty();
                 self.segments = if self.released {
                     Vec::new()
                 } else {
-                    vec![Segment::Laid(layout)]
+                    vec![filed(layout)]
                 };
                 self.used.clear();
                 Event::MergeCommitted { full: true }
@@ -1070,15 +1085,91 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// A merge's read failed: the file keeps what it held, the segments it
+    /// took come back, and no merge runs for the rest of the boot.
+    fn abandon(&mut self, segments: Vec<Segment<'a>>, merging: &Merging) -> Event {
+        self.stats.abandoned += 1;
+        self.reads = FileReads::default();
+        self.fetch = None;
+        self.refilling = None;
+        if !self.released {
+            let mut segments = segments;
+            segments.append(&mut self.segments);
+            self.segments = segments;
+        }
+        self.partial = true;
+        Event::Abandoned {
+            full: matches!(merging, Merging::Full),
+        }
+    }
+
+    /// Make the next piece of a streamed write ready: read its records in
+    /// the file (`read` carries the reads out) and fill its window.
+    /// `Some(true)` once ready, `Some(false)` while the reads are under
+    /// way, `None` when one failed.
+    fn fetch(
+        &mut self,
+        execution: &Execution<'a>,
+        streamed: &Streamed<'a>,
+        read: &mut dyn FnMut(&mut FileReads),
+    ) -> Option<bool> {
+        let Some((0, offset, bytes)) = execution.next_read(PIECE_BYTES) else {
+            return Some(true);
+        };
+        if self
+            .fetch
+            .as_ref()
+            .is_none_or(|fetch| (fetch.offset, fetch.bytes) != (offset, bytes))
+        {
+            let runs = streamed.layout.file_runs(offset, bytes);
+            if runs.is_empty() {
+                return Some(true);
+            }
+            let reads = runs
+                .into_iter()
+                .map(|(at, length, into)| (into, self.reads.ask(at, length)))
+                .collect();
+            self.fetch = Some(Fetch {
+                offset,
+                bytes,
+                reads,
+            });
+        }
+        read(&mut self.reads);
+        let fetch = self.fetch.as_ref().expect("asked");
+        if fetch.reads.iter().any(|(_, id)| !self.reads.ended(*id)) {
+            return Some(false);
+        }
+        let fetch = self.fetch.take().expect("asked");
+        let mut filled = Vec::with_capacity(fetch.reads.len());
+        for (into, id) in fetch.reads {
+            filled.push((into, self.reads.take_ended(id)??));
+        }
+        streamed.fill(offset, bytes, &filled);
+        Some(true)
+    }
+
+    /// Count `part` as taking from `from` to the clock's next reading, and
+    /// answer that reading.
+    fn lap(&mut self, part: Part, from: u64, clock: &mut dyn FnMut() -> u64) -> u64 {
+        let now = clock();
+        let longest = &mut self.stats.parts[part as usize];
+        *longest = (*longest).max(now.saturating_sub(from));
+        now
+    }
+
     /// Carry the work forward until `clock` passes `deadline`, or a write
     /// queued its piece (`advance` carries a plan out a piece at a time on
-    /// the device, `None` while it cannot). Answers what it did to report.
+    /// the device, `None` while it cannot), or a merge waits for its reads
+    /// of the file (`read` starts those asked and takes those that ended,
+    /// never waiting for the device). Answers what it did to report.
     pub fn step(
         &mut self,
         clock: &mut dyn FnMut() -> u64,
         deadline: u64,
         entries: &mut dyn Entries,
         advance: &mut dyn FnMut(&mut Execution<'a>) -> Option<Result<bool, String>>,
+        read: &mut dyn FnMut(&mut FileReads),
     ) -> Result<Vec<Event>, String> {
         let mut events = Vec::new();
         if self.failed {
@@ -1087,7 +1178,6 @@ impl<'a> Writer<'a> {
         let mut at = clock();
         events.extend(self.govern(entries));
         at = self.lap(Part::Govern, at, clock);
-        events.extend(self.settle(clock, &mut at));
         if self.idle() {
             events.extend(self.begin(at, entries));
             at = self.lap(Part::Begin, at, clock);
@@ -1104,26 +1194,138 @@ impl<'a> Writer<'a> {
                     if !done {
                         Task::Delta(delta, trigger)
                     } else {
-                        let task = self.laid_delta(delta, trigger, &mut events);
+                        let task = match delta.finish() {
+                            Some(layout) => {
+                                let layout = Arc::new(layout);
+                                match self.write_segment(layout.clone(), trigger) {
+                                    Some(task) => task,
+                                    None => {
+                                        events.push(Event::Waiting {
+                                            records: layout.records(),
+                                        });
+                                        self.waiting.push(layout);
+                                        Task::Idle
+                                    }
+                                }
+                            }
+                            None => Task::Idle,
+                        };
                         at = self.lap(Part::Plan, at, clock);
                         task
                     }
                 }
                 Task::Merge(mut merge, merging) => {
-                    let done = merge.step(STEP_WORK);
+                    let merge_bound = merge.bound();
+                    read(merge.reads());
+                    let finished = merge.step(STEP_WORK);
+                    read(merge.reads());
                     at = self.lap(Part::Merge, at, clock);
-                    if !done {
+                    if !finished {
+                        // Its reads go on in later steps.
+                        if merge.reads().waiting() {
+                            self.task = Task::Merge(merge, merging);
+                            break;
+                        }
                         Task::Merge(merge, merging)
+                    } else if merge.failed() {
+                        let counted = (merge.reads().reads, merge.reads().bytes);
+                        self.stats.file_reads += counted.0;
+                        self.stats.file_read_bytes += counted.1;
+                        events.push(self.abandon(merge.abandon(), &merging));
+                        Task::Idle
                     } else {
-                        let task = self.merged(merge, merging, &mut events)?;
+                        let counted = (merge.reads().reads, merge.reads().bytes);
+                        self.stats.file_reads += counted.0;
+                        self.stats.file_read_bytes += counted.1;
+                        let Some(Merged {
+                            layout,
+                            evicted,
+                            expired,
+                            invalid,
+                        }) = merge.finish()
+                        else {
+                            unreachable!("a merge laid out");
+                        };
+                        events.push(Event::Merged {
+                            full: matches!(merging, Merging::Full),
+                            records: layout.records(),
+                            bytes: layout.bytes(),
+                            bound: merge_bound,
+                            evicted,
+                            expired,
+                            invalid,
+                        });
+                        let layout = Arc::new(layout);
+                        // A full merge replaces every segment and list; a
+                        // pair, the two it merged.
+                        let (replace, remove) = match merging {
+                            Merging::Full => (vec![SEGMENT_BLOB, USED_BLOB], Vec::new()),
+                            Merging::Pair(offsets) => (Vec::new(), offsets.to_vec()),
+                        };
+                        // Its records still in the file are written through
+                        // a window the writer fills before each piece.
+                        let streamed = layout
+                            .streamed()
+                            .then(|| Arc::new(Streamed::new(layout.clone())));
+                        let source: Arc<dyn journal::Source + 'a> = match &streamed {
+                            Some(streamed) => streamed.clone(),
+                            None => layout.clone(),
+                        };
+                        let change = Change {
+                            replace,
+                            remove,
+                            blobs: vec![Blob {
+                                kind: SEGMENT_BLOB,
+                                source,
+                            }],
+                        };
+                        let planned = self.plan(change);
                         at = self.lap(Part::Plan, at, clock);
-                        task
+                        match planned {
+                            Some(execution) => Task::Write {
+                                execution,
+                                done: Done::Merge(layout, merging, streamed),
+                            },
+                            // A pair's records grew past the room for both:
+                            // the file keeps the two, and no merge runs
+                            // again this boot.
+                            None if matches!(merging, Merging::Pair(_)) => {
+                                self.partial = true;
+                                Task::Idle
+                            }
+                            None => {
+                                self.failed = true;
+                                return Err(String::from(
+                                    "a merged segment found no room beside the file's content",
+                                ));
+                            }
+                        }
                     }
                 }
                 Task::Write {
                     mut execution,
                     done,
                 } => {
+                    if let Done::Merge(_, merging, Some(streamed)) = &done {
+                        let fetched = self.fetch(&execution, streamed, read);
+                        at = self.lap(Part::Fetch, at, clock);
+                        match fetched {
+                            Some(true) => {}
+                            Some(false) => {
+                                self.task = Task::Write { execution, done };
+                                break;
+                            }
+                            None => {
+                                // The file keeps the segments merged, whose
+                                // indexes the merge took: no merge runs
+                                // again this boot.
+                                let event = self.abandon(Vec::new(), merging);
+                                events.push(event);
+                                self.task = Task::Idle;
+                                break;
+                            }
+                        }
+                    }
                     let advanced = advance(&mut execution);
                     at = self.lap(Part::Write, at, clock);
                     match advanced {
@@ -1144,89 +1346,10 @@ impl<'a> Writer<'a> {
                 break;
             }
         }
+        if core::mem::take(&mut self.retired) {
+            events.push(Event::Retired);
+        }
         Ok(events)
-    }
-
-    /// A new segment laid out: its write, or it waits for room.
-    fn laid_delta(
-        &mut self,
-        delta: Box<Delta>,
-        trigger: Trigger,
-        events: &mut Vec<Event>,
-    ) -> Task<'a> {
-        let Some(layout) = delta.finish() else {
-            return Task::Idle;
-        };
-        let layout = Arc::new(layout);
-        match self.write_segment(layout.clone(), trigger) {
-            Some(task) => task,
-            None => {
-                events.push(Event::Waiting {
-                    records: layout.records(),
-                });
-                self.waiting.push(layout);
-                Task::Idle
-            }
-        }
-    }
-
-    /// A merge laid out: its write.
-    fn merged(
-        &mut self,
-        merge: Box<Merge<'a>>,
-        merging: Merging,
-        events: &mut Vec<Event>,
-    ) -> Result<Task<'a>, String> {
-        let bound = merge.bound();
-        let Merged {
-            layout,
-            evicted,
-            expired,
-            invalid,
-        } = merge.finish();
-        events.push(Event::Merged {
-            full: matches!(merging, Merging::Full),
-            records: layout.records(),
-            bytes: layout.bytes(),
-            bound,
-            evicted,
-            expired,
-            invalid,
-        });
-        let layout = Arc::new(layout);
-        // A full merge replaces every segment and list; a pair, the two it
-        // merged.
-        let (replace, remove) = match merging {
-            Merging::Full => (vec![SEGMENT_BLOB, USED_BLOB], Vec::new()),
-            Merging::Pair(offsets) => (Vec::new(), offsets.to_vec()),
-        };
-        let change = Change {
-            replace,
-            remove,
-            blobs: vec![Blob {
-                kind: SEGMENT_BLOB,
-                source: layout.clone(),
-            }],
-        };
-        match self.plan(change) {
-            Some(execution) => Ok(Task::Write {
-                execution,
-                done: Done::Merge(layout, merging),
-            }),
-            // A pair's records grew past the room for both: memory holds
-            // them merged, the file as they were, and no pair merges again
-            // this boot.
-            None if matches!(merging, Merging::Pair(_)) => {
-                self.segments.push(Segment::Laid(layout));
-                Ok(Task::Idle)
-            }
-            None => {
-                self.failed = true;
-                Err(String::from(
-                    "a merged segment found no room beside the file's content",
-                ))
-            }
-        }
     }
 
     /// At a stop: finish a new segment's write in flight (`run` carries a
