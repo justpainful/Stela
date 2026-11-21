@@ -76,6 +76,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.pointer.census = on.then(|| Box::new(pointer::census::Census::new(pe)));
         // Self-loops count their entries only while timing is on.
         self.native_system = None;
+        self.variant_memo = None;
     }
 
     /// The step loop's timing so far, while it is on.

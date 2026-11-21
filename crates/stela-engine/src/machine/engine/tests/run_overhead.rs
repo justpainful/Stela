@@ -121,6 +121,11 @@ fn run_loop_costs() {
         prepare(&mut machine, cycle);
         let ns = time(&mut machine);
         std::println!("RUNS exit={exit} pes=1 serial ns_per_run={ns:.1}");
+        // `RUN_LOOP_SERIAL=1` times the serial loop alone, for a profiler
+        // that runs threads one at a time.
+        if std::env::var_os("RUN_LOOP_SERIAL").is_some() {
+            continue;
+        }
         for pes in [1, 2, 4] {
             let machines = parallel(pes, system);
             let start = std::sync::Barrier::new(pes);

@@ -207,6 +207,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 floating_point: &mut self.floating_point,
                 memory_checks: &mut self.memory_checks,
                 native_system: &mut self.native_system,
+                variant_memo: &mut self.variant_memo,
                 debug: &mut self.debug,
                 pointer: &mut self.pointer,
                 mirrors: &mut self.mirrors,

@@ -54,6 +54,7 @@ pub(super) struct NativeProcessorState<'a> {
     pub floating_point: &'a mut Option<Option<u8>>,
     pub memory_checks: &'a mut Option<MemoryChecks>,
     pub native_system: &'a mut Option<NativeSystem>,
+    pub variant_memo: &'a mut Option<super::super::VariantMemo>,
     pub debug: &'a mut Option<DebugMode>,
     pub pointer: &'a mut PointerService,
     pub mirrors: &'a mut Mirrors,
@@ -124,6 +125,7 @@ impl NativeProcessorState<'_> {
             floating_point: &mut *self.floating_point,
             memory_checks: &mut *self.memory_checks,
             native_system: &mut *self.native_system,
+            variant_memo: &mut *self.variant_memo,
             debug: &mut *self.debug,
             pointer: &mut *self.pointer,
             mirrors: &mut *self.mirrors,
@@ -185,6 +187,7 @@ impl NativeProcessorState<'_> {
         *self.floating_point = None;
         *self.memory_checks = None;
         *self.native_system = None;
+        *self.variant_memo = None;
         *self.debug = None;
         self.pointer.close();
         self.mirrors.close_all();

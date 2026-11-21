@@ -642,13 +642,27 @@ struct JumpEntry {
 }
 
 /// A half's recent context number, with the EL, variant and fetch epoch it
-/// was found for.
+/// was found for. The variant is its id, which names one variant for the
+/// board's life ([`Machine::variants`] only grows), so a lookup compares
+/// one word rather than the variant's every field.
 #[derive(Debug, Clone, Copy)]
 struct Recent {
     el: u8,
-    variant: Variant,
+    variant: VariantId,
     epoch: FetchEpoch,
     number: u64,
+}
+
+/// [`Machine::current_variant_id`]'s last answer and the inputs it reads
+/// besides the derived state it is forgotten with (`native_system`): the
+/// fetch's own `single`, PSTATE.SM where the PE has SME, and the DIT tier.
+#[derive(Debug, Clone, Copy)]
+struct VariantMemo {
+    single: bool,
+    scalable: Option<bool>,
+    timing: bool,
+    variant: Variant,
+    id: VariantId,
 }
 
 /// `T` on cache lines of its own: a shared word that PEs read on every
@@ -991,6 +1005,10 @@ pub struct Machine<H: Host, D: Devices> {
     memory_checks: Option<MemoryChecks>,
     /// [`Variant::system`] for the current EL, while valid.
     native_system: Option<NativeSystem>,
+    /// The current variant's id, forgotten with `native_system` (every
+    /// change that forgets `floating_point` or `memory_checks` forgets it
+    /// too): [`Machine::current_variant_id`].
+    variant_memo: Option<VariantMemo>,
     /// Whether blocks that branch back to their own start run their
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
@@ -1467,6 +1485,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             floating_point: None,
             memory_checks: None,
             native_system: None,
+            variant_memo: None,
             self_loops: true,
             regions: true,
             event_sample: None,

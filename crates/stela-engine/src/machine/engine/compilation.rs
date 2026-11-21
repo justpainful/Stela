@@ -77,9 +77,9 @@ pub(super) fn grow_table(
 impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn fetch_block(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
         self.linked_at_install = None;
-        let context = self.current_variant(single, false);
+        let (context, context_id) = self.current_variant_id(single);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
-        let contexts = self.contexts(el, context);
+        let contexts = self.contexts_of(el, context, context_id);
         self.chain.set_contexts(contexts);
         if !self.dropped_refills.is_empty() || !self.refills.is_empty() {
             let refilling = self.host.counter();
@@ -148,7 +148,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // non-global fetch): the page is recorded, and dispatchers look
         // up, in their successors.
         if self.translation_generation != generation {
-            let contexts = self.contexts(el, context);
+            let contexts = self.contexts_of(el, context, context_id);
             self.chain.set_contexts(contexts);
         }
         let current = Variant {
@@ -1120,6 +1120,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
             timing: self.cpu.pstate.dit && self.timing_target().is_some(),
             translated: false,
         }
+    }
+
+    /// [`Self::current_variant`] with `guarded_page` clear, and its id
+    /// ([`Self::variant_id`]): kept until the derived state it reads is
+    /// forgotten, or the fetch's `single`, PSTATE.SM or the DIT tier
+    /// differs, so a fetch in an unchanged state neither forms the variant
+    /// nor searches the table for it.
+    pub(super) fn current_variant_id(&mut self, single: bool) -> (Variant, VariantId) {
+        let scalable = self
+            .cpu
+            .scalable
+            .is_some()
+            .then(|| self.cpu.svcr() & 1 != 0);
+        let timing = self.cpu.pstate.dit && self.timing_target().is_some();
+        if let Some(memo) = self.variant_memo
+            && (memo.single, memo.scalable, memo.timing) == (single, scalable, timing)
+        {
+            return (memo.variant, memo.id);
+        }
+        let variant = self.current_variant(single, false);
+        let id = self.variant_id(variant);
+        self.variant_memo = Some(super::VariantMemo {
+            single,
+            scalable,
+            timing,
+            variant,
+            id,
+        });
+        (variant, id)
     }
 
     /// `variant`'s id, added to [`Self::variants`] the first time by
