@@ -262,6 +262,23 @@ impl Controller {
         )
     }
 
+    /// Send the I/O completion queue's signal, MSI-X vector 0, as `message`
+    /// from now on: written with the vector masked, so a completion
+    /// meanwhile stays pending and goes to the new address once it is
+    /// unmasked (PCI 3.0 section 6.8.2.9). Whether the controller now sends
+    /// it; one that signals nothing, faulted or shut down keeps what it had.
+    /// No command and no queue changes.
+    pub(super) fn retarget(&mut self, message: super::MsiMessage) -> bool {
+        let Some(entry) = self.msix.as_ref().filter(|_| self.signalled) else {
+            return false;
+        };
+        if self.fault.is_some() || self.shut_down {
+            return false;
+        }
+        super::retarget_msix(entry, message);
+        true
+    }
+
     /// Whether a command runs, waits to run again or the controller resets.
     pub(super) fn busy(&self) -> bool {
         self.recovery.is_some()

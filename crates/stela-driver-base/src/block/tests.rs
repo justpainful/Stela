@@ -1431,3 +1431,44 @@ fn a_failed_piece_ends_its_request_and_the_queue_goes_on() {
     assert_eq!(results[&next], Ok(None));
     assert_eq!(*calls.borrow(), [64 << 10, 64 << 10, 64 << 10, 512]);
 }
+
+/// A disk that signals takes a new message for its completion signal through
+/// its shared disk; one that signals nothing answers that it sends none.
+#[test]
+fn a_shared_disk_moves_its_devices_completion_signal() {
+    struct Signalling {
+        disk: RamDisk,
+        message: Rc<Cell<Option<crate::bus::irq::MsiMessage>>>,
+    }
+    impl BlockDevice for Signalling {
+        fn identity(&self) -> &Identity {
+            self.disk.identity()
+        }
+        fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+            self.disk.read(lba, buffer)
+        }
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            self.disk.write(lba, data)
+        }
+        fn signals(&self) -> bool {
+            true
+        }
+        fn retarget_signal(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
+            self.message.set(Some(message));
+            true
+        }
+    }
+    let message = crate::bus::irq::MsiMessage {
+        address: 0xfee0_7000,
+        data: 0x62,
+    };
+    let sent = Rc::new(Cell::new(None));
+    let disk = Shared::new(Box::new(Signalling {
+        disk: RamDisk::new("s", 8, 512),
+        message: Rc::clone(&sent),
+    }));
+    assert!(disk.retarget_signal(message));
+    assert_eq!(sent.get(), Some(message));
+    let silent = Shared::new(Box::new(RamDisk::new("q", 8, 512)));
+    assert!(!silent.retarget_signal(message));
+}

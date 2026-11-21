@@ -1400,6 +1400,8 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         && binding.worker.0 != 0
     {
         network::set_receive_core(processor.apic_id);
+        // The host disks' completion signals too, once that PE runs.
+        storage::set_signal_core(binding.pe, processor.apic_id, &io.host_disks);
     }
     let devices = parallel::Board::new(devices, hub.clone());
     let settings = parallel::Settings {

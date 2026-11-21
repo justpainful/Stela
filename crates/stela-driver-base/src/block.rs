@@ -1232,6 +1232,15 @@ pub trait BlockDevice {
     fn signals(&self) -> bool {
         false
     }
+
+    /// Send the completion signal as `message` from now on, to a processor
+    /// that takes it sooner than the one [`crate::Handoff::completion`]
+    /// named. Whether the device now sends it; one that [`Self::signals`]
+    /// nothing answers false. Only the message changes: no command, nor
+    /// when the device completes it.
+    fn retarget_signal(&mut self, _message: crate::bus::irq::MsiMessage) -> bool {
+        false
+    }
 }
 
 impl<D: BlockDevice + ?Sized> BlockDevice for Box<D> {
@@ -1311,6 +1320,10 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Box<D> {
 
     fn signals(&self) -> bool {
         (**self).signals()
+    }
+
+    fn retarget_signal(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
+        (**self).retarget_signal(message)
     }
 }
 

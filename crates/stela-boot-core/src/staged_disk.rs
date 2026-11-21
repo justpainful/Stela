@@ -521,6 +521,11 @@ pub const SILENT_COMPLETIONS: u32 = 64;
 /// drivers, which this check does not justify; so another device's signal
 /// can make a silent disk look heard, which leaves it at the lost-signal
 /// looks' pace, as before.
+///
+/// A disk found silent is heard again once a signal comes after all: the
+/// boot's first commands, before the guest's processors run, complete while
+/// the processor the message names takes no interrupt, so a disk whose
+/// signal arrives can look silent then.
 #[derive(Debug, Default)]
 pub struct SignalWatch {
     /// The signal count at the first completion.
@@ -529,23 +534,45 @@ pub struct SignalWatch {
     silent: u32,
     /// Decided: a signal came, or the disk was found silent.
     decided: bool,
+    /// The signal count when the disk was found silent, until a completion
+    /// finds it moved.
+    found_silent: Option<u64>,
 }
 
 impl SignalWatch {
-    /// A completion was taken with the signal count at `signals`: true once,
-    /// at the [`SILENT_COMPLETIONS`]th completion with no signal since the
-    /// first.
-    pub fn completed(&mut self, signals: u64) -> bool {
+    /// A completion was taken with the signal count at `signals`:
+    /// `Some(false)` once, at the [`SILENT_COMPLETIONS`]th completion with no
+    /// signal since the first; then `Some(true)` once, at the first
+    /// completion with the count moved since: the disk is heard after all.
+    pub fn completed(&mut self, signals: u64) -> Option<bool> {
+        if let Some(count) = self.found_silent {
+            if count == signals {
+                return None;
+            }
+            self.found_silent = None;
+            return Some(true);
+        }
         if self.decided {
-            return false;
+            return None;
         }
         if *self.first.get_or_insert(signals) != signals {
             self.decided = true;
-            return false;
+            return None;
         }
         self.silent += 1;
-        self.decided = self.silent >= SILENT_COMPLETIONS;
-        self.decided
+        if self.silent < SILENT_COMPLETIONS {
+            return None;
+        }
+        self.decided = true;
+        self.found_silent = Some(signals);
+        Some(false)
+    }
+
+    /// Whether the disk was found silent and no signal came since: its
+    /// completions still go to [`Self::completed`], which tells once one
+    /// does.
+    pub fn silenced(&self) -> bool {
+        self.found_silent.is_some()
     }
 }
 

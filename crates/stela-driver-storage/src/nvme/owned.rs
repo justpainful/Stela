@@ -464,6 +464,7 @@ unsafe fn attach_with_timeout(
         tags: (0..DEPTH).map(|_| Tag::Free).collect(),
         recovery: None,
         signalled: false,
+        msix: None,
         owed: false,
         max_transfer: BOUNCE_BYTES,
         max_command_bytes: MAX_COMMAND_BYTES,
