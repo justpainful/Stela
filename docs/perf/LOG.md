@@ -155,6 +155,47 @@ driver-base 1120, audio 405, storage 316 passed; compiler 1593 passed,
 7 FP16 failures (as before). fmt, host clippy and the UEFI clippy lanes
 (engine, compiler, storage, boot-core, stela-boot) clean.
 
+## 2026-11-21, goal: +40 % whole Mac (engine round trip)
+
+Owner's boots average about 0.3 G guest instructions/s per PE while a
+tight translated loop runs 2 to 6 G/s per PE: the time is between blocks.
+Measured here: the engine's round trip for one native run
+(`run_loop_costs`, the engine's fixed cost of an exit), callgrind for
+deterministic host instruction counts (`RUN_LOOP_SERIAL=1`), perf
+cpu-clock sampling for the parallel cases.
+
+| Commit | Change | Serial host instructions (8 M runs) |
+|---|---|---|
+| base `a6e287c` | | 27.75 G |
+| `bec611c` | variant id memo; recent contexts compare ids | 23.98 G |
+| `a77fcc3` | ITLB salt shift by BSR, not software popcount | 23.41 G |
+| `d647fe6` | missed-transfer classification sampled 1 in 8 | 20.43 G (-26 % total) |
+
+ns per native run, cloud Xeon:
+
+| Exit | PEs | Before | After |
+|---|---|---|---|
+| br | serial | 164 | 116 |
+| br | 1 parallel | 189 | 133 to 142 |
+| br | 2 | 213 | 157 |
+| br | 4 | 220 | 158 |
+| mrs+br | serial | 206 | 167 to 170 |
+| mrs+br | 4 | 254 | 190 to 198 |
+
+Also measured, not landed:
+- Host CPU features (+popcnt,+bmi1,+bmi2,+lzcnt,+movbe) for the engine:
+  br serial 136 -> 132 ns (-3 %): a build option candidate, as it would
+  #UD on CPUs without them.
+- Compile throughput of a 44 038-instruction arm64 corpus (mbedtls and
+  Mesa C, clang -mcpu=apple-m1 -O2), owner tier: 4.2 us a block, 500 ns
+  a guest instruction. An app's code compiles in well under a second, so
+  app launch time is not compile bound.
+- A self-loop back edge without its NZCV store: -5 to -26 % per kernel,
+  not bit-exact (fault and budget exits need the word); dropped.
+
+Tests: engine 1976 passed, compiler 1593 (7 FP16 as before); clippy host
+and UEFI clean.
+
 ## Owner checkpoints
 
 The owner asks for the difference since their last question. Each line is
@@ -170,3 +211,5 @@ the state they were last told about.
   processes and more. The owner's last measured rate is session 3's
   (2.42 G/s median, 4.98 G/s peak); the next boot's `GUEST PERFORMANCE`
   line is the new figure.
+- 2026-11-21 (asked 3, goal set): base `a6e287c`. Engine round trip of a
+  native run 164 -> 116 ns serial (-29 %), 220 -> 158 ns on 4 PEs (-28 %).
