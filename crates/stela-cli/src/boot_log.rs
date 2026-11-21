@@ -744,6 +744,9 @@ pub(crate) fn summary(log: &Log) -> String {
              [boot log dropped, BOOT LOG busy)"
         );
     }
+    if let Some(rates) = guest_rates_text(&guest_rates(&log.stream)) {
+        text.push_str(&rates);
+    }
     if log.overwritten() != 0 {
         text.push_str("; older lines were overwritten");
         let kept: Vec<u64> = log.kept_starts().map(|(start, _)| start.boot).collect();
@@ -762,6 +765,87 @@ pub(crate) fn summary(log: &Log) -> String {
     }
     text.push('\n');
     text
+}
+
+/// One boot's guest speed, from its `GUEST PERFORMANCE` lines
+/// (`stela.efi`'s `engine::run`): the reports, and the median and the
+/// highest of their `instructions_per_second`, every PE's together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuestRates {
+    pub(crate) reports: usize,
+    pub(crate) median: u64,
+    pub(crate) peak: u64,
+}
+
+/// Each boot's [`GuestRates`] in `stream`, oldest first: one for each boot
+/// whose lines report any, a boot starting at each `=== STELA BOOT ` line.
+pub(crate) fn guest_rates(stream: &[u8]) -> Vec<GuestRates> {
+    const LINE: &[u8] = b"GUEST PERFORMANCE ";
+    const FIELD: &[u8] = b" instructions_per_second=";
+    let mut boots = Vec::new();
+    let mut rates: Vec<u64> = Vec::new();
+    let mut close = |rates: &mut Vec<u64>| {
+        if rates.is_empty() {
+            return;
+        }
+        rates.sort_unstable();
+        boots.push(GuestRates {
+            reports: rates.len(),
+            median: rates[rates.len() / 2],
+            peak: rates[rates.len() - 1],
+        });
+        rates.clear();
+    };
+    for line in stream.split(|&byte| byte == b'\n') {
+        if line.starts_with(b"=== STELA BOOT ") {
+            close(&mut rates);
+            continue;
+        }
+        let Some(at) = line.windows(LINE.len()).position(|window| window == LINE) else {
+            continue;
+        };
+        let rest = &line[at..];
+        let Some(field) = rest.windows(FIELD.len()).position(|window| window == FIELD) else {
+            continue;
+        };
+        let digits: Vec<u8> = rest[field + FIELD.len()..]
+            .iter()
+            .copied()
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        if let Some(rate) = std::str::from_utf8(&digits)
+            .ok()
+            .and_then(|text| text.parse().ok())
+        {
+            rates.push(rate);
+        }
+    }
+    close(&mut rates);
+    boots
+}
+
+/// The summary's words for `boots`' guest speed: the last boot's median and
+/// peak, and the median's change from the boot before when there is one.
+pub(crate) fn guest_rates_text(boots: &[GuestRates]) -> Option<String> {
+    let giga = |rate: u64| rate as f64 / 1e9;
+    let last = boots.last()?;
+    let mut text = format!(
+        "; guest instructions in its last boot: median {:.2} G/s, peak {:.2} G/s ({} reports)",
+        giga(last.median),
+        giga(last.peak),
+        last.reports
+    );
+    if let [.., before, _] = boots
+        && before.median != 0
+    {
+        let change = (last.median as f64 / before.median as f64 - 1.0) * 100.0;
+        let _ = write!(
+            text,
+            ", median {change:+.0} % from the boot before ({:.2} G/s)",
+            giga(before.median)
+        );
+    }
+    Some(text)
 }
 
 /// The lines of `stream` that say a boot left lines out of its log: a
@@ -944,6 +1028,48 @@ fn listing(table: &gpt::Table, block: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Each boot's GUEST PERFORMANCE reports give its median and peak, and
+    /// the summary compares the last boot's median with the one before.
+    #[test]
+    fn guest_rates_are_counted_per_boot() {
+        let stream = b"=== STELA BOOT 1 ===\n\
+[  10.000] GUEST PERFORMANCE retired=9 interval_retired=9 instructions_per_second=2000000000 instructions_per_block_milli=5\n\
+[  20.000] GUEST PERFORMANCE retired=9 interval_retired=9 instructions_per_second=3000000000 x\n\
+[  30.000] GUEST PERFORMANCE retired=9 interval_retired=9 instructions_per_second=1000000000 x\n\
+=== STELA BOOT 2 ===\n\
+[  10.000] HOST MEMORY free=1M\n\
+=== STELA BOOT 3 ===\n\
+[  10.000] GUEST PERFORMANCE retired=1 interval_retired=1 instructions_per_second=3000000000 x\n\
+[  11.000] GUEST PERFORMANCE retired=1 interval_retired=1 instructions_per_second=5000000000 x\n\
+[  12.000] PES WHERE instructions_per_second=7\n";
+        let rates = guest_rates(stream);
+        assert_eq!(
+            rates,
+            [
+                GuestRates {
+                    reports: 3,
+                    median: 2_000_000_000,
+                    peak: 3_000_000_000
+                },
+                GuestRates {
+                    reports: 2,
+                    median: 5_000_000_000,
+                    peak: 5_000_000_000
+                },
+            ]
+        );
+        assert_eq!(
+            guest_rates_text(&rates).unwrap(),
+            "; guest instructions in its last boot: median 5.00 G/s, peak 5.00 G/s (2 reports), \
+             median +150 % from the boot before (2.00 G/s)"
+        );
+        assert_eq!(
+            guest_rates_text(&rates[..1]).unwrap(),
+            "; guest instructions in its last boot: median 2.00 G/s, peak 3.00 G/s (3 reports)"
+        );
+        assert_eq!(guest_rates_text(&[]), None);
+    }
     use stela_formats::payload::gpt::{Disk, Partition, Table, encode};
     use stela_runtime::pc::boot_log::Writer;
 
