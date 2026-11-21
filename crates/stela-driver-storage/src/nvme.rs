@@ -19,7 +19,7 @@ use crate::{
         BlockDevice, BlockError, Command, DiscardLimits, Features, Finished, Identity, Rotation,
         Transport, WriteZeroes, ascii,
     },
-    bus::{dma::DmaAllocator, pci::Function},
+    bus::{dma::DmaAllocator, irq::MsiMessage, mmio::Mmio, pci::Function, virtio::retarget_msix},
     registers,
 };
 use alloc::{boxed::Box, format, rc::Rc, vec::Vec};
@@ -698,6 +698,9 @@ struct Controller {
     /// The I/O completion queue raises MSI-X vector 0, which the host
     /// gave the message of its completion signal.
     signalled: bool,
+    /// Vector 0's MSI-X table entry while `signalled`, where
+    /// [`Self::retarget`] writes another message.
+    msix: Option<Mmio>,
     /// I/O submissions published since the I/O submission doorbell last
     /// rang ([`Controller::ring_submissions`]): a batch rings once, after
     /// its last command, as Linux's `nvme_commit_rqs` does.
@@ -975,6 +978,7 @@ pub fn attach(
         tags: (0..DEPTH).map(|_| Tag::Free).collect(),
         recovery: None,
         signalled: false,
+        msix: None,
         owed: false,
         max_transfer: BOUNCE_BYTES,
         max_command_bytes: MAX_COMMAND_BYTES,
@@ -1006,10 +1010,10 @@ pub fn attach(
     };
     start_after_stop(&mut controller, |_| {
         function.enable_bus_master()?;
-        let Some((message, msix, table)) = msix else {
+        let Some((message, msix, table)) = &msix else {
             return Ok(false);
         };
-        function.enable_msix(msix, || {
+        function.enable_msix(*msix, || {
             table.write32(0, message.address as u32);
             table.write32(4, (message.address >> 32) as u32);
             table.write32(8, message.data);
@@ -1018,6 +1022,9 @@ pub fn attach(
         })?;
         Ok(true)
     })?;
+    if controller.signalled {
+        controller.msix = msix.map(|(_, _, table)| table);
+    }
     discover(controller, format!("{}", function.address), &mut { dma })
 }
 
@@ -1689,6 +1696,11 @@ impl BlockDevice for Namespace {
 
     fn signals(&self) -> bool {
         self.controller.borrow().signalled
+    }
+
+    /// One controller's vector 0, whichever namespace asks.
+    fn retarget_signal(&mut self, message: MsiMessage) -> bool {
+        self.controller.borrow_mut().retarget(message)
     }
 
     /// Flush, then shut the controller down once for all its namespaces.

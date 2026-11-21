@@ -624,6 +624,13 @@ impl Shared {
         self.lock().stats()
     }
 
+    /// Send the disk's completion signal as `message` from now on
+    /// ([`BlockDevice::retarget_signal`]), once no other owner is using it:
+    /// one controller's signal, whichever window's command it completes.
+    pub fn retarget_signal(&self, message: crate::bus::irq::MsiMessage) -> bool {
+        self.lock().retarget_signal(message)
+    }
+
     /// Whether `other` shares this same disk.
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)

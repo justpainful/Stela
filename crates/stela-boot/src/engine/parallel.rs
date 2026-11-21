@@ -268,6 +268,9 @@ impl Pe {
                 // staged guest disk its host I/O.
                 stop if machine.yielded_for_interrupt(&stop) => {
                     super::run::host_work(&mut machine, "idle service", |machine| {
+                        // The host disks' completion signals come to this
+                        // core from its first idle service, if it is theirs.
+                        super::storage::retarget_signals(pe);
                         // A staged disk's step first, which a guest's read
                         // waits on and which takes microseconds: a core
                         // woken for it (an owed step, a look's or a

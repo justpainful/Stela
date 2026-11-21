@@ -37,6 +37,7 @@ impl Fixture {
             tags: (0..DEPTH).map(|_| Tag::Free).collect(),
             recovery: None,
             signalled: false,
+            msix: None,
             owed: false,
             max_transfer: BOUNCE_BYTES,
             max_command_bytes: MAX_COMMAND_BYTES,
@@ -1433,6 +1434,46 @@ fn completions_are_signalled_and_posted_in_memory() {
     assert!(disk.posted());
     assert!(disk.finish(read).is_some());
     assert!(!disk.posted());
+}
+
+/// A signalled controller's vector 0 takes another message, written with
+/// the vector masked and unmasked after; one that signals nothing, or that
+/// faulted, keeps its entry, and no command or queue changes either way.
+#[test]
+fn a_signalled_controller_moves_its_completion_signal() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let mut table = [0u64; 2];
+    // SAFETY: `table` outlives the controller's use of it in this test.
+    let entry = unsafe { Mmio::new(table.as_mut_ptr() as u64, size_of_val(&table)) };
+    entry.write32(0, 0xfee0_0000);
+    entry.write32(8, 0x62);
+    disk.controller.borrow_mut().msix = Some(entry);
+    let message = MsiMessage {
+        address: 0xfee0_7000,
+        data: 0x62,
+    };
+    assert!(!disk.retarget_signal(message), "not signalled");
+    assert_eq!(table[0] as u32, 0xfee0_0000);
+    disk.controller.borrow_mut().signalled = true;
+    let queue = disk.controller.borrow().create_queue(false).unwrap();
+    assert!(disk.retarget_signal(message));
+    assert_eq!(table, [0xfee0_7000, 0x62]);
+    assert_eq!(disk.controller.borrow().create_queue(false).unwrap(), queue);
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        let id = running_id(&controller, read);
+        post(&mut controller, id, 0);
+    }
+    assert!(disk.finish(read).is_some());
+    disk.controller.borrow_mut().fault = Some(BlockError::Timeout);
+    let elsewhere = MsiMessage {
+        address: 0xfee0_1000,
+        data: 0x62,
+    };
+    assert!(!disk.retarget_signal(elsewhere), "faulted");
+    assert_eq!(table, [0xfee0_7000, 0x62]);
 }
 
 #[test]

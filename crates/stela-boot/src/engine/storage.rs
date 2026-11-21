@@ -23,7 +23,7 @@ use core::{
     cell::Cell,
     panic::Location,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use stela_boot_core::drivers_turn::{self, Call, Entry};
 use stela_boot_core::staged_disk::{self, DiskWorker};
@@ -781,14 +781,30 @@ impl Service {
 
     /// A command completed: a disk said to signal that has sent no signal
     /// over [`staged_disk::SILENT_COMPLETIONS`] completions is looked at
-    /// as one that sends none, and reported once.
+    /// as one that sends none, until a signal comes after all, as one does
+    /// once its processor takes interrupts or its message moved
+    /// ([`retarget_signals`]); each reported once.
     fn heard(&mut self) {
-        if self.signals() && self.heard.completed(super::host::device_signals()) {
-            self.signals.set(Some(false));
-            output::arguments(format_args!(
-                "HOST DISK serial={} no completion interrupt, polling\n",
-                stela_contracts::masked::Tail(&self.inner.identity().serial)
-            ));
+        if !self.signals() && !self.heard.silenced() {
+            return;
+        }
+        let serial = || stela_contracts::masked::Tail(&self.inner.identity().serial);
+        match self.heard.completed(super::host::device_signals()) {
+            Some(false) => {
+                self.signals.set(Some(false));
+                output::arguments(format_args!(
+                    "HOST DISK serial={} no completion interrupt, polling\n",
+                    serial()
+                ));
+            }
+            Some(true) => {
+                self.signals.set(Some(true));
+                output::arguments(format_args!(
+                    "HOST DISK serial={} completion interrupt heard, no longer polling\n",
+                    serial()
+                ));
+            }
+            None => {}
         }
     }
 
@@ -1322,6 +1338,79 @@ static OWED_TIMES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(super) fn ring_owed_steps_at(id: u64) {
     if let Ok(id) = u32::try_from(id) {
         OWED_DOORBELL.store(id, Ordering::Relaxed);
+    }
+}
+
+/// The PE whose core the host disks' completion signals move to once it
+/// runs ([`retarget_signals`]), `usize::MAX` for none or once moved, and
+/// that core's APIC ID.
+static SIGNAL_PE: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SIGNAL_CORE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The host disks whose signals move, and the loader root their drivers
+/// run in, written once before the PEs run.
+static SIGNAL_DISKS: output::Global<Vec<(String, Shared)>> =
+    output::Global(core::cell::RefCell::new(Vec::new()));
+static SIGNAL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Move `disks`' completion signals, which the handoff sent to the boot
+/// processor, to the core of PE `pe`, APIC ID `apic`, once that PE serves
+/// its host ([`retarget_signals`]): macOS runs the lower PEs first and
+/// leaves the last mostly waiting, so that core takes a signal at once,
+/// where the boot processor, running guest code, takes it only between its
+/// slices. Before the PEs run.
+pub(super) fn set_signal_core(pe: usize, apic: u64, disks: &HostDisks) {
+    if let Ok(mut kept) = SIGNAL_DISKS.0.try_borrow_mut() {
+        kept.clone_from(&disks.disks);
+    }
+    SIGNAL_ROOT.store(disks.root, Ordering::Relaxed);
+    SIGNAL_CORE.store(apic, Ordering::Relaxed);
+    SIGNAL_PE.store(pe, Ordering::Release);
+}
+
+/// From PE `pe`'s host service: if it is [`set_signal_core`]'s, move the
+/// host disks' completion signals to its core, once. Its core runs the
+/// engine's host by then, which takes the signal's vector; a command that
+/// completes meanwhile signals the old core or the new, and the looks for
+/// lost signals find it either way. The owed steps' doorbell moves there
+/// too ([`ring_owed`]).
+pub(super) fn retarget_signals(pe: usize) {
+    if SIGNAL_PE.load(Ordering::Relaxed) != pe
+        || SIGNAL_PE
+            .compare_exchange(pe, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let apic = SIGNAL_CORE.load(Ordering::Relaxed);
+    let Some(message) = super::host::completion_signal(apic) else {
+        return;
+    };
+    let Ok(disks) = SIGNAL_DISKS
+        .0
+        .try_borrow_mut()
+        .map(|mut kept| core::mem::take(&mut *kept))
+    else {
+        return;
+    };
+    let root = SIGNAL_ROOT.load(Ordering::Relaxed);
+    let mut moved = 0;
+    for (serial, disk) in &disks {
+        let retargeted = {
+            // SAFETY: `open` captured the loader root, as for every
+            // service call; the disk's driver keeps the entry it writes.
+            let _root = unsafe { RestoreRoot::enter(root) };
+            disk.retarget_signal(message)
+        };
+        if retargeted {
+            moved += 1;
+            output::arguments(format_args!(
+                "HOST DISK serial={} completion signal moved to APIC {apic:#x}, PE {pe}\n",
+                stela_contracts::masked::Tail(serial)
+            ));
+        }
+    }
+    if moved != 0 {
+        ring_owed_steps_at(apic);
     }
 }
 
