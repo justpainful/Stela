@@ -268,6 +268,14 @@ impl Pe {
                 // staged guest disk its host I/O.
                 stop if machine.yielded_for_interrupt(&stop) => {
                     super::run::host_work(&mut machine, "idle service", |machine| {
+                        // A staged disk's step first, which a guest's read
+                        // waits on and which takes microseconds: a core
+                        // woken for it (an owed step, a look's or a
+                        // completion signal's) takes it before the GPUs'
+                        // work below, which can take far longer.
+                        if super::storage::serve_staged(true) {
+                            machine.devices.call_home();
+                        }
                         let watch = machine.guest_watch();
                         // The GPUs' Linux work first, which a frame waits
                         // on, in the boot CPU's place, until this PE's
