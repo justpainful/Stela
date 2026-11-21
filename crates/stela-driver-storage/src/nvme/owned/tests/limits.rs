@@ -8,7 +8,10 @@ fn write_zeroes_default_uses_mdts_without_the_payload_bounce_cap() {
     for (mdts, command_bytes, payload_bytes) in [
         (0, MAX_COMMAND_BYTES, BOUNCE_BYTES),
         (4, 64 * 1024, 64 * 1024),
-        (7, 512 * 1024, BOUNCE_BYTES),
+        (5, 128 * 1024, 128 * 1024),
+        (7, 512 * 1024, 512 * 1024),
+        (8, 1024 * 1024, BOUNCE_BYTES),
+        (9, 2048 * 1024, BOUNCE_BYTES),
         (31, MAX_COMMAND_BYTES, BOUNCE_BYTES),
         (63, MAX_COMMAND_BYTES, BOUNCE_BYTES),
         (64, MAX_COMMAND_BYTES, BOUNCE_BYTES),
