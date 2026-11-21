@@ -305,6 +305,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// host's view follows natively where the host gives one
     /// ([`Host::native_view`]); else the record's thunk ends the run.
     pub(super) fn finish_transition(&mut self, budget: u64) {
+        // Most runs follow no transition: take writes the whole note back.
+        if self.transition_note.is_none() {
+            return;
+        }
         let Some(note) = self.transition_note.take() else {
             return;
         };
